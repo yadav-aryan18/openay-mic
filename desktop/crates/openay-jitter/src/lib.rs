@@ -18,10 +18,11 @@
 //!   index, so no update can ever be lost to a read-modify-write race
 //!   (a shared "length" counter that both sides store to would suffer lost
 //!   updates when a load-store pair interleaves, which is why it is avoided).
-//! - `push` is all-or-nothing: if the whole block does not fit, *nothing* is
-//!   written and the block counts as an overrun. Dropping a whole frame is
-//!   better than tearing it across the ring boundary, which would glitch the
-//!   audio with half a frame of garbage.
+//! - `push` writes as much as fits and returns the written count (a short
+//!   write counts one overrun). For a continuous sample stream partial
+//!   writes are strictly better than dropping whole blocks: with quantum-
+//!   sized consumer drains, full-block drops repeat systematically and tear
+//!   periodic holes into the audio.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -123,13 +124,14 @@ impl JitterBuffer {
         self.mask + 1
     }
 
-    /// Push a whole block of samples.
+    /// Push a block of samples.
     ///
-    /// If the entire block fits in the free space it is written (possibly
-    /// wrapping around the ring) and `samples.len()` is returned. If it does
-    /// not fit, **nothing** is written, the overrun counter is incremented,
-    /// and `0` is returned: a frame is either stored whole or dropped whole,
-    /// never torn.
+    /// Writes as many samples as fit in the free space (wrapping around the
+    /// ring internally) and returns the written count. A short write —
+    /// including `0` when the ring is full — increments the overrun counter
+    /// once. Sample-granular partial writes keep continuous audio glitch-free
+    /// under quantum-sized consumer drains; callers re-derive frame
+    /// boundaries downstream if they need them.
     pub fn push(&self, samples: &[f32]) -> usize {
         let n = samples.len();
         if n == 0 {
@@ -141,10 +143,19 @@ impl JitterBuffer {
         // being read concurrently.
         let tail = self.tail.load(Ordering::Acquire);
         let head = self.head.load(Ordering::Relaxed);
-        if n > self.capacity() - (head - tail) {
+        // Partial write: for a continuous SAMPLE stream, dropping whole
+        // blocks tears periodic holes into the audio (a quantum-sized drain
+        // frees less room than the next push needs, so full-block drops
+        // repeat systematically). Writing what fits keeps playback
+        // continuous; a short write is counted as one overrun.
+        let writable = (self.capacity() - (head - tail)).min(n);
+        if writable < n {
             self.overruns.fetch_add(1, Ordering::Relaxed);
-            return 0;
+            if writable == 0 {
+                return 0;
+            }
         }
+        let n = writable;
         let start = head & self.mask;
         let first = (self.capacity() - start).min(n);
         // SAFETY: SPSC protocol — the producer is the only thread writing the
@@ -222,8 +233,8 @@ impl JitterBuffer {
         self.available() as f32 / self.capacity() as f32
     }
 
-    /// Number of whole blocks dropped by [`push`](Self::push) for lack of
-    /// space.
+    /// Number of pushes that could not write everything (short or zero
+    /// written) for lack of space.
     pub fn overruns(&self) -> u64 {
         self.overruns.load(Ordering::Relaxed)
     }
@@ -361,33 +372,38 @@ mod tests {
         assert_eq!(jb.underruns(), 0);
     }
 
-    /// A block that does not fit must be dropped whole: nothing written,
-    /// overrun counted, prior contents untouched.
+    /// A push with insufficient space writes what fits (partial), counts one
+    /// overrun per short write, and leaves prior contents untouched.
     #[test]
-    fn overrun_drops_entire_block() {
+    fn overrun_writes_partial_block() {
         let jb = JitterBuffer::new(1024);
         let fill = vec![1.0f32; 1024];
         assert_eq!(jb.push(&fill), 1024, "exact fill fits");
         assert_eq!(jb.free(), 0);
 
         let extra = vec![2.0f32; 8];
-        assert_eq!(jb.push(&extra), 0, "no space -> whole block dropped");
+        assert_eq!(jb.push(&extra), 0, "no space -> nothing written");
         assert_eq!(jb.overruns(), 1);
         assert_eq!(jb.available(), 1024, "prior contents intact");
 
-        // Leave exactly one free sample: 8 samples still cannot fit, so the
-        // block is dropped whole again.
+        // Leave exactly one free sample: one of the 8 samples is written,
+        // the short write counts a second overrun.
         let mut out = vec![0.0f32; 1];
         assert_eq!(jb.pop(&mut out), 1);
+        assert_eq!(out[0], 1.0);
         assert_eq!(jb.free(), 1);
-        assert_eq!(jb.push(&extra), 0);
+        assert_eq!(jb.push(&extra), 1);
         assert_eq!(jb.overruns(), 2);
 
-        // The surviving data is exactly what was pushed: 1023 samples of 1.0.
+        // The surviving data is exactly what was pushed: 1023 samples of 1.0
+        // followed by the first sample of the short write (still buffered).
         let mut rest = vec![0.0f32; 1023];
         assert_eq!(jb.pop(&mut rest), 1023);
-        assert!(out.iter().all(|&s| s == 1.0));
         assert!(rest.iter().all(|&s| s == 1.0));
+        assert_eq!(jb.available(), 1, "the short write's sample is buffered");
+        let mut last = vec![0.0f32; 1];
+        assert_eq!(jb.pop(&mut last), 1);
+        assert_eq!(last[0], 2.0, "first pushed sample of the short write");
         assert_eq!(jb.available(), 0);
     }
 

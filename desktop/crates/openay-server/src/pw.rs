@@ -328,9 +328,22 @@ fn create_link_verified(
 /// buffer. No allocation, no locking, no logging.
 ///
 /// Policy (per plan): emit silence until `available >= target_samples`, then
-/// pop as much as fits; if a callback has to zero-fill any part of the
-/// buffer, count one underrun and drop back to the silence (prebuffer) state
-/// so the next burst starts clean instead of crackling.
+/// pop as much as fits and keep streaming. The graph quantum (1024 samples
+/// @ 48 kHz ≈ 21 ms) exceeds the prebuffer target (default 10 ms), so a
+/// partial pop — zero-filling the tail of a quantum — is *normal* operation
+/// and does not stop streaming. Only a completely dry pop while streaming is
+/// an underrun: it is counted and drops the stream back to the prebuffer
+/// state so the next burst starts clean instead of crackling.
+///
+/// The dequeued buffer's data slice can be much larger than one quantum
+/// (the negotiated pool block may hold 16384 samples while the graph's
+/// quantum is 1024). We therefore fill at most one quantum per callback and
+/// advertise exactly that in `chunk.size`; claiming the whole slice would
+/// make the sink consume ~16 quanta per callback and stall the stream (the
+/// callback would only fire every ~16 driver cycles, draining the jitter
+/// buffer at a fraction of the production rate).
+const QUANTUM_SAMPLES: usize = 1024;
+
 fn process_callback(stream: &pw::stream::StreamRef, shared: &mut PwShared) {
     let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
@@ -351,28 +364,29 @@ fn process_callback(stream: &pw::stream::StreamRef, shared: &mut PwShared) {
     let samples: &mut [f32] =
         unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<f32>(), n_f32) };
 
+    let fill = QUANTUM_SAMPLES.min(n_f32);
     let mut written = 0usize;
     if shared.streaming.load(Ordering::Relaxed)
         || shared.jitter.available() >= shared.target_samples
     {
         shared.streaming.store(true, Ordering::Relaxed);
-        written = shared.jitter.pop(samples);
+        written = shared.jitter.pop(&mut samples[..fill]);
     }
-    if written < samples.len() {
+    if written < fill {
         // Zero-fill the remainder: either still prebuffering (silence is
-        // expected) or a streaming underrun. Count one underrun per callback
-        // that had to zero-fill while streaming — including the case where
-        // the buffer ran completely dry — then reset the streaming latch so
-        // the stream re-prebuffers instead of crackling.
-        samples[written..].fill(0.0);
-        if shared.streaming.load(Ordering::Relaxed) {
+        // expected) or the tail of a quantum that the jitter buffer could
+        // not fill yet (normal, the quantum exceeds the prebuffer target).
+        samples[written..fill].fill(0.0);
+        // Only a completely dry pop while streaming is a real underrun; it
+        // resets the streaming latch so the stream re-prebuffers.
+        if written == 0 && shared.streaming.load(Ordering::Relaxed) {
             shared.jitter.note_underrun();
+            shared.streaming.store(false, Ordering::Relaxed);
         }
-        shared.streaming.store(false, Ordering::Relaxed);
     }
 
     let chunk = data.chunk_mut();
     *chunk.offset_mut() = 0;
     *chunk.stride_mut() = (4 * CHANNELS) as i32;
-    *chunk.size_mut() = (4 * samples.len()) as u32;
+    *chunk.size_mut() = (4 * fill) as u32;
 }
