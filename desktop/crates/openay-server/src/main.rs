@@ -134,30 +134,26 @@ async fn main() -> Result<()> {
     #[cfg(feature = "pipewire")]
     let mut pw_setup = Some(tokio::task::spawn_blocking(move || pw_setup_rx.recv()));
 
-    // Wait for Ctrl-C, or for an early PipeWire setup failure.
+    // Wait for Ctrl-C, or for an early PipeWire setup failure. Whichever
+    // fires first ends the wait (both arms are terminal).
     #[cfg(feature = "pipewire")]
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                quit.store(true, Ordering::Relaxed);
-                break;
-            }
-            res = pw_setup.as_mut().expect("pw_setup pending"), if pw_setup.is_some() => {
-                pw_setup = None;
-                quit.store(true, Ordering::Relaxed);
-                // Only an Err message is ever sent (setup failed). A closed
-                // channel means the thread exited without the main loop
-                // having been stopped — report that too.
-                let msg = match res {
-                    Ok(Ok(Err(e))) => format!("PipeWire setup failed: {e}"),
-                    Ok(Ok(Ok(()))) => "PipeWire thread exited unexpectedly".to_string(),
-                    Ok(Err(_)) | Err(_) => {
-                        "PipeWire setup channel closed unexpectedly".to_string()
-                    }
-                };
-                pw_error = Some(msg);
-                break;
-            }
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            quit.store(true, Ordering::Relaxed);
+        }
+        res = pw_setup.as_mut().expect("pw_setup pending"), if pw_setup.is_some() => {
+            quit.store(true, Ordering::Relaxed);
+            // Only an Err message is ever sent (setup failed). A closed
+            // channel means the thread exited without the main loop
+            // having been stopped — report that too.
+            let msg = match res {
+                Ok(Ok(Err(e))) => format!("PipeWire setup failed: {e}"),
+                Ok(Ok(Ok(()))) => "PipeWire thread exited unexpectedly".to_string(),
+                Ok(Err(_)) | Err(_) => {
+                    "PipeWire setup channel closed unexpectedly".to_string()
+                }
+            };
+            pw_error = Some(msg);
         }
     }
 

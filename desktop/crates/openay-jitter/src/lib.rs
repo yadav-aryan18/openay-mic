@@ -13,6 +13,11 @@
 //!   plus the ring storage behind an [`UnsafeCell`] (see [`JitterBuffer`] for
 //!   the soundness argument). There are no locks and no allocations after
 //!   construction.
+//! - Occupancy is derived from the two monotonic indices (`head - tail`),
+//!   never from a third shared counter: each thread writes **only its own**
+//!   index, so no update can ever be lost to a read-modify-write race
+//!   (a shared "length" counter that both sides store to would suffer lost
+//!   updates when a load-store pair interleaves, which is why it is avoided).
 //! - `push` is all-or-nothing: if the whole block does not fit, *nothing* is
 //!   written and the block counts as an overrun. Dropping a whole frame is
 //!   better than tearing it across the ring boundary, which would glitch the
@@ -47,10 +52,11 @@ fn next_pow2(x: usize) -> usize {
 /// A lock-free single-producer/single-consumer ring of `f32` samples.
 ///
 /// `head` is the write index (producer only) and `tail` the read index
-/// (consumer only); both advance monotonically and are masked on access.
-/// Occupancy is tracked by the shared atomic `len` counter, which both sides
-/// update — this avoids the classic full-vs-empty ambiguity of masked index
-/// arithmetic (a full ring would otherwise read as empty).
+/// (consumer only); both advance **monotonically** — they are masked only on
+/// access, never stored masked. This removes the classic full-vs-empty
+/// ambiguity (a full ring is `head - tail == capacity`, an empty one is
+/// `head - tail == 0`) and, because each thread writes only its own index,
+/// no update can be lost to an interleaved read-modify-write.
 ///
 /// # Soundness of the interior mutability
 ///
@@ -59,16 +65,18 @@ fn next_pow2(x: usize) -> usize {
 ///
 /// - There is exactly **one producer thread** (calls [`push`](Self::push))
 ///   and exactly **one consumer thread** (calls [`pop`](Self::pop)).
-/// - Producer: write cells `[head, head + n)`, then
-///   `head.store(n, Release)`, then `len.store(len + n, Release)`.
-/// - Consumer: `len.load(Acquire)` (synchronizes with the producer's
-///   `len.store`, making the data and `head` visible), read cells
-///   `[tail, tail + take)`, then `tail.store(take, Release)`, then
-///   `len.store(len - take, Release)`.
-/// - The producer's next `len.load(Acquire)` synchronizes with the
-///   consumer's `len.store`, so the cells it is about to overwrite were
-///   fully read (and published via `tail.store`) before being reused. The
-///   write region and the read region are therefore always disjoint, so the
+/// - Producer: `tail.load(Acquire)` (synchronizes with the consumer's
+///   `tail.store(Release)`, which publishes that the cells below the new tail
+///   were fully read and are free to reuse), free-space check, write cells
+///   `[head, head + n)`, then `head.store(head + n, Release)`.
+/// - Consumer: `head.load(Acquire)` (synchronizes with the producer's
+///   `head.store(Release)`, publishing the data writes), read cells
+///   `[tail, tail + take)`, then `tail.store(tail + take, Release)`.
+/// - The producer writes only cells below `tail + capacity` (its free-space
+///   check), all of which the consumer finished reading before publishing
+///   that `tail`; the consumer reads only cells below the `head` it loaded,
+///   which the producer finished writing before publishing it. The write
+///   region and the read region are therefore always disjoint, so the
 ///   `&mut [f32]` / `&[f32]` slices the two threads create never alias the
 ///   same cell.
 /// - [`reset`](Self::reset) must not run concurrently with `push`/`pop`.
@@ -78,10 +86,10 @@ pub struct JitterBuffer {
     buf: UnsafeCell<Vec<f32>>,
     /// `capacity - 1`, the ring mask.
     mask: usize,
+    /// Producer's monotonic write index; written only by the producer.
     head: AtomicUsize,
+    /// Consumer's monotonic read index; written only by the consumer.
     tail: AtomicUsize,
-    /// Samples currently buffered (the occupancy), maintained by both sides.
-    len: AtomicUsize,
     overruns: AtomicU64,
     underruns: AtomicU64,
 }
@@ -105,7 +113,6 @@ impl JitterBuffer {
             mask: cap - 1,
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
-            len: AtomicUsize::new(0),
             overruns: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
         }
@@ -128,20 +135,24 @@ impl JitterBuffer {
         if n == 0 {
             return 0;
         }
-        let len = self.len.load(Ordering::Acquire);
-        let free = self.capacity() - len;
-        if n > free {
+        // Acquire syncs with the consumer's Release `tail.store`: everything
+        // below the loaded tail was fully read, so the cells we are about to
+        // write (all of which are below `tail + capacity`) are provably not
+        // being read concurrently.
+        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Relaxed);
+        if n > self.capacity() - (head - tail) {
             self.overruns.fetch_add(1, Ordering::Relaxed);
             return 0;
         }
-        let head = self.head.load(Ordering::Relaxed);
         let start = head & self.mask;
         let first = (self.capacity() - start).min(n);
         // SAFETY: SPSC protocol — the producer is the only thread writing the
         // ring, and every cell in `[start, start + n)` was released by the
-        // consumer (its reads were published by its `tail.store` + `len.store`
-        // pair, which the `len.load(Acquire)` above synchronized with), so the
-        // write slices never alias cells the consumer is concurrently reading.
+        // consumer (its reads were published by the `tail.store(Release)`
+        // that the `tail.load(Acquire)` above synchronized with), so the
+        // write slices never alias cells the consumer is concurrently
+        // reading.
         unsafe {
             let ptr = (*self.buf.get()).as_mut_ptr();
             std::slice::from_raw_parts_mut(ptr.add(start), first)
@@ -150,8 +161,8 @@ impl JitterBuffer {
                 std::slice::from_raw_parts_mut(ptr, n - first).copy_from_slice(&samples[first..]);
             }
         }
+        // Release publishes both the data writes and the new head position.
         self.head.store(head.wrapping_add(n), Ordering::Release);
-        self.len.store(len + n, Ordering::Release);
         n
     }
 
@@ -164,16 +175,19 @@ impl JitterBuffer {
         if n == 0 {
             return 0;
         }
-        let len = self.len.load(Ordering::Acquire);
-        let take = n.min(len);
+        // Acquire syncs with the producer's Release `head.store`, so the
+        // samples we are about to read were fully written before being
+        // published.
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Relaxed);
+        let take = n.min(head - tail);
         if take == 0 {
             return 0;
         }
-        let tail = self.tail.load(Ordering::Relaxed);
         let start = tail & self.mask;
         let first = (self.capacity() - start).min(take);
-        // SAFETY: SPSC protocol — the `len.load(Acquire)` above synchronized
-        // with the producer's `len.store`, so the samples in
+        // SAFETY: SPSC protocol — the `head.load(Acquire)` above synchronized
+        // with the producer's `head.store(Release)`, so the samples in
         // `[start, start + take)` were fully written and published before the
         // consumer reads them; the consumer is the only thread reading them,
         // so the read slices never alias cells the producer is concurrently
@@ -185,14 +199,17 @@ impl JitterBuffer {
                 out[first..take].copy_from_slice(std::slice::from_raw_parts(ptr, take - first));
             }
         }
+        // Release publishes the cells as read (and hence reusable by the
+        // producer's next `tail.load(Acquire)`).
         self.tail.store(tail.wrapping_add(take), Ordering::Release);
-        self.len.store(len - take, Ordering::Release);
         take
     }
 
     /// Samples currently buffered and ready to pop.
     pub fn available(&self) -> usize {
-        self.len.load(Ordering::Acquire)
+        self.head
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.tail.load(Ordering::Relaxed))
     }
 
     /// Free samples (capacity minus available).
@@ -229,7 +246,6 @@ impl JitterBuffer {
     pub fn reset(&self) {
         self.head.store(0, Ordering::Release);
         self.tail.store(0, Ordering::Release);
-        self.len.store(0, Ordering::Release);
         self.overruns.store(0, Ordering::Relaxed);
         self.underruns.store(0, Ordering::Relaxed);
     }
