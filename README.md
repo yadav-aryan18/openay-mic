@@ -23,7 +23,7 @@ solutions like WO Mic on latency, security, and UX.
   (`OPUS_APPLICATION_RESTRICTED_LOWDELAY`, 10 ms frames).
 - Wire format: see [`shared/protocol.md`](shared/protocol.md).
 
-## Building & testing (Phase 3 state)
+## Building & testing (Phase 4 state)
 
 All tooling is user-space; no root required.
 
@@ -58,6 +58,12 @@ scripts/run_phase2.sh
   - On emulator: full chain device->host over UDP (10.0.2.2) and TCP (adb
     reverse), zero loss; on-device Opus encoding verified; real-audio content
     path proven on host (440 Hz sine -> WAV, RMS matches reference)
-- [ ] Phase 4 — PipeWire virtual source node + jitter buffer
+- [x] Phase 4 — PipeWire virtual source node + jitter buffer
+  - `openay-server`: UDP/TCP receiver → seq tracking → PCM/Opus decode →
+    lock-free jitter buffer → native PipeWire source (`openay_mic`,
+    Audio/Source/Virtual via null-audio-sink + link-factory)
+  - Live against the system daemon: recordable as a real "OpenAY Mic"
+    source; 440 Hz tone round-trips with zero packet loss and bit-exact
+    amplitude (RMS 9267 per 100 ms bucket, no dropouts)
 - [ ] Phase 5 — Compose UI (Android) / Slint tray app (desktop)
 - [ ] Phase 6 — latency audit, xrun handling, CPU profiling
