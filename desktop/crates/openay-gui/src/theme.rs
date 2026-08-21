@@ -1,7 +1,7 @@
 //! OpenAY Mic design system — palette and typography from `shared/design.md`
 //! ("Studio rack at night"). Every color/type decision below is binding.
 
-use iced::widget::{button, container, text_input};
+use iced::widget::{button, container, pick_list, text_input};
 use iced::{Border, Color, Font};
 
 // ---------------------------------------------------------------------------
@@ -48,14 +48,38 @@ pub const CHAKRA_MEDIUM: &[u8] = include_bytes!("../../../../shared/fonts/Chakra
 pub const PLEX_REGULAR: &[u8] = include_bytes!("../../../../shared/fonts/IBMPlexMono-Regular.ttf");
 pub const PLEX_MEDIUM: &[u8] = include_bytes!("../../../../shared/fonts/IBMPlexMono-Medium.ttf");
 
+// IMPORTANT (iced 0.13 font matching): iced registers embedded fonts in its
+// cosmic-text fontdb, which keys faces by the **typographic family** from the
+// name table (name_id 16, falling back to name_id 1). All four bundled TTFs
+// set name_id 16 to "Chakra Petch" / "IBM Plex Mono" — the weight lives in
+// name_id 17 (SemiBold / Medium / Regular), NOT in the family string. A
+// `Font::with_name("Chakra Petch SemiBold")` therefore matches nothing and
+// iced silently falls back to the default system font (DejaVu), which is how
+// the menu "≡" rendered as a tofu box. Match family + weight separately:
+
 /// Display/labels: Chakra Petch SemiBold (headers/lamp).
-pub const FONT_HEADER: Font = Font::with_name("Chakra Petch SemiBold");
+pub const FONT_HEADER: Font = Font {
+    family: iced::font::Family::Name("Chakra Petch"),
+    weight: iced::font::Weight::Semibold,
+    ..Font::DEFAULT
+};
 /// Stage labels, chips: Chakra Petch Medium.
-pub const FONT_LABEL: Font = Font::with_name("Chakra Petch Medium");
+pub const FONT_LABEL: Font = Font {
+    family: iced::font::Family::Name("Chakra Petch"),
+    weight: iced::font::Weight::Medium,
+    ..Font::DEFAULT
+};
 /// Data/numbers: IBM Plex Mono Regular.
-pub const FONT_MONO: Font = Font::with_name("IBM Plex Mono Regular");
+pub const FONT_MONO: Font = Font {
+    family: iced::font::Family::Name("IBM Plex Mono"),
+    ..Font::DEFAULT
+};
 /// Data/numbers, emphasized: IBM Plex Mono Medium.
-pub const FONT_MONO_MEDIUM: Font = Font::with_name("IBM Plex Mono Medium");
+pub const FONT_MONO_MEDIUM: Font = Font {
+    family: iced::font::Family::Name("IBM Plex Mono"),
+    weight: iced::font::Weight::Medium,
+    ..Font::DEFAULT
+};
 
 // ---------------------------------------------------------------------------
 // Component styles
@@ -107,6 +131,9 @@ pub fn engraved_button(theme: &iced::Theme, status: button::Status) -> button::S
 }
 
 /// The ON AIR toggle: engraved ring in standby, amber glow ring on air.
+/// While held (pressed), the cold ring brightens from line to dim — the
+/// short 200 ms halo flash in `app.rs` covers the design's ring pulse, and
+/// this is the instant held-state feedback. No bounce/spring.
 pub fn air_button(theme: &iced::Theme, status: button::Status, live: bool) -> button::Style {
     let _ = theme;
     let (ring, fg) = if live { (AMBER, CREAM) } else { (LINE, DIM) };
@@ -120,8 +147,8 @@ pub fn air_button(theme: &iced::Theme, status: button::Status, live: bool) -> bu
         text_color: fg,
         ..button::Style::default()
     };
-    if live && matches!(status, button::Status::Pressed) {
-        style.border.color = AMBER;
+    if matches!(status, button::Status::Pressed) {
+        style.border.color = if live { AMBER } else { DIM };
     }
     style
 }
@@ -142,3 +169,46 @@ pub fn settings_input(theme: &iced::Theme, _status: text_input::Status) -> text_
         selection: AMBER,
     }
 }
+
+/// Bind-address pick list (settings panel): hairline, warm, same language as
+/// the text input next to it. The dropdown menu keeps the theme defaults,
+/// which derive from this palette (warm, dark) and therefore stay on-token.
+pub fn settings_pick_list(
+    theme: &iced::Theme,
+    status: pick_list::Status,
+) -> pick_list::Style {
+    let _ = theme;
+    let border = match status {
+        pick_list::Status::Hovered | pick_list::Status::Opened => DIM,
+        _ => LINE,
+    };
+    pick_list::Style {
+        text_color: CREAM,
+        placeholder_color: DIM,
+        handle_color: AMBER,
+        background: iced::Background::Color(INK),
+        border: Border {
+            radius: 2.0.into(),
+            width: 1.0,
+            color: border,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Typography notes (binding, design.md §Typography)
+// ---------------------------------------------------------------------------
+
+// NOTE (letter-spacing / "+8% tracking"): design.md calls for wide tracking
+// (+8%) on the all-caps Chakra Petch stage labels. iced 0.13's text pipeline
+// (cosmic-text) exposes NO letter-spacing on the `Text` widget — there is no
+// `tracking`/`letter_spacing` field anywhere in `iced_core::widget::text` or
+// `iced_widget::text` (verified against iced 0.13.1 / iced-widget 0.13.4).
+// Emulating tracking by inserting space glyphs between characters would be
+// ~+50% tracking (a full space at 10 px is far wider than +8%) and would
+// corrupt the strings the glyph-safety test audits, so we do NOT fake it.
+// Instead the "wide, engraved, silkscreen" reading comes from: all-caps
+// labels, Chakra Petch's squared letterforms, DIM color, and the generous
+// 4 px/8 px gaps around each label. Documented here so the gap between the
+// design brief and the widget toolkit is explicit rather than silent.
+//

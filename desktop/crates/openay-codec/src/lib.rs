@@ -175,7 +175,7 @@ mod tests {
         // Encode + decode frame by frame, timing each round trip.
         let mut decoded = Vec::with_capacity(pcm.len());
         let mut total_ns: u128 = 0;
-        for frame in pcm.chunks_exact(FRAME_SAMPLES) {
+        for frame in pcm.as_chunks::<FRAME_SAMPLES>().0 {
             let t0 = std::time::Instant::now();
             let pkt = codec.encode(frame).expect("encode frame");
             let out = codec.decode(&pkt).expect("decode frame");
@@ -310,12 +310,12 @@ mod tests {
         let mut codec = OpusCodec::new().unwrap();
         codec.set_bitrate(32_000).unwrap();
         let small: Vec<usize> = pcm
-            .chunks_exact(FRAME_SAMPLES)
+            .as_chunks::<FRAME_SAMPLES>().0.iter()
             .map(|f| codec.encode(f).unwrap().len())
             .collect();
         codec.set_bitrate(96_000).unwrap();
         let large: Vec<usize> = pcm
-            .chunks_exact(FRAME_SAMPLES)
+            .as_chunks::<FRAME_SAMPLES>().0.iter()
             .map(|f| codec.encode(f).unwrap().len())
             .collect();
         let avg = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len() as f64;

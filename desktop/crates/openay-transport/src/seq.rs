@@ -99,7 +99,7 @@ mod tests {
         // Stream continues from 15.
         assert_eq!(t.update(15), SeqEvent::InOrder);
         // A larger jump across the 32768 threshold is a reorder, not a gap.
-        assert_eq!(t.update(16).is_gap(), false);
+        assert!(!t.update(16).is_gap());
     }
 
     #[test]

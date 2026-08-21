@@ -12,13 +12,30 @@
 //! # Architecture
 //!
 //! [`spawn_engine`] starts a dedicated engine thread (with its own tokio
-//! runtime) and returns an [`EngineHandle`]. Commands ([`Start`]/
-//! [`Stop`](EngineCommand::Stop)) are sent over the handle's channel; status
-//! is read as a cheap snapshot ([`EngineHandle::status`]). The engine can be
-//! stopped and restarted with a different config without creating a new
-//! handle, which is what settings changes in the GUI rely on.
+//! runtime) and returns an [`EngineHandle`]. **The handle is cold at
+//! creation**: no sockets are bound and nothing is received until an
+//! [`EngineCommand::Start`] is sent. The optional config passed to
+//! [`spawn_engine`] is only recorded as the defaults for the first `Start`
+//! (it also feeds the standby [`EngineStatus`] display); the caller starts
+//! the engine explicitly:
+//!
+//! ```ignore
+//! let handle = spawn_engine(Some(config));
+//! handle.cmd().send(EngineCommand::Start(config)).await?;
+//! ```
+//!
+//! Commands ([`Start`] / [`Stop`]) are sent over the
+//! handle's channel; status is read as a cheap snapshot
+//! ([`EngineHandle::status`]). The engine can be stopped and restarted with
+//! a different config without creating a new handle, which is what settings
+//! changes in the GUI rely on. Each `Start` begins a fresh run: while
+//! stopped, the snapshot reports `running == false` with every transport
+//! counter, `fill_ms`, `level_peak`, and `uptime_secs` at zero; the run's
+//! final numbers survive only in the canonical stats line (see
+//! [`EngineHandle::take_stats_line`]).
 //!
 //! [`Start`]: EngineCommand::Start
+//! [`Stop`]: EngineCommand::Stop
 
 mod ingest;
 #[cfg(feature = "pipewire")]
@@ -167,6 +184,13 @@ impl EngineConfig {
 
 /// Snapshot of the engine's live state.
 ///
+/// Per-run semantics: all fields describe the *current* run only. When
+/// [`running`](EngineStatus::running) is `false` — never started, stopped,
+/// or failed to start — every transport counter (`received`, `lost`, `dup`,
+/// `ooo`, `malformed`, `overruns`, `underruns`), `fill_ms`, `level_peak`,
+/// and `uptime_secs` reads zero. [`take_stats_line`](EngineHandle::take_stats_line)
+/// is the only way to obtain a run's final numbers after it has stopped.
+///
 /// [`level_peak`](EngineStatus::level_peak) is the peak capture level over
 /// the interval since the *previous* snapshot, in `0.0..=1.0` — each
 /// `status()` call consumes the interval (same semantics as the Android
@@ -189,7 +213,7 @@ pub struct EngineStatus {
     /// Jitter buffer occupancy in ms of audio.
     pub fill_ms: f32,
     /// Peak capture level since the last snapshot, `0.0..=1.0`
-    /// (consumed on read).
+    /// (consumed on read; always `0.0` while stopped).
     pub level_peak: f32,
     /// Seconds since the last `Start` (0 when stopped).
     pub uptime_secs: u64,
@@ -217,6 +241,13 @@ pub struct EngineHandle {
 impl EngineHandle {
     /// A snapshot of the current engine state. The level peak is consumed
     /// by this call (see [`EngineStatus::level_peak`]).
+    ///
+    /// Per-run semantics: when `running == false` every transport counter
+    /// (`received`/`lost`/`dup`/`ooo`/`malformed`/`overruns`/`underruns`),
+    /// `fill_ms`, `level_peak`, and `uptime_secs` read zero — the snapshot
+    /// describes the current run only, never lifetime totals. Use
+    /// [`EngineHandle::take_stats_line`] for a run's final numbers after
+    /// `Stop`.
     pub fn status(&self) -> EngineStatus {
         let running = self.state.running.load(Ordering::Relaxed);
         let cfg = self
@@ -225,6 +256,8 @@ impl EngineHandle {
             .lock()
             .expect("engine config mutex poisoned")
             .unwrap_or_default();
+        // Always consume the peak accumulator (it is stale once stopped);
+        // only report it while running.
         let level_peak = self.state.peak.swap(0, Ordering::Relaxed) as f32 / PEAK_SCALE as f32;
 
         let mut s = EngineStatus {
@@ -241,7 +274,7 @@ impl EngineHandle {
             overruns: 0,
             underruns: 0,
             fill_ms: 0.0,
-            level_peak,
+            level_peak: if running { level_peak } else { 0.0 },
             uptime_secs: 0,
         };
 
@@ -280,21 +313,6 @@ impl EngineHandle {
             {
                 s.uptime_secs = t0.elapsed().as_secs();
             }
-        } else if let Some(f) = self
-            .state
-            .stats
-            .lock()
-            .expect("stats mutex poisoned")
-            .as_ref()
-        {
-            s.received = f.received;
-            s.lost = f.lost;
-            s.dup = f.dup;
-            s.ooo = f.ooo;
-            s.malformed = f.malformed;
-            s.overruns = f.overruns;
-            s.underruns = f.underruns;
-            s.fill_ms = f.fill_ms;
         }
         s
     }
@@ -303,12 +321,14 @@ impl EngineHandle {
     /// the engine).
     ///
     /// [`Start`]: EngineCommand::Start
+    /// [`Stop`]: EngineCommand::Stop
     pub fn cmd(&self) -> mpsc::Sender<EngineCommand> {
         self.cmd_tx.clone()
     }
 
     /// The most recent fatal error (bind failure, PipeWire setup failure,
-    /// network task panic), cleared by the next successful `Start`.
+    /// network task panic), cleared when the next `Start` begins — a failed
+    /// start immediately sets a fresh error in its place.
     pub fn last_error(&self) -> Option<String> {
         self.state
             .last_error
@@ -317,8 +337,10 @@ impl EngineHandle {
             .clone()
     }
 
-    /// The final stats line of the last stopped run
-    /// (the canonical `SRV transport=...` line, printed once by the CLI).
+    /// The canonical `SRV transport=...` stats line of the last *stopped*
+    /// run (printed once by the CLI). `take`-ing it consumes it; it is also
+    /// cleared at the beginning of every `Start`, so a failed start never
+    /// surfaces a stale line from an earlier run.
     pub fn take_stats_line(&self) -> Option<String> {
         self.state
             .last_stats_line
@@ -331,16 +353,20 @@ impl EngineHandle {
 /// Shared engine state, readable from any thread.
 struct EngineState {
     running: AtomicBool,
+    /// The engine's current/standby config (last successful `Start`, or the
+    /// config passed to [`spawn_engine`] before the first start). Reported by
+    /// `status()` even while stopped, so callers can render the standby
+    /// state with the intended transport/bind/port/codec.
     config: Mutex<Option<EngineConfig>>,
     jitter: Mutex<Option<Arc<JitterBuffer>>>,
     ingest: Mutex<Option<Arc<Mutex<Ingest>>>>,
     started_at: Mutex<Option<Instant>>,
     last_error: Mutex<Option<String>>,
     last_stats_line: Mutex<Option<String>>,
-    stats: Mutex<Option<FinalStats>>,
     /// Max |sample| over the current interval, scaled to `0..=65535`.
     /// Written by the PipeWire RT callback (strict-max CAS), read by
-    /// exchanging (consumed per snapshot).
+    /// exchanging (consumed per snapshot). Reset to 0 on every `Start`/`Stop`
+    /// so a stopped engine never reports a stale peak.
     peak: Arc<AtomicU32>,
 }
 
@@ -354,24 +380,9 @@ impl Default for EngineState {
             started_at: Mutex::new(None),
             last_error: Mutex::new(None),
             last_stats_line: Mutex::new(None),
-            stats: Mutex::new(None),
             peak: Arc::new(AtomicU32::new(0)),
         }
     }
-}
-
-/// Stats frozen at pipeline teardown, so `status()` still reports
-/// meaningful numbers while stopped.
-#[derive(Debug, Clone, Copy, Default)]
-struct FinalStats {
-    received: u64,
-    lost: u64,
-    dup: u64,
-    ooo: u64,
-    malformed: u64,
-    overruns: u64,
-    underruns: u64,
-    fill_ms: f32,
 }
 
 impl EngineState {
@@ -382,14 +393,50 @@ impl EngineState {
     fn clear_error(&self) {
         *self.last_error.lock().expect("error mutex poisoned") = None;
     }
+
+    fn clear_last_stats_line(&self) {
+        *self
+            .last_stats_line
+            .lock()
+            .expect("stats line mutex poisoned") = None;
+    }
+
+    fn mark_running(&self) {
+        self.running.store(true, Ordering::Relaxed);
+    }
+
+    fn mark_stopped(&self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Spawn the engine on a dedicated thread (with its own tokio runtime) and
-/// return a handle. If `initial` is `Some`, the engine starts with that
-/// config immediately.
+/// return a handle. The handle starts **cold**: no sockets are bound and no
+/// pipeline runs until an [`EngineCommand::Start`] is sent.
+///
+/// `initial` (if `Some`) is recorded as the *default configuration* for the
+/// standby [`EngineStatus`] display (transport, bind, port, codec) and as the
+/// config the engine considers current until the first `Start` overwrites
+/// it. It is deliberately **not** started — the caller must send
+/// [`EngineCommand::Start`] to begin receiving. The CLI follows the
+/// canonical pattern:
+///
+/// ```ignore
+/// let handle = spawn_engine(Some(config));
+/// handle.cmd().send(EngineCommand::Start(config)).await?;
+/// ```
+///
+/// The handle is cheap to clone. Dropping every clone of the handle closes
+/// the command channel and lets the engine wind down after the running
+/// pipeline finishes.
 pub fn spawn_engine(initial: Option<EngineConfig>) -> EngineHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
     let state = Arc::new(EngineState::default());
+    // The config is only "defaults for the first Start": publish it for the
+    // standby status display, but do NOT start a pipeline.
+    if let Some(cfg) = initial {
+        *state.config.lock().expect("engine config mutex poisoned") = Some(cfg);
+    }
     let thread_state = state.clone();
     std::thread::Builder::new()
         .name("openay-engine".into())
@@ -399,26 +446,20 @@ pub fn spawn_engine(initial: Option<EngineConfig>) -> EngineHandle {
                 .enable_all()
                 .build()
                 .expect("building the engine tokio runtime");
-            rt.block_on(engine_main(cmd_rx, thread_state, initial));
+            rt.block_on(engine_main(cmd_rx, thread_state));
         })
         .expect("spawning the engine thread");
     EngineHandle { cmd_tx, state }
 }
 
 /// The engine's command loop: owns the lifecycle of the pipeline.
-async fn engine_main(
-    mut cmd_rx: mpsc::Receiver<EngineCommand>,
-    state: Arc<EngineState>,
-    initial: Option<EngineConfig>,
-) {
+///
+/// The engine is cold on entry: nothing runs until a `Start` command
+/// arrives. A pipeline that dies on its own (bind failure, PipeWire setup
+/// failure) is reaped on the periodic tick, which also guarantees
+/// `status().running == false` once the network task has exited.
+async fn engine_main(mut cmd_rx: mpsc::Receiver<EngineCommand>, state: Arc<EngineState>) {
     let mut pipeline: Option<Pipeline> = None;
-
-    if let Some(cfg) = initial {
-        match start_pipeline(cfg, &state).await {
-            Ok(p) => pipeline = Some(p),
-            Err(e) => state.set_error(format!("{e:#}")),
-        }
-    }
 
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     loop {
@@ -463,6 +504,13 @@ async fn engine_main(
 
 /// A live pipeline: network receive task + optional PipeWire thread over one
 /// jitter buffer.
+///
+/// The `jitter` and `ingest` fields are never read directly (the compiler
+/// warns about them) but they are ownership-load-bearing: dropping the
+/// `Pipeline` decrements the `Arc` refcounts, keeping the jitter buffer and
+/// the ingest state alive for the network task until the pipeline is torn
+/// down.
+#[allow(dead_code)]
 struct Pipeline {
     jitter: Arc<JitterBuffer>,
     ingest: Arc<Mutex<Ingest>>,
@@ -491,9 +539,16 @@ impl Pipeline {
 }
 
 /// Start the pipeline for `config` and publish the shared state.
+///
+/// A `Start` resets every per-run counter: the jitter buffer and ingest
+/// state are created fresh, the level peak accumulator is zeroed, and any
+/// leftover stats line from a previous run is cleared (a failed `Start`
+/// therefore never surfaces stale numbers).
 async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Result<Pipeline> {
     let config = config.validated().map_err(|e| anyhow::anyhow!(e))?;
     state.clear_error();
+    state.clear_last_stats_line();
+    state.peak.store(0, Ordering::Relaxed);
 
     let capacity_samples = (config.capacity_ms * SAMPLE_RATE as f32 / 1000.0) as usize;
     let jitter = Arc::new(JitterBuffer::new(capacity_samples));
@@ -538,7 +593,7 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
         .started_at
         .lock()
         .expect("engine uptime mutex poisoned") = Some(Instant::now());
-    state.running.store(true, Ordering::Relaxed);
+    state.mark_running();
 
     Ok(Pipeline {
         jitter,
@@ -578,8 +633,10 @@ fn spawn_pw_monitor(
 }
 
 /// Tear the pipeline down: signal quit, await the network task (which
-/// returns the final stats line), reap the PipeWire thread, and freeze the
-/// stats for `status()` while stopped.
+/// returns the final stats line), reap the PipeWire thread, and reset the
+/// shared state so `status()` reports `running == false` with zeroed
+/// counters. The run's final numbers survive only in the stats line
+/// (retrievable via [`EngineHandle::take_stats_line`]).
 async fn stop_pipeline(p: Pipeline, state: &Arc<EngineState>) {
     p.quit.store(true, Ordering::Relaxed);
 
@@ -619,27 +676,15 @@ async fn stop_pipeline(p: Pipeline, state: &Arc<EngineState>) {
         }
     }
 
-    // Freeze the final stats so status() stays meaningful while stopped.
-    let fill_ms = p.jitter.available() as f32 / SAMPLE_RATE as f32 * 1000.0;
-    let g = p.ingest.lock().expect("ingest mutex poisoned");
-    let final_stats = FinalStats {
-        received: g.received,
-        lost: g.lost,
-        dup: g.duplicate,
-        ooo: g.out_of_order,
-        malformed: g.malformed,
-        overruns: p.jitter.overruns(),
-        underruns: p.jitter.underruns(),
-        fill_ms,
-    };
-    drop(g);
-    *state.stats.lock().expect("stats mutex poisoned") = Some(final_stats);
+    // The canonical stats line survives the stop; the snapshot counters do
+    // not (see the per-run semantics on `EngineStatus`).
     if let Some(line) = final_line {
         *state
             .last_stats_line
             .lock()
             .expect("stats line mutex poisoned") = Some(line);
     }
+    state.peak.store(0, Ordering::Relaxed);
     *state.jitter.lock().expect("engine jitter mutex poisoned") = None;
     *state.ingest.lock().expect("engine ingest mutex poisoned") = None;
     *state
@@ -647,12 +692,6 @@ async fn stop_pipeline(p: Pipeline, state: &Arc<EngineState>) {
         .lock()
         .expect("engine uptime mutex poisoned") = None;
     state.mark_stopped();
-}
-
-impl EngineState {
-    fn mark_stopped(&self) {
-        self.running.store(false, Ordering::Relaxed);
-    }
 }
 
 /// Run the receive pipeline until `quit` is set, then return the final

@@ -40,7 +40,7 @@ This puts Rust (`~/.cargo/bin`) and the conda env (which provides
 | `crates/openay-jitter`    | Lock-free SPSC `f32` jitter buffer (pure std, zero dependencies), prebuffer/overrun/underrun accounting |
 | `crates/openay-loopback`  | `openay-loopback` CLI: send/recv over UDP+TCP with full verification, one-way latency bench |
 | `crates/openay-server`    | Engine library + `openay-server` CLI: desktop receiver (UDP/TCP -> jitter buffer -> PipeWire virtual mic, `pipewire` feature). The engine API (`spawn_engine`/`EngineHandle`) is shared with the GUI |
-| `crates/openay-gui`       | `openay-gui` console: tray-resident Iced GUI (design.md "Studio rack at night") over the engine — The Chain hero card, VU ladder, ON AIR toggle, settings slide-over |
+| `crates/openay-gui`       | `openay-gui` console: Iced GUI (design.md "Studio rack at night") over the engine with a best-effort StatusNotifier tray — The Chain hero card, VU ladder, ON AIR toggle, settings slide-over; the window close button quits the app cleanly (no hide-to-tray) |
 
 ## Build & test
 
@@ -139,34 +139,40 @@ plus `level_peak == 0.0` in this network-only build.
 
 ## openay-gui console (Phase 5)
 
-The desktop console: a tray-resident Iced window implementing the
-`shared/design.md` "Studio rack at night" contract faithfully — ink/panel/
-cream/amber/tally palette, Chakra Petch + IBM Plex Mono (embedded from
-`shared/fonts/`), The Chain hero card (MIC level ring / LINK pps+loss /
-CONSOLE jitter target), a 24-segment VU ladder (18 cream / 3 amber / 3 red,
-~12 dB/s decay ballistics), the circular ON AIR/STANDBY toggle with a
-~400 ms power-on stagger, and a settings slide-over (port, bind-address
-dropdown from local interfaces, codec chips, 5–20 ms jitter slider,
-autostart / start-minimized / reduced-motion switches).
+The desktop console: an Iced window (with a best-effort StatusNotifier tray)
+implementing the `shared/design.md` "Studio rack at night" contract
+faithfully — ink/panel/cream/amber/tally palette, Chakra Petch + IBM Plex
+Mono (embedded from `shared/fonts/`), The Chain hero card (MIC level ring /
+LINK pps+loss / CONSOLE jitter target), a 24-segment VU ladder (18 cream /
+3 amber / 3 red, ~12 dB/s decay ballistics), the circular ON AIR/STANDBY
+toggle with a ~400 ms power-on stagger, and a settings slide-over (port,
+bind-address dropdown from local interfaces, codec chips, 5–20 ms jitter
+slider, autostart / start-minimized / reduced-motion switches).
 
 ```bash
 cargo build --release -p openay-gui --features openay-server/pipewire
-target/release/openay-gui                 # window; close-requested hides to tray
-target/release/openay-gui --minimized     # tray-only until Show Console
+target/release/openay-gui                 # window; the close button quits the app
+target/release/openay-gui --minimized     # starts hidden (tray-only) until "Show Console"
 ```
 
 - **Config**: `~/.config/openay-mic/config.toml` (serde/toml; missing or
   partial files load defaults). XDG autostart entry
   `~/.config/autostart/openay-mic.desktop` is written/removed by the
   AUTOSTART switch (Exec points at the running binary with `--minimized`).
-- **Tray** (ksni StatusNotifierItem): Show Console / Start / Stop (checkmark
-  state) / Quit; the 24x24 pixmap reflects the state (gray idle, amber
-  armed, red live) — generated once by `crates/openay-gui/tools/gen_icons.py`
-  into `src/icons.rs` (ARGB32 converted at runtime for the freedesktop spec).
+- **Window behaviour contract**: the window's close button (or Alt+F4)
+  ALWAYS quits the application cleanly — the engine is stopped and the tray
+  item unregistered before the runtime exits. There is no hide-to-tray.
+- **Tray** (ksni StatusNotifierItem, best-effort): Show Console / Start /
+  Stop (checkmark state) / Quit; the 24x24 pixmap reflects the state (gray
+  idle, amber armed, red live) — generated once by
+  `crates/openay-gui/tools/gen_icons.py` into `src/icons.rs` (ARGB32
+  converted at runtime for the freedesktop spec). If registration fails or
+  the desktop has no StatusNotifierWatcher, a warning is logged once and the
+  app continues fully usable as a plain window (and `--minimized` is
+  ignored, since there would be no way to restore the window).
 - **Robustness**: the engine handle is created once; settings changes stop,
-  mutate, and restart the pipeline on the same handle. Quitting the window
-  (close button) hides to the tray; real exit is via tray Quit. Second
-  launch behavior is intentionally undefined.
+  mutate, and restart the pipeline on the same handle. Second launch
+  behavior is intentionally undefined.
 - **Reduced motion**: a config flag drops the cable pulse and the power-on
   stagger (iced has no built-in API for it in 0.13).
 

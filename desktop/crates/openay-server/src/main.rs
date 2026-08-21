@@ -94,6 +94,12 @@ async fn main() -> Result<()> {
 
     let handle = spawn_engine(Some(config));
 
+    // Cold-start contract: spawn_engine never binds or starts a pipeline —
+    // the config it was given is just the defaults for the first Start. Send
+    // Start right away so the CLI binds immediately after launch (scripts
+    // and smoke flows depend on the port being live within ~200 ms).
+    handle.cmd().send(EngineCommand::Start(config)).await?;
+
     // Wait for Ctrl-C, or for an early engine stop (bind failure / PipeWire
     // setup failure). Whichever fires first ends the wait.
     loop {

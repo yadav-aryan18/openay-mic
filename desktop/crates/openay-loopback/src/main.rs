@@ -199,7 +199,7 @@ fn parse_opt_u64(v: Option<&String>, what: &str, default: u64) -> Result<u64> {
 /// Generate the `seq`-th test packet: alternating Pcm/Opus starting Pcm,
 /// xorshift(seed=seq) payload.
 fn gen_packet(seq: u16, payload_size: usize) -> Packet {
-    let kind = if seq % 2 == 0 {
+    let kind = if seq.is_multiple_of(2) {
         PayloadType::Pcm
     } else {
         PayloadType::Opus
@@ -212,7 +212,7 @@ fn gen_packet(seq: u16, payload_size: usize) -> Packet {
 /// Generate a bench packet: 8-byte LE monotonic-ns stamp followed by
 /// xorshift(seed=seq) filler.
 fn gen_bench_packet(seq: u16, stamp_ns: u64, payload_size: usize) -> Packet {
-    let kind = if seq % 2 == 0 {
+    let kind = if seq.is_multiple_of(2) {
         PayloadType::Pcm
     } else {
         PayloadType::Opus
@@ -300,7 +300,7 @@ impl RecvVerifier {
             SeqEvent::Reorder => self.stats.out_of_order += 1,
             _ => {}
         }
-        let expected_kind = if pkt.seq % 2 == 0 {
+        let expected_kind = if pkt.seq.is_multiple_of(2) {
             PayloadType::Pcm
         } else {
             PayloadType::Opus

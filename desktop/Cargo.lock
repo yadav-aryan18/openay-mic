@@ -2544,6 +2544,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "iced",
+ "iced_core",
  "if-addrs",
  "ksni",
  "openay-server",

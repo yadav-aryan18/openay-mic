@@ -20,3 +20,7 @@ toml = "0.8"
 anyhow = "1"
 dirs = "6"
 if-addrs = "0.15"
+
+[dev-dependencies]
+# Headless layout probing in unit tests (same version as the iced tree).
+iced_core = "0.13"

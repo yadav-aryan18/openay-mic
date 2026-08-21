@@ -10,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 /// Generate the `n`-th test packet (alternating Pcm/Opus, xorshift payload
 /// seeded with the sequence number) exactly as `openay-loopback` does.
 fn gen_packet(seq: u16, payload_size: usize) -> Packet {
-    let kind = if seq % 2 == 0 {
+    let kind = if seq.is_multiple_of(2) {
         PayloadType::Pcm
     } else {
         PayloadType::Opus
@@ -21,7 +21,7 @@ fn gen_packet(seq: u16, payload_size: usize) -> Packet {
 }
 
 fn assert_packet_matches(pkt: &Packet, seq: u16, payload_size: usize) {
-    let expected_kind = if seq % 2 == 0 {
+    let expected_kind = if seq.is_multiple_of(2) {
         PayloadType::Pcm
     } else {
         PayloadType::Opus

@@ -1,7 +1,13 @@
-//! OpenAY Mic desktop console — a tray-resident Iced GUI over the
-//! `openay-server` engine. Implements the "Studio rack at night" design
-//! (`shared/design.md`): The Chain hero card, VU ladder, ON AIR toggle, and
-//! a settings slide-over, all in the warm rack-unit palette.
+//! OpenAY Mic desktop console — an Iced GUI over the `openay-server` engine,
+//! with a best-effort StatusNotifier tray. Implements the "Studio rack at
+//! night" design (`shared/design.md`): The Chain hero card, VU ladder, ON AIR
+//! toggle, and a settings slide-over, all in the warm rack-unit palette.
+//!
+//! Window behaviour contract: the window's close button ALWAYS quits the
+//! application cleanly (stop engine, unregister tray). There is no
+//! hide-to-tray. The tray (if a StatusNotifierWatcher exists) offers
+//! Show/Start/Stop/Quit; `--minimized` only hides the window at startup and
+//! is ignored when no tray could be registered (the app must stay reachable).
 
 mod app;
 mod config;
@@ -26,8 +32,10 @@ fn window_settings(start_minimized: bool) -> window::Settings {
         visible: !start_minimized,
         resizable: true,
         decorations: true,
-        // The window never closes on its own: close-requested hides to the
-        // tray; the only real exit is the tray's Quit item.
+        // Close-requested is handled in `App::update`: it runs a cleanup
+        // task (engine stop, tray unregister) and then `iced::exit()`s.
+        // Keeping this false lets that cleanup happen before the runtime
+        // terminates.
         exit_on_close_request: false,
         ..window::Settings::default()
     }
@@ -50,17 +58,25 @@ fn main() -> iced::Result {
     // The engine: created once, reused across settings changes.
     let engine = openay_server::spawn_engine(None);
 
-    // System tray (best-effort; the app works without one).
+    // System tray (best-effort; the app works without one). If registration
+    // fails or the desktop has no StatusNotifierWatcher, warn once and
+    // continue — the app stays fully usable as a plain window, and the
+    // window close button quits it.
     let tray_bus = Arc::new(TrayBus::default());
     let tray = match spawn_tray(tray_bus.clone()) {
         Ok(t) => Some(t),
         Err(e) => {
-            eprintln!("openay-gui: tray unavailable: {e:#}; continuing without it");
+            eprintln!(
+                "openay-gui: warning: system tray unavailable ({e:#}); \
+                 running window-only (the window close button quits the app)"
+            );
             None
         }
     };
 
-    let minimized = cli_minimized || config.start_minimized;
+    // Only start hidden when there is a tray to restore the window; without
+    // one the app would be unreachable.
+    let minimized = (cli_minimized || config.start_minimized) && tray.is_some();
 
     let flags = Flags {
         engine,

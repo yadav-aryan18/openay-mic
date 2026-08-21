@@ -17,6 +17,9 @@ pub const RED_START: usize = SEGMENTS - RED_SEGMENTS;
 
 /// Decay rate of the VU ballistics in dB per second (design.md: ~12 dB/s).
 pub const DECAY_DB_PER_SEC: f32 = 12.0;
+/// Peak-hold decays a third as fast as the main reading (design.md: a single
+/// brighter segment at the recent max, decaying).
+pub const HOLD_DECAY_DB_PER_SEC: f32 = DECAY_DB_PER_SEC / 3.0;
 /// Levels below this dB floor snap to zero.
 pub const FLOOR_DB: f32 = -60.0;
 
@@ -90,23 +93,33 @@ pub fn zone_for(level: f32) -> Zone {
     }
 }
 
-/// VU ballistics state: instant attack, ~12 dB/s decay.
+/// VU ballistics state: instant attack, ~12 dB/s decay for the reading, and
+/// a peak-hold marker that decays a third as fast (design.md: "a single
+/// brighter segment at recent max, decaying").
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VuBallistics {
     level: f32,
+    peak_hold: f32,
 }
 
 impl Default for VuBallistics {
     fn default() -> Self {
-        VuBallistics { level: 0.0 }
+        VuBallistics {
+            level: 0.0,
+            peak_hold: 0.0,
+        }
     }
 }
 
 impl VuBallistics {
-    /// Create ballistics starting from a given displayed level.
+    /// Create ballistics starting from a given displayed level (the hold
+    /// starts at the same level).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(level: f32) -> Self {
-        VuBallistics { level }
+        VuBallistics {
+            level,
+            peak_hold: level,
+        }
     }
 
     /// Current displayed level.
@@ -114,8 +127,22 @@ impl VuBallistics {
         self.level
     }
 
+    /// The peak-hold level: the most recent maximum, decaying at
+    /// [`HOLD_DECAY_DB_PER_SEC`]. (Only the segment count is used by the
+    /// canvas; the level is exposed for tests and debugging.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn hold_level(&self) -> f32 {
+        self.peak_hold
+    }
+
+    /// Segments lit by the peak-hold (always >= `vu_segments(level())`).
+    pub fn hold_segments(&self) -> usize {
+        vu_segments(self.peak_hold)
+    }
+
     /// Fold a fresh peak sample into the displayed level after `dt` seconds:
-    /// rises instantly, decays at [`DECAY_DB_PER_SEC`] dB/s.
+    /// rises instantly, decays at [`DECAY_DB_PER_SEC`] dB/s. The peak-hold
+    /// rises instantly too but decays at [`HOLD_DECAY_DB_PER_SEC`].
     pub fn update(&mut self, peak: f32, dt: f32) -> f32 {
         let peak = peak.clamp(0.0, 1.0);
         if peak >= self.level {
@@ -124,6 +151,17 @@ impl VuBallistics {
             let db = level_to_db(self.level);
             let new_db = db - DECAY_DB_PER_SEC * dt.max(0.0);
             self.level = if new_db <= FLOOR_DB {
+                0.0
+            } else {
+                db_to_level(new_db)
+            };
+        }
+        if peak >= self.peak_hold {
+            self.peak_hold = peak;
+        } else if self.peak_hold > 0.0 {
+            let db = level_to_db(self.peak_hold);
+            let new_db = db - HOLD_DECAY_DB_PER_SEC * dt.max(0.0);
+            self.peak_hold = if new_db <= FLOOR_DB {
                 0.0
             } else {
                 db_to_level(new_db)
@@ -252,6 +290,51 @@ mod tests {
         let mut b = VuBallistics::default();
         b.update(2.0, 0.0);
         assert_eq!(b.level(), 1.0);
+    }
+
+    /// Peak-hold: attacks instantly with the peak, and after the level has
+    /// decayed the hold still marks the recent maximum (a "brighter segment
+    /// at recent max, decaying").
+    #[test]
+    fn ballistics_peak_hold_attacks_instantly_and_holds() {
+        let mut b = VuBallistics::default();
+        b.update(0.5, 1.0); // jump from 0 to 0.5 is instant
+        assert_eq!(b.hold_level(), 0.5);
+        assert_eq!(b.hold_segments(), vu_segments(0.5));
+
+        // 0.1 s later the reading has barely moved; the hold matches it.
+        b.update(0.5, 0.1);
+        assert!(b.hold_level() >= b.level());
+
+        // Level decays at 12 dB/s while the hold decays at 4 dB/s: after a
+        // long silence the hold still marks a higher segment than the
+        // reading (or both reach the floor together).
+        let mut b = VuBallistics::new(0.5); // -6.02 dB
+        b.update(0.0, 0.5); // level -12.02 dB, hold -8.02 dB
+        let level_db = level_to_db(b.level());
+        let hold_db = level_to_db(b.hold_level());
+        assert!(
+            (level_db - (-12.02)).abs() < 0.1,
+            "reading decays at 12 dB/s, got {level_db}"
+        );
+        assert!(
+            (hold_db - (-8.02)).abs() < 0.1,
+            "hold decays at 4 dB/s, got {hold_db}"
+        );
+        assert!(hold_db > level_db, "hold must lag behind the reading");
+        assert!(
+            b.hold_segments() >= vu_segments(b.level()),
+            "hold must never mark fewer segments than the reading"
+        );
+    }
+
+    #[test]
+    fn ballistics_peak_hold_never_goes_negative() {
+        let mut b = VuBallistics::new(db_to_level(-30.0));
+        b.update(0.0, 100.0); // long silence: both decay to the floor
+        assert_eq!(b.level(), 0.0);
+        assert_eq!(b.hold_level(), 0.0);
+        assert_eq!(b.hold_segments(), 0);
     }
 
     #[test]
