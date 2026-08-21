@@ -3,9 +3,10 @@
 //
 // Threading model
 // ---------------
-//   audio/RT thread  : IAudioSource::Deliver -> OnAudio() -> ring Push().
-//                      ONLY lock-free atomic ops here (hard RT constraint:
-//                      no I/O, no malloc, no mutex, no logging).
+//   audio/RT thread  : IAudioSource::Deliver -> OnAudio(): CAS-max input
+//                      level peak + byte conversion -> ring Push(). ONLY
+//                      lock-free atomic ops here (hard RT constraint: no I/O,
+//                      no malloc, no mutex, no logging).
 //   network thread   : polls the ring (1 ms granularity, <= 5 ms wait), pops
 //                      frame_ms*48 samples, encodes (PCM passthrough / Opus),
 //                      builds Packet{type, seq++ from 0, payload} and sends it
@@ -134,6 +135,14 @@ public:
     // Median RT-callback duration in microseconds; 0 until >= 2 samples.
     uint64_t callback_us_p50() const;
 
+    // Input level peak since the last call (max absolute sample, 0..32767);
+    // atomically consumed AND reset, so each call covers exactly its own
+    // interval (one UI poll period). RT-thread safe; no effect on the stream.
+    uint16_t ExchangeLevelPeak() {
+        return static_cast<uint16_t>(
+            level_peak_.exchange(0, std::memory_order_relaxed));
+    }
+
 private:
     void OnAudio(const int16_t* samples, size_t frames);  // RT thread
     void NetworkLoop();                                   // network thread
@@ -172,6 +181,17 @@ private:
     std::atomic<uint64_t> encode_errors_{0};
     std::atomic<uint64_t> send_errors_{0};
     std::atomic<int> last_error_{0};
+
+    // Input level meter: max |sample| seen since the last ExchangeLevelPeak(),
+    // 0..32767 (INT16_MIN clamps to 32767). Written on the RT thread with a
+    // relaxed compare-and-swap max loop (C++17 has no fetch_max; bounded
+    // retries — the accumulator only ever grows or resets to 0, so each retry
+    // either succeeds or sees a value >= the candidate and stops); consumed
+    // and reset by any thread via exchange(). Relaxed ordering is a deliberate
+    // choice: this is self-contained telemetry (a marginally stale/racing peak
+    // only shifts one UI poll by a frame), not a synchronization signal, so no
+    // release/acquire pairing is needed. RT-safe: lock-free, allocation-free.
+    std::atomic<uint32_t> level_peak_{0};
 
     // Callback-duration histogram (fixed size, RT-safe relaxed atomic
     // writes; median computed on the stats path).

@@ -27,6 +27,12 @@ std::unique_ptr<IAudioSource> MakeSource() {
 #endif
 }
 
+// round(peak / 32767 * 100) as an exact integer (0..100); no FP needed on the
+// stats path: floor(peak*100/32767 + 0.5) == (peak*200 + 32767) / 65534.
+uint32_t LevelPercent(uint32_t peak) {
+    return (peak * 200u + 32767u) / 65534u;
+}
+
 }  // namespace
 
 CaptureEngine::~CaptureEngine() { Stop(); }
@@ -84,12 +90,19 @@ bool CaptureEngine::IsRunning() const {
     return running_;
 }
 
+uint16_t CaptureEngine::ExchangeLevelPeak() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!running_ || !pipeline_) return 0;
+    return pipeline_->ExchangeLevelPeak();
+}
+
 std::string CaptureEngine::StatsJson() const {
     std::lock_guard<std::mutex> lk(mu_);
 
     const bool running = running_;
     uint64_t sent = 0, bytes = 0, overruns = 0, encode_err = 0, send_err = 0;
     uint64_t xruns = 0, p50 = 0;
+    uint32_t level_peak = 0;
     std::string last_error;
     if (pipeline_) {
         sent = pipeline_->packets_sent();
@@ -101,6 +114,9 @@ std::string CaptureEngine::StatsJson() const {
         const PipelineError pe = pipeline_->last_error();
         if (pe != PipelineError::None) last_error = PipelineErrorName(pe);
     }
+    // Reading for stats consumes the peak (exchange semantics): each poll
+    // reports exactly its own interval. 0 when not running.
+    if (running && pipeline_) level_peak = pipeline_->ExchangeLevelPeak();
     if (source_) {
         if (last_error.empty()) last_error = source_->error_string();
         xruns = source_->xruns();
@@ -139,7 +155,9 @@ std::string CaptureEngine::StatsJson() const {
     json += std::to_string(p50);
     json += ",\"last_error\":\"";
     json += last_error;
-    json += "\"}";
+    json += "\",\"level_peak\":";
+    json += std::to_string(LevelPercent(level_peak));
+    json += "}";
     return json;
 }
 

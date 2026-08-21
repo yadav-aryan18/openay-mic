@@ -89,7 +89,7 @@ Thread ownership:
 
 | Thread | Runs |
 |--------|------|
-| audio RT | `OboeSource::onAudioReady` → `CapturePipeline::OnAudio` (atomic ring push + µs timing) |
+| audio RT | `OboeSource::onAudioReady` → `CapturePipeline::OnAudio` (atomic ring push + µs timing + CAS-max level peak) |
 | network | `CapturePipeline::NetworkLoop`: poll ring, encode, send; drains ≤ 50 ms on Stop |
 | control | engine facade (`Configure`/`Start`/`Stop`/`StatsJson`) and JNI calls from the service thread |
 
@@ -104,8 +104,14 @@ close sink.
 {"running":true,"transport":"udp","host":"10.0.2.2","port":41700,"codec":"opus",
  "frame_ms":10,"sharing":"exclusive","sample_rate":48000,"sent":1234,"bytes":1186560,
  "ring_overruns":0,"encode_errors":0,"send_errors":0,"xruns":0,"callback_us_p50":0,
- "last_error":""}
+ "last_error":"","level_peak":40}
 ```
+
+`level_peak` (Phase 5 input metering) is the peak input level of the current
+poll interval as a percent 0..100, `round(peak/32767*100)`; reading it consumes
+the peak (each poll covers exactly its own interval), so the UI's 500 ms
+`nativeGetStats()` loop drives the live level animation for free. It is 0 when
+not running.
 
 `sharing`/`xruns`/`last_error` come from `OboeSource` on Android
 ("exclusive"/"shared", `AudioStream::getXRunCount()`, `onErrorAfterClose`); on

@@ -42,8 +42,14 @@ public:
     // {"running":true,"transport":"udp","host":"10.0.2.2","port":41700,
     //  "codec":"opus","frame_ms":10,"sharing":"exclusive","sample_rate":48000,
     //  "sent":1234,"bytes":1186560,"ring_overruns":0,"encode_errors":0,
-    //  "send_errors":0,"xruns":0,"callback_us_p50":0,"last_error":""}
+    //  "send_errors":0,"xruns":0,"callback_us_p50":0,"last_error":"",
+    //  "level_peak":40}
     std::string StatsJson() const;
+
+    // Input level peak (0..32767) since the last call, consumed and reset;
+    // 0 when not running. Note StatsJson() also consumes the peak, so each
+    // poll interval is metered exactly once.
+    uint16_t ExchangeLevelPeak();
 
 private:
     void StopLocked();

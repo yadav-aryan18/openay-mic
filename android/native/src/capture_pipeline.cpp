@@ -59,6 +59,7 @@ bool CapturePipeline::Configure(IAudioSource* source, TransportType transport,
     encode_errors_.store(0, std::memory_order_relaxed);
     send_errors_.store(0, std::memory_order_relaxed);
     callback_idx_.store(0, std::memory_order_relaxed);
+    level_peak_.store(0, std::memory_order_relaxed);  // no stale level from a prior run
 
     // --- validate ----------------------------------------------------------
     if (!source) {
@@ -179,12 +180,32 @@ void CapturePipeline::Stop() {
 // ---------------------------------------------------------------------------
 
 void CapturePipeline::OnAudio(const int16_t* samples, size_t frames) {
-    // Hard-RT path: conversion + ring write only (atomics, no allocation).
+    // Hard-RT path: level peak + conversion + ring write only (atomics, no
+    // allocation). The peak update is a relaxed CAS-max — see level_peak_ in
+    // the header for the ordering rationale.
     const auto t0 = std::chrono::steady_clock::now();
     const size_t bytes = frames * 2;
+    uint32_t peak = level_peak_.load(std::memory_order_relaxed);
     if (bytes <= scratch_.size()) {  // always true: scratch_ is the max frame
         for (size_t i = 0; i < frames; ++i) {
-            const uint16_t u = static_cast<uint16_t>(samples[i]);
+            const int16_t s = samples[i];
+            // |s| as uint32 (int32 intermediate so INT16_MIN negates cleanly),
+            // clamped to the documented 0..32767 meter range.
+            const uint32_t mag =
+                s < 0 ? static_cast<uint32_t>(-static_cast<int32_t>(s))
+                      : static_cast<uint32_t>(s);
+            const uint32_t mag_clamped = mag > 32767u ? 32767u : mag;
+            // CAS-max accumulator (C++17 has no fetch_max). On failure the
+            // compare_exchange reloads `peak` with the stored value and we
+            // retry; bounded — each retry either succeeds or observes a value
+            // >= mag_clamped and exits. The reader's exchange(0) only ever
+            // lowers the stored value below mag_clamped, so convergence is
+            // guaranteed.
+            while (mag_clamped > peak &&
+                   !level_peak_.compare_exchange_weak(
+                       peak, mag_clamped, std::memory_order_relaxed)) {
+            }
+            const uint16_t u = static_cast<uint16_t>(s);
             scratch_[2 * i] = static_cast<uint8_t>(u & 0xFFu);
             scratch_[2 * i + 1] = static_cast<uint8_t>(u >> 8);
         }
