@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "OpenAY Mic desktop receiver: network -> jitter buffer -> PipeWire virtual microphone"
 
+[lib]
+name = "openay_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "openay-server"
 path = "src/main.rs"

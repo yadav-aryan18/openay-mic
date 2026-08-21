@@ -45,7 +45,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -88,6 +88,11 @@ pub struct PwShared {
     /// `ceil(target_ms * 48_000 / 1000)` samples that must be buffered before
     /// the first real samples are emitted.
     pub target_samples: usize,
+    /// Peak level accumulator (RT-safe): the process callback folds
+    /// `max |sample|` scaled to `0..=65535` into this atomic with a
+    /// strict-max CAS loop; the status reader exchanges it on read
+    /// (each snapshot consumes the interval).
+    pub peak_level: Arc<AtomicU32>,
 }
 
 /// Run the PipeWire source until `quit` is set. Blocking; call on a
@@ -382,6 +387,27 @@ fn process_callback(stream: &pw::stream::StreamRef, shared: &mut PwShared) {
         if written == 0 && shared.streaming.load(Ordering::Relaxed) {
             shared.jitter.note_underrun();
             shared.streaming.store(false, Ordering::Relaxed);
+        }
+    }
+
+    // Level metering (RT-safe: no locks, no allocation, no logging). Fold
+    // max |sample| over the popped samples into the shared peak accumulator,
+    // scaled to 0..=65535, with a strict-max CAS loop.
+    if written > 0 {
+        let mut peak = 0u32;
+        for &s in &samples[..written] {
+            let v = (s.abs() * 65_535.0) as u32;
+            if v > peak {
+                peak = v;
+            }
+        }
+        let cell = &shared.peak_level;
+        let mut prev = cell.load(Ordering::Relaxed);
+        while prev < peak {
+            match cell.compare_exchange_weak(prev, peak, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
         }
     }
 

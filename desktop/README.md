@@ -39,7 +39,8 @@ This puts Rust (`~/.cargo/bin`) and the conda env (which provides
 | `crates/openay-codec`     | libopus wrapper: 48 kHz mono, 10 ms frames, restricted lowdelay, 32 kbps default |
 | `crates/openay-jitter`    | Lock-free SPSC `f32` jitter buffer (pure std, zero dependencies), prebuffer/overrun/underrun accounting |
 | `crates/openay-loopback`  | `openay-loopback` CLI: send/recv over UDP+TCP with full verification, one-way latency bench |
-| `crates/openay-server`    | `openay-server` CLI: desktop receiver (UDP/TCP -> jitter buffer -> PipeWire virtual mic, `pipewire` feature) |
+| `crates/openay-server`    | Engine library + `openay-server` CLI: desktop receiver (UDP/TCP -> jitter buffer -> PipeWire virtual mic, `pipewire` feature). The engine API (`spawn_engine`/`EngineHandle`) is shared with the GUI |
+| `crates/openay-gui`       | `openay-gui` console: tray-resident Iced GUI (design.md "Studio rack at night") over the engine — The Chain hero card, VU ladder, ON AIR toggle, settings slide-over |
 
 ## Build & test
 
@@ -58,10 +59,14 @@ cargo test -p openay-transport --features bluetooth --test transports -- --ignor
 
 ## openay-server CLI
 
-The desktop receiver (Phase 4): receives OpenAY audio packets, decodes them
-into `f32`, feeds a lock-free jitter buffer, and exposes the audio as a
-PipeWire virtual microphone source node named `openay_mic` (`media.class =
-Audio/Source/Virtual`, F32LE mono 48 kHz).
+The desktop receiver (Phase 4) is now a library with a thin CLI wrapper.
+The engine API (`spawn_engine`, `EngineHandle`, `EngineConfig`) is shared
+with the GUI so both can drive the same receive pipeline.
+
+The CLI receives OpenAY audio packets, decodes them into `f32`, feeds a
+lock-free jitter buffer, and — with the `pipewire` feature — exposes the
+audio as a PipeWire virtual microphone source node named `openay_mic`
+(`media.class = Audio/Source/Virtual`, F32LE mono 48 kHz).
 
 ```
 openay-server [--transport udp|tcp] [--port N] [--bind ADDR]
@@ -98,6 +103,72 @@ wpctl status | grep -i openay                      # should show the node
 
 The process callback runs on PipeWire's RT data thread and only touches the
 lock-free jitter buffer and atomics (no locks, allocation, or logging).
+
+### Engine API and level metering
+
+`openay_server` exposes the pipeline as a start/stop-able engine:
+
+```rust
+let handle = openay_server::spawn_engine(None);          // dedicated thread + runtime
+handle.cmd().send(EngineCommand::Start(config)).await?;  // or pass Some(config) to spawn
+let status: EngineStatus = handle.status();              // snapshot (see below)
+handle.cmd().send(EngineCommand::Stop).await?;
+```
+
+`EngineStatus::level_peak` is the peak capture level (`0.0..=1.0`) over the
+interval since the previous snapshot — each `status()` call consumes the
+interval (same semantics as the Android side). The RT process callback in
+`pw.rs` folds `max |sample|` into an `AtomicU32` scaled to 0..=65535 with a
+strict-max CAS loop; no locks/alloc/log in the callback. **Without the
+`pipewire` feature nothing consumes the jitter buffer, so `level_peak`
+stays `0.0`** — asserted by the headless smoke test
+(`crates/openay-server/tests/engine_smoke.rs`), which drives the engine over
+UDP with `UdpSender` and checks counts/loss/fill, then verifies the engine
+survives a Stop -> Start cycle on the same handle.
+
+### Headless smoke test (non-GUI logic)
+
+```bash
+cargo test -p openay-server --test engine_smoke
+```
+
+Constructs an `EngineHandle`, starts the UDP engine on a free port, feeds
+100 packets via `openay_transport::UdpSender`, and asserts the status
+counters (`received == 100`, `lost == 0`, overruns counted, buffer full)
+plus `level_peak == 0.0` in this network-only build.
+
+## openay-gui console (Phase 5)
+
+The desktop console: a tray-resident Iced window implementing the
+`shared/design.md` "Studio rack at night" contract faithfully — ink/panel/
+cream/amber/tally palette, Chakra Petch + IBM Plex Mono (embedded from
+`shared/fonts/`), The Chain hero card (MIC level ring / LINK pps+loss /
+CONSOLE jitter target), a 24-segment VU ladder (18 cream / 3 amber / 3 red,
+~12 dB/s decay ballistics), the circular ON AIR/STANDBY toggle with a
+~400 ms power-on stagger, and a settings slide-over (port, bind-address
+dropdown from local interfaces, codec chips, 5–20 ms jitter slider,
+autostart / start-minimized / reduced-motion switches).
+
+```bash
+cargo build --release -p openay-gui --features openay-server/pipewire
+target/release/openay-gui                 # window; close-requested hides to tray
+target/release/openay-gui --minimized     # tray-only until Show Console
+```
+
+- **Config**: `~/.config/openay-mic/config.toml` (serde/toml; missing or
+  partial files load defaults). XDG autostart entry
+  `~/.config/autostart/openay-mic.desktop` is written/removed by the
+  AUTOSTART switch (Exec points at the running binary with `--minimized`).
+- **Tray** (ksni StatusNotifierItem): Show Console / Start / Stop (checkmark
+  state) / Quit; the 24x24 pixmap reflects the state (gray idle, amber
+  armed, red live) — generated once by `crates/openay-gui/tools/gen_icons.py`
+  into `src/icons.rs` (ARGB32 converted at runtime for the freedesktop spec).
+- **Robustness**: the engine handle is created once; settings changes stop,
+  mutate, and restart the pipeline on the same handle. Quitting the window
+  (close button) hides to the tray; real exit is via tray Quit. Second
+  launch behavior is intentionally undefined.
+- **Reduced motion**: a config flag drops the cable pulse and the power-on
+  stagger (iced has no built-in API for it in 0.13).
 
 ## openay-loopback CLI
 

@@ -7,6 +7,7 @@ members = [
     "crates/openay-jitter",
     "crates/openay-loopback",
     "crates/openay-server",
+    "crates/openay-gui",
 ]
 
 [workspace.package]

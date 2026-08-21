@@ -1,0 +1,22 @@
+[package]
+name = "openay-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenAY Mic desktop console: tray-resident Iced GUI over the openay-server engine"
+
+[[bin]]
+name = "openay-gui"
+path = "src/main.rs"
+
+[dependencies]
+openay-server = { path = "../openay-server" }
+# Software renderer only (tiny-skia, NOT wgpu); tokio integration for the
+# async engine commands; canvas for the custom-drawn instruments.
+iced = { version = "0.13", default-features = false, features = ["tiny-skia", "tokio", "canvas"] }
+ksni = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+dirs = "6"
+if-addrs = "0.15"
