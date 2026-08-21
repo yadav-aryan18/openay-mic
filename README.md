@@ -23,7 +23,7 @@ solutions like WO Mic on latency, security, and UX.
   (`OPUS_APPLICATION_RESTRICTED_LOWDELAY`, 10 ms frames).
 - Wire format: see [`shared/protocol.md`](shared/protocol.md).
 
-## Building & testing (Phase 4 state)
+## Building & testing (Phase 5 state)
 
 All tooling is user-space; no root required.
 
@@ -65,5 +65,12 @@ scripts/run_phase2.sh
   - Live against the system daemon: recordable as a real "OpenAY Mic"
     source; 440 Hz tone round-trips with zero packet loss and bit-exact
     amplitude (RMS 9267 per 100 ms bucket, no dropouts)
-- [ ] Phase 5 — Compose UI (Android) / Slint tray app (desktop)
+- [x] Phase 5 — Compose UI (Android) / Iced tray app (desktop)
+  - Shared design system (`shared/design.md`, "studio rack at night"):
+    warm-graphite palette, Chakra Petch + IBM Plex Mono, signature
+    "The Chain" live signal-path strip on both platforms
+  - Android: full Compose redesign (ON AIR toggle, transport/codec/frame
+    controls, live level ring, network card) — verified on emulator
+  - Desktop: `openay-gui` (Iced, tray-resident) with VU ladder, engine
+    settings slide-over, autostart; `openay-server` refactored to lib+bin
 - [ ] Phase 6 — latency audit, xrun handling, CPU profiling
