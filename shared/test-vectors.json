@@ -1,0 +1,48 @@
+{
+  "protocol": "openay-mic-v1",
+  "magic": "0xa7",
+  "header_bytes": 6,
+  "note": "Canonical golden vectors per shared/protocol.md. C++ tests embed the same bytes; this JSON is the source of truth.",
+  "vectors": [
+    {
+      "name": "pcm_basic",
+      "hex": "a70000010004deadbeef",
+      "expect": { "type": "pcm", "seq": 1, "payload_hex": "deadbeef" }
+    },
+    {
+      "name": "opus_high_seq",
+      "hex": "a701fffe0003010203",
+      "expect": { "type": "opus", "seq": 65534, "payload_hex": "010203" }
+    },
+    {
+      "name": "control_hello",
+      "hex": "a7020000000568656c6c6f",
+      "expect": { "type": "control", "seq": 0, "payload_hex": "68656c6c6f" }
+    },
+    {
+      "name": "empty_payload",
+      "hex": "a700ffff0000",
+      "expect": { "type": "pcm", "seq": 65535, "payload_hex": "" }
+    },
+    {
+      "name": "bad_magic",
+      "hex": "000000010004deadbeef",
+      "error": "bad_magic"
+    },
+    {
+      "name": "truncated_header",
+      "hex": "a700000100",
+      "error": "truncated"
+    },
+    {
+      "name": "truncated_payload",
+      "hex": "a70000010004dead",
+      "error": "truncated"
+    },
+    {
+      "name": "reserved_type",
+      "hex": "a77f00010004deadbeef",
+      "error": "reserved_type"
+    }
+  ]
+}

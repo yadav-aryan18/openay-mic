@@ -1,0 +1,9 @@
+[package]
+name = "openay-jitter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenAY Mic jitter buffer: lock-free SPSC f32 ring with overrun/underrun accounting"
+
+[dependencies]
+# Intentionally empty: this crate is pure std, zero external dependencies.

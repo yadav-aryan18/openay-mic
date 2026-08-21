@@ -1,0 +1,16 @@
+[package]
+name = "openay-loopback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenAY Mic loopback sender/receiver/bench CLI for UDP and TCP"
+
+[[bin]]
+name = "openay-loopback"
+path = "src/main.rs"
+
+[dependencies]
+openay-protocol = { path = "../openay-protocol" }
+openay-transport = { path = "../openay-transport" }
+tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "sync", "io-util"] }
+anyhow = "1"

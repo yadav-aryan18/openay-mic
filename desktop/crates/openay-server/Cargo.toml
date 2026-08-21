@@ -1,0 +1,30 @@
+[package]
+name = "openay-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenAY Mic desktop receiver: network -> jitter buffer -> PipeWire virtual microphone"
+
+[[bin]]
+name = "openay-server"
+path = "src/main.rs"
+
+[dependencies]
+openay-protocol = { path = "../openay-protocol" }
+openay-transport = { path = "../openay-transport" }
+openay-codec = { path = "../openay-codec" }
+openay-jitter = { path = "../openay-jitter" }
+tokio = { version = "1", features = ["net", "macros", "rt-multi-thread", "time", "signal"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[features]
+default = []
+# Virtual microphone source via PipeWire. pipewire-rs 0.8 links against
+# libpipewire-0.3 and libspa-0.2 (pkg-config), so this feature is opt-in and
+# requires those libraries at build time.
+pipewire = ["dep:pipewire"]
+
+[dependencies.pipewire]
+version = "0.8"
+optional = true

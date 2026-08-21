@@ -1,0 +1,25 @@
+# Build outputs
+target/
+build/
+build-*/
+.cxx/
+*.o
+*.a
+*.so
+
+# Rust
+Cargo.lock.orig
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.apk.idsig
+.gradle/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

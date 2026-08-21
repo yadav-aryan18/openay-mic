@@ -1,0 +1,31 @@
+[package]
+name = "openay-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenAY Mic transports: UDP datagrams, TCP byte-stream framing, RFCOMM (optional), sequencing and stats"
+
+[dependencies]
+openay-protocol = { path = "../openay-protocol" }
+tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "sync", "io-util"] }
+thiserror = "1"
+# Used only for SO_RCVBUF, which tokio's UdpSocket does not expose.
+socket2 = "0.6"
+log = "0.4"
+
+[features]
+default = []
+# RFCOMM SPP server support via bluer. Requires a working BlueZ D-Bus stack
+# at runtime; the crate compiles without any Bluetooth hardware present.
+bluetooth = ["dep:bluer", "dep:futures-core", "bluer/bluetoothd", "bluer/rfcomm"]
+
+[dependencies.bluer]
+version = "0.17"
+optional = true
+
+[dependencies.futures-core]
+version = "0.3"
+optional = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

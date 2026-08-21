@@ -1,0 +1,11 @@
+[package]
+name = "openay-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenAY Mic audio codec: libopus wrapper (48 kHz mono, 10 ms frames, restricted lowdelay)"
+
+[dependencies]
+# Only the 0.3.0-rc.0 pre-release exists for the 0.3 line; cargo requires the
+# explicit prerelease specifier.
+audiopus = "0.3.0-rc.0"
