@@ -107,6 +107,11 @@ scripts/gen_click_track.py   # acoustic click track for the hardware audit
     p50 ≈ 47–50 ms / p95 ≈ 51–57 ms over the full UDP → decode → jitter →
     PipeWire chain (anchor error bars documented; hardware audit remains
     ground truth)
+  - `node.latency` evaluation: `OPENAY_NODE_LATENCY=480/48000` (requested
+    on both the engine stream and the null-sink driver) cuts the measured
+    p50 to ≈ 39–42 ms / p95 ≈ 47 ms for idle 0.51 %CPU / Opus-active
+    0.71 %CPU — ~10 ms glass-to-glass for a few tenths of a percent CPU,
+    well inside the budgets
   - CPU budgets asserted: idle 0.20–0.40 %CPU (<1 %), Opus-active
     0.51–0.71 %CPU (<3 %), RSS ≈ 8 MiB
   - Hardware glass-to-glass audit kit: click-track generator/analyzer,

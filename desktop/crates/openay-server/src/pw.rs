@@ -69,6 +69,46 @@ const LINK_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 /// Maximum link-factory attempts.
 const MAX_LINK_ATTEMPTS: u32 = 10;
 
+/// Opt-in smaller graph quantum for latency tuning (Phase 6 `node.latency`
+/// evaluation). When `OPENAY_NODE_LATENCY` is set to a PipeWire fraction
+/// like `480/48000` (a bare sample count is also accepted), it is requested
+/// as the `node.latency` property on BOTH the engine stream and the
+/// null-sink driver — a quantum only shrinks if every node in the driven
+/// chain asks for it. Unset keeps the daemon default (1024/48000 ≈ 21.3 ms
+/// here, which dominates end-to-end latency).
+///
+/// Pure setup-time configuration: properties are passed at object creation,
+/// so the RT callback path is unaffected.
+fn node_latency_property() -> Option<(&'static str, String)> {
+    parse_node_latency(std::env::var("OPENAY_NODE_LATENCY").ok().as_deref())
+}
+
+fn parse_node_latency(raw: Option<&str>) -> Option<(&'static str, String)> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Accept "N/DEN" or a bare sample count N (denominator = our rate).
+    let value = if let Some((num, den)) = raw.split_once('/') {
+        match (num.trim().parse::<u64>(), den.trim().parse::<u64>()) {
+            (Ok(n), Ok(d)) if n > 0 && d > 0 => format!("{n}/{d}"),
+            _ => {
+                eprintln!("openay-server: ignoring invalid OPENAY_NODE_LATENCY {raw:?}");
+                return None;
+            }
+        }
+    } else {
+        match raw.parse::<u64>() {
+            Ok(n) if n > 0 => format!("{n}/{SAMPLE_RATE}"),
+            _ => {
+                eprintln!("openay-server: ignoring invalid OPENAY_NODE_LATENCY {raw:?}");
+                return None;
+            }
+        }
+    };
+    Some(("node.latency", value))
+}
+
 /// State shared between the network task (producer) and the RT process
 /// callback (consumer). Atomics only — the callback never blocks.
 ///
@@ -126,15 +166,16 @@ fn setup_source(shared: PwShared) -> Result<()> {
     // media.class/media.category/media.role — WirePlumber would otherwise
     // export it as a standalone node that would stay suspended with no
     // ports). The public source is the null-sink created below.
-    let stream = pw::stream::Stream::new(
-        &core,
-        "openay-mic",
-        properties! {
-            *pw::keys::NODE_NAME => "openay_engine",
-            *pw::keys::NODE_DESCRIPTION => "OpenAY Mic engine",
-        },
-    )
-    .context("creating stream")?;
+    let mut stream_props = properties! {
+        *pw::keys::NODE_NAME => "openay_engine",
+        *pw::keys::NODE_DESCRIPTION => "OpenAY Mic engine",
+    };
+    if let Some((key, value)) = node_latency_property() {
+        eprintln!("openay-server: requesting {key} = {value}");
+        stream_props.insert(key, value);
+    }
+    let stream = pw::stream::Stream::new(&core, "openay-mic", stream_props)
+        .context("creating stream")?;
 
     let _listener = stream
         .add_local_listener_with_user_data(shared.clone())
@@ -203,17 +244,21 @@ fn setup_source(shared: PwShared) -> Result<()> {
     // nothing could link to it. Keep the Node handle alive for the process
     // lifetime (no object.linger: lingering nodes survive server shutdown as
     // zombie sources — see module docs).
+    let mut sink_props = properties! {
+        "factory.name" => "support.null-audio-sink",
+        *pw::keys::MEDIA_CLASS => "Audio/Source/Virtual",
+        *pw::keys::NODE_NAME => "openay_mic",
+        *pw::keys::NODE_DESCRIPTION => "OpenAY Mic",
+        "audio.position" => "[ FL ]",
+    };
+    // The null-sink is the graph driver: without its own node.latency
+    // request the quantum stays at the daemon default even if the stream
+    // asks for less.
+    if let Some((key, value)) = node_latency_property() {
+        sink_props.insert(key, value);
+    }
     let source_node = core
-        .create_object::<pw::node::Node>(
-            "adapter",
-            &properties! {
-                "factory.name" => "support.null-audio-sink",
-                *pw::keys::MEDIA_CLASS => "Audio/Source/Virtual",
-                *pw::keys::NODE_NAME => "openay_mic",
-                *pw::keys::NODE_DESCRIPTION => "OpenAY Mic",
-                "audio.position" => "[ FL ]",
-            },
-        )
+        .create_object::<pw::node::Node>("adapter", &sink_props)
         .context("creating null-audio-sink source")?;
 
     // The proxy id (upcast_ref().id()) is the client-side proxy-map id, NOT
@@ -417,4 +462,41 @@ fn process_callback(stream: &pw::stream::StreamRef, shared: &mut PwShared) {
     *chunk.offset_mut() = 0;
     *chunk.stride_mut() = (4 * CHANNELS) as i32;
     *chunk.size_mut() = (4 * fill) as u32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_latency_unset_or_empty_is_none() {
+        assert_eq!(parse_node_latency(None), None);
+        assert_eq!(parse_node_latency(Some("")), None);
+        assert_eq!(parse_node_latency(Some("   ")), None);
+    }
+
+    #[test]
+    fn node_latency_fraction_and_bare_count() {
+        assert_eq!(
+            parse_node_latency(Some("480/48000")),
+            Some(("node.latency", "480/48000".to_string()))
+        );
+        // Bare sample count takes the protocol rate as denominator.
+        assert_eq!(
+            parse_node_latency(Some("256")),
+            Some(("node.latency", format!("256/{SAMPLE_RATE}")))
+        );
+        // Whitespace around the value and the components is tolerated.
+        assert_eq!(
+            parse_node_latency(Some(" 1024 / 48000 ")),
+            Some(("node.latency", "1024/48000".to_string()))
+        );
+    }
+
+    #[test]
+    fn node_latency_invalid_inputs_are_ignored_not_fatal() {
+        for bad in ["0", "0/48000", "480/0", "-5", "abc", "480/", "/48000", "4.8"] {
+            assert_eq!(parse_node_latency(Some(bad)), None, "{bad} must be ignored");
+        }
+    }
 }
