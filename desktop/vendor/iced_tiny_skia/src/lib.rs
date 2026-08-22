@@ -160,10 +160,10 @@ impl Renderer {
                     // window space before being intersected with the layer
                     // clip — otherwise translated canvas content is either
                     // skipped outright or clipped against a misplaced mask.
-                    let Some(new_clip_bounds) = (group.clip_bounds()
-                        * group.transformation()
-                        * scale_factor)
-                        .intersection(&clip_bounds)
+                    let transform =
+                        Transformation::scale(scale_factor) * group.transformation();
+                    let Some(new_clip_bounds) =
+                        (group.clip_bounds() * transform).intersection(&clip_bounds)
                     else {
                         continue;
                     };
@@ -173,8 +173,7 @@ impl Renderer {
                     for primitive in group.as_slice() {
                         self.engine.draw_primitive(
                             primitive,
-                            group.transformation()
-                                * Transformation::scale(scale_factor),
+                            transform,
                             pixels,
                             clip_mask,
                             clip_bounds,
@@ -195,11 +194,12 @@ impl Renderer {
                 }
 
                 for group in &layer.text {
+                    let transform =
+                        Transformation::scale(scale_factor) * group.transformation();
                     for text in group.as_slice() {
                         self.engine.draw_text(
                             text,
-                            group.transformation()
-                                * Transformation::scale(scale_factor),
+                            transform,
                             pixels,
                             clip_mask,
                             clip_bounds,

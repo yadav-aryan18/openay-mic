@@ -303,6 +303,21 @@ impl App {
             self.vu = VuBallistics::default();
         }
 
+        // DEV-ONLY hook (OPENAY_DEBUG_TICKLOG=1): dump what this tick pulled
+        // out of the engine so meter wiring can be diagnosed against a live
+        // stream without a debugger attached.
+        if env_flag("OPENAY_DEBUG_TICKLOG") {
+            eprintln!(
+                "TICK dt={dt:.3} running={} streaming={} pps={:.0} peak={:.4} fill={:.1} lost={}",
+                status.running,
+                self.streaming,
+                self.pps,
+                status.level_peak,
+                status.fill_ms,
+                status.lost,
+            );
+        }
+
         // MIC ring smoothing (~100 ms time constant).
         let alpha = 1.0 - (-dt / RING_TAU).exp();
         self.ring_level += (status.level_peak - self.ring_level) * alpha;
@@ -444,6 +459,18 @@ impl App {
 
 impl App {
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
+        // DEV-ONLY: counts actual view rebuilds (one per render pass) so a
+        // frozen window can be told apart from a stalled update loop.
+        if env_flag("OPENAY_DEBUG_TICKLOG") {
+            eprintln!(
+                "VIEW pps={:.0} vu={:.3} ring={:.3} running={} streaming={}",
+                self.pps,
+                self.vu.level(),
+                self.ring_level,
+                self.status.running,
+                self.streaming,
+            );
+        }
         // Single vertical flow per design.md: header / Chain hero panel /
         // VU ladder row / centered ON AIR toggle / status line. The root
         // column is explicitly Fill x Fill and centers its children
@@ -1226,15 +1253,14 @@ impl<Message> Program<Message> for CablePulse {
         let mut frame = Frame::new(renderer, bounds.size());
         // Filled rect, not a stroked line (see MenuIcon): stroked straight
         // lines render nothing on tiny-skia. 2 px wide, centered, 8 px of
-        // vertical breathing room inside the cable's slot.
-        let cx = frame.center().x;
+        // vertical breathing room inside the cable's slot. Integer-aligned
+        // like MenuIcon so a fractional slot position doesn't blur the bar
+        // into the panel (the left/right cables sat at different subpixels).
         let bar_w = 2.0;
         let bar_h = (bounds.height - 8.0).max(0.0);
+        let x = (frame.center().x - bar_w / 2.0).round();
         frame.fill(
-            &Path::rectangle(
-                Point::new(cx - bar_w / 2.0, (bounds.height - bar_h) / 2.0),
-                Size::new(bar_w, bar_h),
-            ),
+            &Path::rectangle(Point::new(x, (bounds.height - bar_h) / 2.0), Size::new(bar_w, bar_h)),
             self.color,
         );
         vec![frame.into_geometry()]
@@ -2170,5 +2196,104 @@ mod tests {
         }
         max_extent(toggle, toggle.size());
     }
-}
 
+    fn render_element_to_png(app: &App, width: u32, height: u32, scale_factor: f32, out_path: &str) {
+        use iced_core::widget::Tree;
+        use iced_core::renderer::Style;
+        use iced_core::mouse::Cursor;
+        use iced_core::{Rectangle, Size};
+        
+        iced_tiny_skia::graphics::text::font_system()
+            .write()
+            .unwrap()
+            .load_font(theme::CHAKRA_SEMIBOLD.into());
+        iced_tiny_skia::graphics::text::font_system()
+            .write()
+            .unwrap()
+            .load_font(theme::CHAKRA_MEDIUM.into());
+        iced_tiny_skia::graphics::text::font_system()
+            .write()
+            .unwrap()
+            .load_font(theme::PLEX_REGULAR.into());
+        iced_tiny_skia::graphics::text::font_system()
+            .write()
+            .unwrap()
+            .load_font(theme::PLEX_MEDIUM.into());
+
+        let mut renderer = iced::Renderer::new(theme::FONT_MONO, 16.0.into());
+        let limits = iced_core::layout::Limits::new(Size::ZERO, Size::new(width as f32, height as f32));
+        let el = app.view();
+        let mut tree = Tree::new(el.as_widget());
+        let node = el.as_widget().layout(&mut tree, &renderer, &limits);
+        
+        let bounds = Rectangle::with_size(Size::new(width as f32, height as f32));
+        let phys_w = (width as f32 * scale_factor).round() as u32;
+        let phys_h = (height as f32 * scale_factor).round() as u32;
+        let viewport = iced_tiny_skia::graphics::Viewport::with_physical_size(
+            Size::new(phys_w, phys_h),
+            scale_factor as f64,
+        );
+        
+        el.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &app.theme(),
+            &Style { text_color: theme::CREAM },
+            iced_core::Layout::new(&node),
+            Cursor::Unavailable,
+            &bounds,
+        );
+
+        let mut pixmap = tiny_skia::Pixmap::new(phys_w, phys_h).expect("create pixmap");
+        let mut clip_mask = tiny_skia::Mask::new(phys_w, phys_h).expect("create mask");
+        let damage = [bounds];
+        
+        renderer.draw(
+            &mut pixmap.as_mut(),
+            &mut clip_mask,
+            &viewport,
+            &damage,
+            theme::INK,
+            &[] as &[&str],
+        );
+        
+        let raw = pixmap.data();
+        let mut rgba_pixmap = tiny_skia::Pixmap::new(phys_w, phys_h).expect("create rgba pixmap");
+        let rgba_data = rgba_pixmap.data_mut();
+        let (raw_chunks, _) = raw.as_chunks::<4>();
+        let (rgba_chunks, _) = rgba_data.as_chunks_mut::<4>();
+        for (src, dst) in raw_chunks.iter().zip(rgba_chunks.iter_mut()) {
+            dst[0] = src[2]; // R
+            dst[1] = src[1]; // G
+            dst[2] = src[0]; // B
+            dst[3] = src[3]; // A
+        }
+        rgba_pixmap.save_png(out_path).expect("save png");
+    }
+
+    #[test]
+    fn render_ui_snapshots() {
+        let artifact_dir = "./artifacts";
+        
+        // 1. Cold state at 1x and 1.5x (HiDPI)
+        let app = test_app(Config::default());
+        render_element_to_png(&app, 460, 600, 1.0, &format!("{artifact_dir}/render_cold.png"));
+        render_element_to_png(&app, 460, 600, 1.5, &format!("{artifact_dir}/render_cold_1.5x.png"));
+        
+        // 2. Hot state at 1x and 1.5x (HiDPI)
+        let mut hot_app = test_app(Config::default());
+        hot_app.status.running = true;
+        hot_app.streaming = true;
+        hot_app.pps = 480.0;
+        hot_app.ring_level = 0.45;
+        hot_app.vu = VuBallistics::new(0.45);
+        hot_app.status.fill_ms = 10.0;
+        render_element_to_png(&hot_app, 460, 600, 1.0, &format!("{artifact_dir}/render_hot.png"));
+        render_element_to_png(&hot_app, 460, 600, 1.5, &format!("{artifact_dir}/render_hot_1.5x.png"));
+
+        // 3. Settings open at 1x
+        let mut settings_app = test_app(Config::default());
+        settings_app.settings_open = true;
+        render_element_to_png(&settings_app, 460, 600, 1.0, &format!("{artifact_dir}/render_settings.png"));
+    }
+}

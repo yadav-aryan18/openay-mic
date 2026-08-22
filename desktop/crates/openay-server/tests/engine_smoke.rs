@@ -175,23 +175,28 @@ fn engine_receives_udp_packets_without_pipewire() {
     assert_eq!(live.dup, 0);
     assert_eq!(live.ooo, 0);
     assert_eq!(live.malformed, 0);
-    // 100 x 480 samples = 48 000 samples = 1 s of audio; the 100 ms
-    // (4800 sample) jitter buffer rounds up to 8192 samples (170.67 ms) and
-    // is now exactly full: overruns were counted and fill_ms == capacity.
-    let capacity_ms = 8192.0 * 1000.0 / openay_server::SAMPLE_RATE as f32;
-    assert!(live.overruns > 0, "buffer overflow must be counted");
-    assert!(
-        (live.fill_ms - capacity_ms).abs() < 0.01,
-        "fill_ms={} must equal the full-buffer capacity {capacity_ms}",
-        live.fill_ms
-    );
-    // No PipeWire: nothing consumes the buffer, so the level stays 0.0.
-    // (With the `pipewire` feature the RT callback would fold max |sample|
-    // into this field — documented, and asserted as 0.0 here on purpose.)
-    assert_eq!(
-        live.level_peak, 0.0,
-        "without the pipewire feature no audio is consumed, level stays 0.0"
-    );
+    #[cfg(not(feature = "pipewire"))]
+    {
+        // 100 x 480 samples = 48 000 samples = 1 s of audio; the 100 ms
+        // (4800 sample) jitter buffer rounds up to 8192 samples (170.67 ms) and
+        // is now exactly full: overruns were counted and fill_ms == capacity.
+        let capacity_ms = 8192.0 * 1000.0 / openay_server::SAMPLE_RATE as f32;
+        assert!(live.overruns > 0, "buffer overflow must be counted");
+        assert!(
+            (live.fill_ms - capacity_ms).abs() < 0.01,
+            "fill_ms={} must equal the full-buffer capacity {capacity_ms}",
+            live.fill_ms
+        );
+        // No PipeWire: nothing consumes the buffer, so the level stays 0.0.
+        assert_eq!(
+            live.level_peak, 0.0,
+            "without the pipewire feature no audio is consumed, level stays 0.0"
+        );
+    }
+    #[cfg(feature = "pipewire")]
+    {
+        assert!(live.fill_ms > 0.0 || live.overruns > 0);
+    }
 
     // Stop, then confirm the snapshot is zeroed and the handle is reusable;
     // the run's final numbers survive only in the stats line.
@@ -214,6 +219,96 @@ fn engine_receives_udp_packets_without_pipewire() {
         line.starts_with("SRV transport=udp received=100 lost=0 dup=0 ooo=0 malformed=0"),
         "{line}"
     );
+}
+
+/// With the `pipewire` feature the RT playback callback must actually
+/// consume the jitter buffer and fold a nonzero peak for a loud stream —
+/// this is the state->pixels contract's engine half (the GUI renders
+/// `level_peak` as the MIC ring arc and VU ladder; a silent meter here means
+/// a dead console even when every widget is wired correctly). Feeds loud
+/// xorshift PCM at roughly realtime pace and polls `status()` (which consumes
+/// the peak interval) until any interval reports a lit level.
+#[test]
+#[cfg(feature = "pipewire")]
+fn live_stream_folds_level_peak_with_pipewire() {
+    let port = free_udp_port();
+    let config = EngineConfig {
+        transport: Transport::Udp,
+        bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port,
+        codec: CodecMode::Pcm,
+        target_ms: 10.0,
+        capacity_ms: 100.0,
+    }
+    .validated()
+    .expect("config valid");
+    let handle = spawn_engine(Some(config));
+    let rt = rt();
+
+    rt.block_on(async {
+        handle
+            .cmd()
+            .send(EngineCommand::Start(config))
+            .await
+            .expect("send Start");
+    });
+    assert!(
+        wait_until(&handle, Duration::from_secs(5), |s| s.running),
+        "engine must reach the running state"
+    );
+
+    rt.block_on(async {
+        let sender = UdpSender::connect("127.0.0.1", port)
+            .await
+            .expect("connect sender");
+        // Probe until the listener is bound (see the network-only test).
+        let seq = 0u16;
+        loop {
+            sender
+                .send_packet(&Packet {
+                    kind: PayloadType::Pcm,
+                    seq,
+                    payload: pcm_payload(480, 0),
+                })
+                .await
+                .expect("send probe");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if handle.status().received >= 1 {
+                break;
+            }
+        }
+        // ~1 s of audio at ~realtime pace: 10 ms packets, one per interval.
+        let mut had_fill = false;
+        for s in 1..100u16 {
+            sender
+                .send_packet(&Packet {
+                    kind: PayloadType::Pcm,
+                    seq: s,
+                    payload: pcm_payload(480, s as u32),
+                })
+                .await
+                .expect("send packet");
+            if handle.status().fill_ms > 0.0 {
+                had_fill = true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(had_fill, "jitter buffer must receive fill during stream");
+    });
+
+    assert!(
+        wait_until(&handle, Duration::from_secs(5), |s| s.level_peak > 0.05),
+        "RT callback must fold a lit level for a loud stream, got {}",
+        handle.status().level_peak
+    );
+
+    rt.block_on(async {
+        handle
+            .cmd()
+            .send(EngineCommand::Stop)
+            .await
+            .expect("send Stop");
+    });
 }
 
 /// The engine must survive a Stop -> Start cycle on the same handle with a

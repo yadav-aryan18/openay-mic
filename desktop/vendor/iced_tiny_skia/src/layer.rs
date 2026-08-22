@@ -224,14 +224,17 @@ impl Layer {
             &current.primitives,
             |item| match item {
                 Item::Live(primitive) => vec![primitive.visible_bounds()],
-                Item::Group(primitives, group_bounds, transformation) => {
-                    primitives
-                        .as_slice()
-                        .iter()
-                        .map(Primitive::visible_bounds)
-                        .map(|bounds| bounds * *transformation)
-                        .filter_map(|bounds| bounds.intersection(group_bounds))
-                        .collect()
+                Item::Group(_, group_bounds, transformation) => {
+                    // Damage the whole transformed group. The per-primitive
+                    // path used to intersect screen-space bounds (already
+                    // multiplied by the transformation) with `group_bounds`,
+                    // which are recorded in canvas-LOCAL space — the
+                    // intersection is empty at any non-zero window position,
+                    // so canvas-only frames computed zero damage and present
+                    // was skipped forever (frozen meters). Same local-vs-
+                    // transformed clip mismatch as the Renderer::draw fix
+                    // documented in this fork's README.
+                    vec![*group_bounds * *transformation]
                 }
                 Item::Cached(_, bounds, _) => {
                     vec![*bounds]
