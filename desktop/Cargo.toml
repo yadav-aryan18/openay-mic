@@ -6,6 +6,7 @@ members = [
     "crates/openay-codec",
     "crates/openay-jitter",
     "crates/openay-loopback",
+    "crates/openay-proxy",
     "crates/openay-server",
     "crates/openay-gui",
 ]

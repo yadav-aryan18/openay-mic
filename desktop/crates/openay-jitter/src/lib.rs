@@ -23,9 +23,18 @@
 //!   writes are strictly better than dropping whole blocks: with quantum-
 //!   sized consumer drains, full-block drops repeat systematically and tear
 //!   periodic holes into the audio.
+//!
+//! Besides the ring itself, the crate provides the [`DepthController`]: the
+//! adaptive prebuffer-depth policy that raises the target on underruns and
+//! decays it back toward the user's base after clean windows of streaming
+//! (see [`depth`] for the model and the injected-clock test story).
+
+mod depth;
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+pub use depth::{Clock, DepthController, DepthParams, RealClock};
 
 /// Nominal target prebuffer in milliseconds (plan: 5–15 ms window).
 pub const TARGET_PREBUFFER_MS: f32 = 10.0;

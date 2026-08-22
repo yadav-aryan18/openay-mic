@@ -32,3 +32,8 @@ pipewire = ["dep:pipewire"]
 [dependencies.pipewire]
 version = "0.8"
 optional = true
+
+[dev-dependencies]
+# In-process lossy proxy for the adaptive-depth validation scenarios only
+# (never a runtime dependency: the production receiver does not use it).
+openay-proxy = { path = "../openay-proxy" }

@@ -2575,6 +2575,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "openay-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap 4.6.6",
+ "tokio",
+]
+
+[[package]]
 name = "openay-server"
 version = "0.1.0"
 dependencies = [
@@ -2583,6 +2592,7 @@ dependencies = [
  "openay-codec",
  "openay-jitter",
  "openay-protocol",
+ "openay-proxy",
  "openay-transport",
  "pipewire",
  "tokio",

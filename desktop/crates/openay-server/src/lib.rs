@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use openay_jitter::JitterBuffer;
+use openay_jitter::{DepthController, DepthParams, JitterBuffer, RealClock};
 use openay_protocol::PayloadType;
 use tokio::sync::mpsc;
 
@@ -58,6 +58,12 @@ use crate::ingest::Ingest;
 pub const SAMPLE_RATE: usize = 48_000;
 /// Interval between stats lines printed to stdout.
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
+/// Minimum time between `UNDERRUN episodes=...` stderr lines (rate limit).
+const UNDERRUN_LOG_INTERVAL: Duration = Duration::from_secs(5);
+/// Tick period of the per-pipeline depth controller task.
+const DEPTH_TICK: Duration = Duration::from_millis(200);
+/// How fast the depth controller task polls the pipeline quit flag.
+const QUIT_POLL: Duration = Duration::from_millis(25);
 /// Largest possible wire datagram: 6-byte header + 65535-byte payload.
 const MAX_DATAGRAM: usize = 65541;
 /// Jitter buffer capacity in ms of audio (matches the CLI's
@@ -191,6 +197,13 @@ impl EngineConfig {
 /// and `uptime_secs` reads zero. [`take_stats_line`](EngineHandle::take_stats_line)
 /// is the only way to obtain a run's final numbers after it has stopped.
 ///
+/// [`effective_target_ms`](EngineStatus::effective_target_ms) is the
+/// exception: while stopped it reports the configured `target_ms` (the
+/// standby/pre-run depth), while running it reports the live adaptive value
+/// written by the depth controller task — an underrun raises it +2 ms toward
+/// [`MAX_PREBUFFER_MS`], each fully elapsed clean window (60 s) lowers it 1 ms
+/// back toward the configured base.
+///
 /// [`level_peak`](EngineStatus::level_peak) is the peak capture level over
 /// the interval since the *previous* snapshot, in `0.0..=1.0` — each
 /// `status()` call consumes the interval (same semantics as the Android
@@ -217,6 +230,10 @@ pub struct EngineStatus {
     pub level_peak: f32,
     /// Seconds since the last `Start` (0 when stopped).
     pub uptime_secs: u64,
+    /// Live adaptive prebuffer depth in ms: the configured `target_ms` while
+    /// stopped, the depth controller's readjusted value while running
+    /// (see the struct docs for the rise/decay law).
+    pub effective_target_ms: f32,
 }
 
 /// Commands sent to the engine.
@@ -245,7 +262,10 @@ impl EngineHandle {
     /// Per-run semantics: when `running == false` every transport counter
     /// (`received`/`lost`/`dup`/`ooo`/`malformed`/`overruns`/`underruns`),
     /// `fill_ms`, `level_peak`, and `uptime_secs` read zero — the snapshot
-    /// describes the current run only, never lifetime totals. Use
+    /// describes the current run only, never lifetime totals.
+    /// [`effective_target_ms`](EngineStatus::effective_target_ms) reads the
+    /// configured `target_ms` while stopped (the standby depth), and the
+    /// depth controller's live value while running. Use
     /// [`EngineHandle::take_stats_line`] for a run's final numbers after
     /// `Stop`.
     pub fn status(&self) -> EngineStatus {
@@ -276,9 +296,13 @@ impl EngineHandle {
             fill_ms: 0.0,
             level_peak: if running { level_peak } else { 0.0 },
             uptime_secs: 0,
+            effective_target_ms: cfg.target_ms,
         };
 
         if running {
+            // The live adaptive depth: what the RT latch actually waits for.
+            s.effective_target_ms =
+                self.state.effective_target.load(Ordering::Relaxed) as f32 / SAMPLE_RATE as f32 * 1000.0;
             if let Some(jitter) = self
                 .state
                 .jitter
@@ -348,6 +372,25 @@ impl EngineHandle {
             .expect("stats line mutex poisoned")
             .take()
     }
+
+    /// The live jitter buffer of the current run, for tests and diagnostics.
+    ///
+    /// This is a test-support entry point, not part of the supported status
+    /// API: the engine's SPSC contract allows *one* consumer, and in a
+    /// headless (`pipewire` off) build the network task is the only owner of
+    /// the producer side, so a test can take the consumer role — pop at the
+    /// realtime pace and call [`JitterBuffer::note_underrun`] on dry pops,
+    /// exactly like the PipeWire RT callback does. With the `pipewire`
+    /// feature the RT callback is that consumer; two consumers would violate
+    /// the ring protocol. `None` while stopped.
+    #[doc(hidden)]
+    pub fn jitter_for_test(&self) -> Option<Arc<JitterBuffer>> {
+        self.state
+            .jitter
+            .lock()
+            .expect("engine jitter mutex poisoned")
+            .clone()
+    }
 }
 
 /// Shared engine state, readable from any thread.
@@ -368,6 +411,16 @@ struct EngineState {
     /// exchanging (consumed per snapshot). Reset to 0 on every `Start`/`Stop`
     /// so a stopped engine never reports a stale peak.
     peak: Arc<AtomicU32>,
+    /// Live adaptive prebuffer depth in *samples*
+    /// (`ceil(target_ms * 48_000 / 1000)`). Written by the per-pipeline depth
+    /// controller task (and seeded at every `Start` with the configured
+    /// `target_ms`); read by the RT latch and by `status()`. Headless builds
+    /// keep it too so `status().effective_target_ms` is accurate without
+    /// PipeWire.
+    effective_target: Arc<AtomicU32>,
+    /// Timing knobs for the per-pipeline depth controller (set by
+    /// [`spawn_engine_tuned`], default [`DepthParams`] otherwise).
+    depth_params: DepthParams,
 }
 
 impl Default for EngineState {
@@ -381,6 +434,8 @@ impl Default for EngineState {
             last_error: Mutex::new(None),
             last_stats_line: Mutex::new(None),
             peak: Arc::new(AtomicU32::new(0)),
+            effective_target: Arc::new(AtomicU32::new(0)),
+            depth_params: DepthParams::default(),
         }
     }
 }
@@ -430,8 +485,27 @@ impl EngineState {
 /// the command channel and lets the engine wind down after the running
 /// pipeline finishes.
 pub fn spawn_engine(initial: Option<EngineConfig>) -> EngineHandle {
+    spawn_engine_tuned(initial, DepthParams::default())
+}
+
+/// Like [`spawn_engine`], but with explicit [`DepthParams`] for the jitter
+/// depth controller (rise per underrun, clean-window length, decay step).
+///
+/// Intended for tests and scenario validation: [`DepthParams::default`] is
+/// the production policy (+2 ms per underrun, −1 ms per fully elapsed 60 s
+/// clean window), and shrinking the 60 s window lets a validation scenario
+/// watch a full rise/decay cycle in seconds. Everything else — cold-start
+/// contract, command/status semantics, per-`Start` reset — is identical to
+/// [`spawn_engine`].
+pub fn spawn_engine_tuned(
+    initial: Option<EngineConfig>,
+    depth_params: DepthParams,
+) -> EngineHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
-    let state = Arc::new(EngineState::default());
+    let state = Arc::new(EngineState {
+        depth_params,
+        ..EngineState::default()
+    });
     // The config is only "defaults for the first Start": publish it for the
     // standby status display, but do NOT start a pipeline.
     if let Some(cfg) = initial {
@@ -502,20 +576,21 @@ async fn engine_main(mut cmd_rx: mpsc::Receiver<EngineCommand>, state: Arc<Engin
     }
 }
 
-/// A live pipeline: network receive task + optional PipeWire thread over one
-/// jitter buffer.
+/// A live pipeline: network receive task + optional PipeWire thread + the
+/// depth controller task, all over one jitter buffer.
 ///
 /// The `jitter` and `ingest` fields are never read directly (the compiler
 /// warns about them) but they are ownership-load-bearing: dropping the
 /// `Pipeline` decrements the `Arc` refcounts, keeping the jitter buffer and
 /// the ingest state alive for the network task until the pipeline is torn
-/// down.
+/// down. `retarget` is aborted on teardown (it also self-exits on `quit`).
 #[allow(dead_code)]
 struct Pipeline {
     jitter: Arc<JitterBuffer>,
     ingest: Arc<Mutex<Ingest>>,
     quit: Arc<AtomicBool>,
     net_task: tokio::task::JoinHandle<Result<String>>,
+    retarget: tokio::task::JoinHandle<()>,
     #[cfg(feature = "pipewire")]
     pw_thread: Option<std::thread::JoinHandle<Result<()>>>,
 }
@@ -555,6 +630,12 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
     let quit = Arc::new(AtomicBool::new(false));
     let ingest = Arc::new(Mutex::new(Ingest::new(jitter.clone(), config.codec.only())));
 
+    // Seed the adaptive depth with the configured target and share it with
+    // the RT latch (pipewire), the depth controller task, and `status()`.
+    let target_samples =
+        (config.target_ms * SAMPLE_RATE as f32 / 1000.0).ceil() as u32;
+    state.effective_target.store(target_samples, Ordering::Relaxed);
+
     #[cfg(feature = "pipewire")]
     let pw_thread = {
         let streaming = Arc::new(AtomicBool::new(false));
@@ -563,7 +644,7 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
             jitter: jitter.clone(),
             streaming,
             quit: quit.clone(),
-            target_samples: (config.target_ms * SAMPLE_RATE as f32 / 1000.0).ceil() as usize,
+            target_samples: state.effective_target.clone(),
             peak_level: state.peak.clone(),
         };
         let thread = std::thread::Builder::new()
@@ -583,8 +664,16 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
         config,
         ingest.clone(),
         jitter.clone(),
+        state.effective_target.clone(),
         quit.clone(),
     ));
+    let retarget = spawn_depth_controller(
+        jitter.clone(),
+        state.effective_target.clone(),
+        config.target_ms,
+        state.depth_params,
+        quit.clone(),
+    );
 
     *state.config.lock().expect("engine config mutex poisoned") = Some(config);
     *state.jitter.lock().expect("engine jitter mutex poisoned") = Some(jitter.clone());
@@ -600,8 +689,59 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
         ingest,
         quit,
         net_task: net,
+        retarget,
         #[cfg(feature = "pipewire")]
         pw_thread,
+    })
+}
+
+/// Per-pipeline adaptive depth controller task.
+///
+/// Ticks every [`DEPTH_TICK`] (200 ms): if the jitter underrun counter
+/// increased since the last poll, the controller records an underrun
+/// (+`rise_ms` toward the ceiling); otherwise the running tick earns decay
+/// steps per fully elapsed clean window. The resulting effective target in
+/// milliseconds is stored into `effective_target` as
+/// `ceil(target_ms * 48_000 / 1000)` samples — the value the RT latch and
+/// `status()` read. Exits promptly when `quit` is set (Stop / PipeWire
+/// failure); the base depth and the timings come from the pipeline config and
+/// [`EngineState::depth_params`].
+fn spawn_depth_controller(
+    jitter: Arc<JitterBuffer>,
+    effective_target: Arc<AtomicU32>,
+    base_ms: f32,
+    params: DepthParams,
+    quit: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut depth = DepthController::with_params(RealClock, base_ms, params);
+        // The counter starts at 0 for every fresh run (Start resets the
+        // buffer); only underruns observed *after* this task starts count.
+        let mut last_underruns = jitter.underruns();
+        let mut tick = tokio::time::interval(DEPTH_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await; // discard the immediate first tick
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let underruns = jitter.underruns();
+                    if underruns > last_underruns {
+                        depth.on_underrun();
+                        last_underruns = underruns;
+                    }
+                    let target_ms = depth.on_tick(true);
+                    effective_target.store(
+                        (target_ms * SAMPLE_RATE as f32 / 1000.0).ceil() as u32,
+                        Ordering::Relaxed,
+                    );
+                }
+                _ = async {
+                    while !quit.load(Ordering::Relaxed) {
+                        tokio::time::sleep(QUIT_POLL).await;
+                    }
+                } => break,
+            }
+        }
     })
 }
 
@@ -639,6 +779,10 @@ fn spawn_pw_monitor(
 /// (retrievable via [`EngineHandle::take_stats_line`]).
 async fn stop_pipeline(p: Pipeline, state: &Arc<EngineState>) {
     p.quit.store(true, Ordering::Relaxed);
+    // The depth controller self-exits on `quit`; abort it so teardown never
+    // waits on a missed wakeup (its result is uninteresting).
+    p.retarget.abort();
+    let _ = p.retarget.await;
 
     let final_line = match p.net_task.await {
         Ok(Ok(line)) => Some(line),
@@ -700,11 +844,12 @@ async fn run_network(
     config: EngineConfig,
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
+    effective_target: Arc<AtomicU32>,
     quit: Arc<AtomicBool>,
 ) -> Result<String> {
     match config.transport {
-        Transport::Udp => udp_loop(&config, ingest, jitter, quit).await,
-        Transport::Tcp => tcp_loop(&config, ingest, jitter, quit).await,
+        Transport::Udp => udp_loop(&config, ingest, jitter, effective_target, quit).await,
+        Transport::Tcp => tcp_loop(&config, ingest, jitter, effective_target, quit).await,
     }
 }
 
@@ -714,6 +859,7 @@ async fn udp_loop(
     config: &EngineConfig,
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
+    effective_target: Arc<AtomicU32>,
     quit: Arc<AtomicBool>,
 ) -> Result<String> {
     let addr = SocketAddr::new(config.bind, config.port);
@@ -724,6 +870,8 @@ async fn udp_loop(
 
     let mut buf = [0u8; MAX_DATAGRAM];
     let mut last_stats = Instant::now();
+    let mut last_underruns = jitter.underruns();
+    let mut last_underrun_log: Option<Instant> = None;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
@@ -746,6 +894,11 @@ async fn udp_loop(
         if quit.load(Ordering::Relaxed) {
             break;
         }
+        if let Some(line) =
+            underrun_episode_line(&jitter, &effective_target, &mut last_underruns, &mut last_underrun_log)
+        {
+            eprintln!("{line}");
+        }
         if last_stats.elapsed() >= STATS_INTERVAL {
             println!("{}", stats_line(Transport::Udp, &ingest, &jitter));
             last_stats = Instant::now();
@@ -761,6 +914,7 @@ async fn tcp_loop(
     config: &EngineConfig,
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
+    effective_target: Arc<AtomicU32>,
     quit: Arc<AtomicBool>,
 ) -> Result<String> {
     let addr = SocketAddr::new(config.bind, config.port);
@@ -770,6 +924,8 @@ async fn tcp_loop(
     eprintln!("openay-server: TCP listening on {addr}");
 
     let mut last_stats = Instant::now();
+    let mut last_underruns = jitter.underruns();
+    let mut last_underrun_log: Option<Instant> = None;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
@@ -803,12 +959,56 @@ async fn tcp_loop(
         if quit.load(Ordering::Relaxed) {
             break;
         }
+        if let Some(line) =
+            underrun_episode_line(&jitter, &effective_target, &mut last_underruns, &mut last_underrun_log)
+        {
+            eprintln!("{line}");
+        }
         if last_stats.elapsed() >= STATS_INTERVAL {
             println!("{}", stats_line(Transport::Tcp, &ingest, &jitter));
             last_stats = Instant::now();
         }
     }
     Ok(stats_line(Transport::Tcp, &ingest, &jitter))
+}
+
+/// Watch the underrun counter on every 200 ms wake; when it increased,
+/// return a rate-limited stderr line:
+///
+/// ```text
+/// openay-server: UNDERRUN episodes=+K total=U effective_target_ms=T fill_ms=F
+/// ```
+///
+/// `K` is the increase since the last wake, `U` the run total, `T` the live
+/// adaptive depth (the depth controller's current target), and `F` the
+/// current jitter fill. At most one line per [`UNDERRUN_LOG_INTERVAL`] (5 s),
+/// so a burst of underruns cannot spam the console; the counter however is
+/// always advanced so the next increase episode is measured from it.
+/// Returns `None` when there is nothing to print (no increase, or the
+/// 5 s throttle is active).
+fn underrun_episode_line(
+    jitter: &JitterBuffer,
+    effective_target: &AtomicU32,
+    last_underruns: &mut u64,
+    last_log: &mut Option<Instant>,
+) -> Option<String> {
+    let underruns = jitter.underruns();
+    if underruns <= *last_underruns {
+        return None;
+    }
+    let episodes = underruns - *last_underruns;
+    *last_underruns = underruns;
+    let now = Instant::now();
+    if last_log.is_some_and(|t| now.duration_since(t) < UNDERRUN_LOG_INTERVAL) {
+        return None;
+    }
+    *last_log = Some(now);
+    let fill_ms = jitter.available() as f32 / SAMPLE_RATE as f32 * 1000.0;
+    let target_ms = effective_target.load(Ordering::Relaxed) as f32 / SAMPLE_RATE as f32 * 1000.0;
+    Some(format!(
+        "openay-server: UNDERRUN episodes=+{episodes} total={underruns} \
+         effective_target_ms={target_ms:.1} fill_ms={fill_ms:.1}"
+    ))
 }
 
 /// The canonical server stats line, printed every 5 s and once at shutdown:
@@ -907,5 +1107,96 @@ mod tests {
         assert_eq!(cfg.target_ms, 10.0);
         assert_eq!(cfg.capacity_ms, 100.0);
         assert!(cfg.validated().is_ok());
+    }
+
+    /// The underrun episode line: exact format, only on an increase, and
+    /// rate-limited to one per 5 s (the counter still advances).
+    #[test]
+    fn underrun_episode_line_format_and_throttle() {
+        let jb = JitterBuffer::new(1024);
+        let target = AtomicU32::new(576); // 12 ms of 48 kHz audio
+        let mut last_underruns = jb.underruns();
+        let mut last_log = None;
+        assert_eq!(
+            underrun_episode_line(&jb, &target, &mut last_underruns, &mut last_log),
+            None,
+            "no increase: no line"
+        );
+        jb.note_underrun();
+        jb.note_underrun();
+        let line = underrun_episode_line(&jb, &target, &mut last_underruns, &mut last_log)
+            .expect("an increase logs");
+        assert_eq!(
+            line,
+            "openay-server: UNDERRUN episodes=+2 total=2 effective_target_ms=12.0 fill_ms=0.0"
+        );
+        jb.note_underrun();
+        assert_eq!(
+            underrun_episode_line(&jb, &target, &mut last_underruns, &mut last_log),
+            None,
+            "a second increase within 5 s is throttled"
+        );
+        assert_eq!(last_underruns, 3, "the counter advances even when throttled");
+    }
+
+    /// While stopped the snapshot reports the configured target as the
+    /// effective depth (standby display), never a stale run value.
+    #[test]
+    fn status_reports_config_target_as_effective_while_stopped() {
+        let cfg = EngineConfig {
+            target_ms: 17.0,
+            ..EngineConfig::default()
+        };
+        let handle = spawn_engine(Some(cfg));
+        let s = handle.status();
+        assert!(!s.running);
+        assert_eq!(s.effective_target_ms, 17.0);
+    }
+
+    /// The per-run reset: a new `Start` seeds the live target with the
+    /// configured value (the depth controller then adjusts it from there).
+    #[test]
+    fn start_seeds_effective_target_with_config() {
+        let cfg = EngineConfig {
+            transport: Transport::Udp,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 41_701,
+            codec: CodecMode::Auto,
+            target_ms: 12.0,
+            capacity_ms: 100.0,
+        };
+        let handle = spawn_engine(Some(cfg));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            handle
+                .cmd()
+                .send(EngineCommand::Start(cfg))
+                .await
+                .expect("send Start");
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if handle.status().running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let s = handle.status();
+        assert!(s.running);
+        assert!(
+            (s.effective_target_ms - 12.0).abs() < 0.01,
+            "fresh run targets the configured 12 ms, got {}",
+            s.effective_target_ms
+        );
+        rt.block_on(async {
+            handle
+                .cmd()
+                .send(EngineCommand::Stop)
+                .await
+                .expect("send Stop");
+        });
     }
 }

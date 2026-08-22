@@ -86,8 +86,10 @@ pub struct PwShared {
     /// Set by the main thread after Ctrl-C to stop the loop.
     pub quit: Arc<AtomicBool>,
     /// `ceil(target_ms * 48_000 / 1000)` samples that must be buffered before
-    /// the first real samples are emitted.
-    pub target_samples: usize,
+    /// the first real samples are emitted. Written by the depth-controller
+    /// task (live retarget), read Relaxed by the RT callback — a callback
+    /// must never block or spin.
+    pub target_samples: Arc<AtomicU32>,
     /// Peak level accumulator (RT-safe): the process callback folds
     /// `max |sample|` scaled to `0..=65535` into this atomic with a
     /// strict-max CAS loop; the status reader exchanges it on read
@@ -372,7 +374,7 @@ fn process_callback(stream: &pw::stream::StreamRef, shared: &mut PwShared) {
     let fill = QUANTUM_SAMPLES.min(n_f32);
     let mut written = 0usize;
     if shared.streaming.load(Ordering::Relaxed)
-        || shared.jitter.available() >= shared.target_samples
+        || shared.jitter.available() >= shared.target_samples.load(Ordering::Relaxed) as usize
     {
         shared.streaming.store(true, Ordering::Relaxed);
         written = shared.jitter.pop(&mut samples[..fill]);
