@@ -23,7 +23,7 @@ solutions like WO Mic on latency, security, and UX.
   (`OPUS_APPLICATION_RESTRICTED_LOWDELAY`, 10 ms frames).
 - Wire format: see [`shared/protocol.md`](shared/protocol.md).
 
-## Building & testing (Phase 5 state)
+## Building & testing (Phase 6 state)
 
 All tooling is user-space; no root required.
 
@@ -32,6 +32,9 @@ source scripts/env.sh        # Rust, cmake, pkg-config(libopus), JDK, ANDROID_HO
 
 # Desktop (Rust)
 cargo test --workspace                       # unit + golden-vector + codec tests
+cargo test -p openay-server                  # + adaptive-depth scenarios (headless;
+                                             #   compiled out of the workspace run by
+                                             #   feature unification with openay-gui)
 cargo run -p openay-loopback -- bench udp 41001 20000   # loopback latency bench
 
 # Native core (C++, host build)
@@ -41,6 +44,18 @@ ctest --test-dir android/native/build-host --output-on-failure
 
 # Cross-language interop (C++ <-> Rust over UDP and TCP)
 scripts/run_phase2.sh
+
+# Phase 6 gate: everything above plus adaptive-jitter scenarios through the
+# lossy-network proxy, QA-kit self-tests, software latency probe (needs a
+# PipeWire daemon) and CPU budget assertions
+scripts/run_phase6.sh
+
+# Phase 6 tools
+cargo run -p openay-proxy -- --listen 127.0.0.1:41860 --forward 127.0.0.1:41700 \
+  --profile burst            # deterministic loss/burst/jitter UDP forwarder
+scripts/latency_probe.sh     # software ingest->present latency (p50/p95)
+scripts/cpu_profile.sh       # idle / PCM / Opus %CPU + RSS, --assert budgets
+scripts/gen_click_track.py   # acoustic click track for the hardware audit
 ```
 
 ## Status
@@ -74,4 +89,28 @@ scripts/run_phase2.sh
   - Desktop: `openay-gui` (Iced, best-effort tray) with VU ladder, engine
     settings slide-over, autostart; the window close button quits the app
     cleanly (no hide-to-tray); `openay-server` refactored to lib+bin
-- [ ] Phase 6 — latency audit, xrun handling, CPU profiling
+- [x] Phase 6 — QA, profiling & latency tuning
+  - Adaptive jitter buffer: `openay-jitter::DepthController` (+2 ms per
+    underrun to a 20 ms ceiling, −1 ms per 60 s underrun-free toward the
+    user floor; injectable clock, fake-clock unit tests); live retarget
+    via `Arc<AtomicU32>` with no pipeline restart;
+    `EngineStatus.effective_target_ms` surfaced in the GUI CONSOLE card
+    (amber ↑ marker when raised)
+  - `openay-proxy`: deterministic seeded loss profiles (uniform 2%,
+    Gilbert-Elliott bursts ~9%, 0–60 ms delay + 1% dups) for reproducible
+    network-degradation validation
+  - Xrun visibility: rate-limited desktop underrun-episode stderr lines
+    (with effective target); Android service logs xrun increases between
+    its 2 s stats refreshes
+  - Software latency probe (`scripts/latency_probe.sh` +
+    `analyze_latency.py`, onset-marked sender): measured on this host,
+    p50 ≈ 47–50 ms / p95 ≈ 51–57 ms over the full UDP → decode → jitter →
+    PipeWire chain (anchor error bars documented; hardware audit remains
+    ground truth)
+  - CPU budgets asserted: idle 0.20–0.40 %CPU (<1 %), Opus-active
+    0.51–0.71 %CPU (<3 %), RSS ≈ 8 MiB
+  - Hardware glass-to-glass audit kit: click-track generator/analyzer,
+    procedure doc (`docs/latency-audit.md`) and results template
+  - `scripts/run_phase6.sh`: 11/11 checks pass (builds, ctest, cargo
+    workspace + headless adaptive scenarios, python self-tests, proxy
+    delivery-ratio smoke, latency-probe verdict, CPU budget assertions)
