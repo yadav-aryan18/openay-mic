@@ -38,6 +38,11 @@ const CABLE_PULSE_HZ: f32 = 1.0;
 const RING_TAU: f32 = 0.10;
 /// ON AIR press pulse duration (seconds; design.md: 150-250 ms).
 const PRESS_PULSE_MS: f32 = 0.20;
+/// Adaptive-depth "meaningfully above" guard (ms): the effective prebuffer
+/// must exceed the configured base by more than this before the "↑" marker
+/// renders. Absorbs float readout jitter — the controller's own step is
+/// +2 ms per underrun, so 0.05 ms is far below any real raise.
+const DEPTH_RAISE_EPSILON_MS: f32 = 0.05;
 
 // ---------------------------------------------------------------------------
 // Flags
@@ -77,6 +82,11 @@ pub struct App {
     engine: EngineHandle,
     engine_cfg: EngineConfig, // last config sent to the engine
     status: EngineStatus,
+    /// Live adaptive prebuffer depth (ms) from the last status poll:
+    /// `status.effective_target_ms` mirrored into its own field (same
+    /// pattern as `pps`/`streaming`) for the CONSOLE card and the settings
+    /// hint. Equals the configured target while stopped.
+    effective_target_ms: f32,
     // VU / display
     vu: VuBallistics,
     ring_level: f32,
@@ -160,6 +170,7 @@ impl App {
             engine: flags.engine,
             engine_cfg,
             status: initial_status,
+            effective_target_ms: initial_status.effective_target_ms,
             vu: VuBallistics::default(),
             ring_level: 0.0,
             last_received: 0,
@@ -292,6 +303,7 @@ impl App {
         self.last_received = status.received;
         self.pps = vu::pps(received_delta, dt);
         self.streaming = status.running && received_delta > 0;
+        self.effective_target_ms = status.effective_target_ms;
         self.status = status;
 
         // VU ballistics: instant attack, ~12 dB/s decay. When the engine is
@@ -308,11 +320,13 @@ impl App {
         // stream without a debugger attached.
         if env_flag("OPENAY_DEBUG_TICKLOG") {
             eprintln!(
-                "TICK dt={dt:.3} running={} streaming={} pps={:.0} peak={:.4} fill={:.1} lost={}",
+                "TICK dt={dt:.3} running={} streaming={} pps={:.0} peak={:.4} \
+                 eff={:.1} fill={:.1} lost={}",
                 status.running,
                 self.streaming,
                 self.pps,
                 status.level_peak,
+                status.effective_target_ms,
                 status.fill_ms,
                 status.lost,
             );
@@ -639,13 +653,37 @@ impl App {
             .align_x(alignment::Horizontal::Center),
         );
 
+        // CONSOLE: the live adaptive prebuffer depth while running, the
+        // configured base while stopped. A small amber "↑" marks loss
+        // adaptation having raised the buffer meaningfully above the base
+        // (sub-millisecond float readout jitter must not light it).
+        let (console_ms, console_raised) = console_depth(
+            self.effective_target_ms,
+            self.engine_cfg.target_ms,
+            self.status.running,
+        );
+        let console_marker: Element<'_, Message> = if console_raised {
+            text("↑")
+                .font(theme::FONT_MONO_MEDIUM)
+                .size(12)
+                .color(theme::AMBER)
+                .into()
+        } else {
+            Space::new(0.0, 0.0).into()
+        };
+
         let console_card = self.stage_card(
             "CONSOLE",
             column![
-                text(format!("{:.1} ms", self.engine_cfg.target_ms))
-                    .font(theme::FONT_MONO_MEDIUM)
-                    .size(20)
-                    .color(value_color(lit(2))),
+                row![
+                    text(format!("{:.1} ms", console_ms))
+                        .font(theme::FONT_MONO_MEDIUM)
+                        .size(20)
+                        .color(value_color(lit(2))),
+                    console_marker,
+                ]
+                .spacing(2)
+                .align_y(alignment::Vertical::Center),
                 canvas::Canvas::new(FillBar {
                     fraction: (self.status.fill_ms / 100.0).clamp(0.0, 1.0),
                     hot,
@@ -943,6 +981,23 @@ impl App {
             ]
             .align_y(alignment::Vertical::Center),
             slider(5.0..=20.0, self.target_ms, Message::TargetChanged).step(0.5_f32),
+            {
+                // Live-state note: while running, show when the depth
+                // controller lifted the buffer above this setting (the
+                // "↑" in the CONSOLE card, spelled out here). Same amber
+                // attention token as the port error line; hidden otherwise.
+                let hint: Element<Message> =
+                    match depth_hint(self.effective_target_ms, self.target_ms, self.status.running)
+                    {
+                        Some(h) => text(h)
+                            .font(theme::FONT_MONO)
+                            .size(10)
+                            .color(theme::AMBER)
+                            .into(),
+                        None => Space::new(0.0, 0.0).into(),
+                    };
+                hint
+            },
             Space::new(4.0, 4.0),
             toggler(self.autostart)
                 .label("AUTOSTART")
@@ -1029,6 +1084,39 @@ fn engine_cmd(engine: &EngineHandle, cmd: EngineCommand) -> Task<Message> {
         },
         |_| Message::CmdSent,
     )
+}
+
+/// True when the live adaptive depth sits meaningfully above the configured
+/// base (> [`DEPTH_RAISE_EPSILON_MS`]); the depth controller's real raise is
+/// +2 ms per underrun, so this only fires after actual adaptation.
+fn depth_raised(effective: f32, base: f32) -> bool {
+    effective > base + DEPTH_RAISE_EPSILON_MS
+}
+
+/// What the CONSOLE card shows: `(depth_ms, raised)` — the live adaptive
+/// depth while running, the configured base while stopped (the engine
+/// reports the configured value then anyway, but a stale readout must not
+/// leak through). `raised` is the marker condition and is always false
+/// while stopped.
+fn console_depth(effective: f32, base: f32, running: bool) -> (f32, bool) {
+    if running {
+        (effective, depth_raised(effective, base))
+    } else {
+        (base, false)
+    }
+}
+
+/// One-line settings-panel note: `Some(..)` while running and the depth
+/// controller has lifted the effective depth above the configured setting;
+/// `None` otherwise (stopped, or depth at/near the base).
+fn depth_hint(effective: f32, base: f32, running: bool) -> Option<String> {
+    if running && depth_raised(effective, base) {
+        Some(format!(
+            "effective {effective:.1} ms · raised by loss adaptation"
+        ))
+    } else {
+        None
+    }
 }
 
 /// Linear interpolation between two colors.
@@ -2021,6 +2109,58 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Adaptive jitter depth: the CONSOLE card shows the live effective
+    // target while running (with an "↑" marker when loss adaptation lifts
+    // it above the configured base) and the configured base while stopped;
+    // the settings panel repeats the note next to the target slider.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn effective_target_ms_tracks_engine_status() {
+        let mut app = test_app(Config::default());
+        // Stopped engine: the snapshot reports the configured base.
+        assert_eq!(app.effective_target_ms, app.engine_cfg.target_ms);
+        let _ = app.tick(Instant::now());
+        assert_eq!(app.effective_target_ms, app.engine_cfg.target_ms);
+    }
+
+    #[test]
+    fn console_depth_shows_configured_value_while_stopped() {
+        // Stopped: the card shows the configured base even if a stale
+        // effective value is around — no marker, no settings hint.
+        let (depth_ms, raised) = console_depth(14.0, 10.0, false);
+        assert_eq!(depth_ms, 10.0);
+        assert!(!raised);
+        assert_eq!(depth_hint(14.0, 10.0, false), None);
+    }
+
+    #[test]
+    fn console_depth_equal_to_configured_renders_no_marker() {
+        // Running with the depth at the base: value shown, no marker.
+        let (depth_ms, raised) = console_depth(10.0, 10.0, true);
+        assert_eq!(depth_ms, 10.0);
+        assert!(!raised, "effective == configured must not raise the marker");
+
+        // Sub-0.05 ms readout jitter must not light the marker either.
+        let (_, raised) = console_depth(10.04, 10.0, true);
+        assert!(!raised);
+        assert_eq!(depth_hint(10.04, 10.0, true), None);
+    }
+
+    #[test]
+    fn console_depth_above_configured_renders_marker_and_hint() {
+        // Running with the depth controller raised: live value + marker,
+        // and the settings panel spells the condition out.
+        let (depth_ms, raised) = console_depth(14.0, 10.0, true);
+        assert_eq!(depth_ms, 14.0, "running card shows the live depth");
+        assert!(raised, "effective > configured must raise the marker");
+        assert_eq!(
+            depth_hint(14.0, 10.0, true).as_deref(),
+            Some("effective 14.0 ms · raised by loss adaptation")
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Reduced-motion propagation: the power-on stagger is skipped.
     // -----------------------------------------------------------------------
 
@@ -2077,6 +2217,8 @@ mod tests {
         "OPUS",
         "JITTER TARGET",
         "{:.1} ms",
+        "↑", // adaptive-depth raiser marker (CONSOLE card; U+2191 audited)
+        "effective {:.1} ms · raised by loss adaptation",
         "AUTOSTART",
         "START MINIMIZED",
         "REDUCED MOTION",
@@ -2088,7 +2230,7 @@ mod tests {
 
     /// Characters verified (via cmap parsing) to exist in every bundled
     /// font, in addition to printable ASCII.
-    const EXTRA_ALLOWED: &[char] = &['·', '×', '\u{2026}'];
+    const EXTRA_ALLOWED: &[char] = &['·', '×', '\u{2026}', '\u{2191}'];
 
     fn is_allowed_glyph(c: char) -> bool {
         c.is_ascii_graphic() || c == ' ' || EXTRA_ALLOWED.contains(&c)
