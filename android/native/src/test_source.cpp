@@ -14,6 +14,11 @@ TestSource::TestSource(double freq_hz, double amplitude, size_t frame_samples,
 
 bool TestSource::Start() {
     if (running_.load(std::memory_order_relaxed)) return true;  // idempotent
+    // Per-run accounting: a Start->Stop->Start cycle must not accumulate the
+    // previous run's frame counts (tone-udp reads silence_frames_delivered()
+    // after Stop to report onset_packet).
+    silence_frames_.store(0, std::memory_order_relaxed);
+    sine_frames_.store(0, std::memory_order_relaxed);
     running_.store(true, std::memory_order_relaxed);
     thread_ = std::thread(&TestSource::Run, this);
     return true;

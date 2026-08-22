@@ -31,6 +31,9 @@
 #        [--onset-frames N] [--duration S] [--target-ms MS] [--min-ok N]
 #        [--keep] [--skip-build]
 set -u
+# Pin the locale: awk's decimal output (anchor_ms) must stay dot-formatted
+# for the analyzer's float parsing regardless of the host's LC_NUMERIC.
+export LC_ALL=C
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 source "$ROOT/scripts/env.sh"

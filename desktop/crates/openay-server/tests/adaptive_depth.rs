@@ -186,11 +186,11 @@ async fn consumer(jitter: Arc<openay_jitter::JitterBuffer>, stop: Arc<AtomicBool
     }
 }
 
-/// Seed chosen deterministically so the burst profile's first ~200
-/// decisions contain the long bad-state run (packets ~50..80, a 310 ms
-/// hole): with this seed the drop sequence is 35 drops in 400 packets with
-/// a 31-packet consecutive run — the burstiness the scenario needs, and
-/// fully reproducible.
+/// Seed chosen deterministically so the burst profile's bad-state run lands
+/// mid-stream: with this seed the drop sequence is 35 drops in 400 packets
+/// including a 27-packet consecutive run spanning packets ≈53..80 (~270 ms)
+/// — long after seq 0 baselines the sequence tracker, and far deeper than
+/// the consumer's prebuffer margin. Fully reproducible.
 const BURST_SEED: u64 = 0x1;
 
 /// Spawn an in-process lossy proxy and return a quit flag for it.
@@ -279,7 +279,7 @@ async fn adaptive_depth_rises_under_burst_loss() {
     let consumer_task = tokio::spawn(consumer(jitter.clone(), cons_stop.clone()));
 
     // ~600 frames = 6 s of audio at the phone's realtime pace. The seeded
-    // burst profile's 27-packet hole spans packets ~53..79 (t ≈ 0.5–0.8 s),
+    // burst profile's 27-packet hole spans packets ≈53..80 (t ≈ 0.5–0.8 s),
     // long after the sequence tracker has baselined on delivered seq 0, so
     // the hole registers as real loss.
     let producer_task = tokio::spawn(send_stream(proxy_addr, 600, Arc::new(AtomicBool::new(false))));
@@ -391,10 +391,13 @@ async fn adaptive_depth_decays_stepwise_on_clean_stream() {
     // Phase 2 (clean): the SAME engine run keeps streaming, but the proxy
     // now forwards everything. Underruns stop, so the window accrues and the
     // target must step down by exactly 1 ms per 600 ms window to the base.
+    // 900 frames (9 s) so the budget covers a worst-case rise to the 20 ms
+    // ceiling: 10 windows of decay + tick/poll quantization still fit before
+    // the stream ends (once it does, drain dry-pops would raise again).
     let clean_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), clean_proxy_port);
     let (clean_proxy_quit, clean_proxy_task) = start_proxy(clean_addr, engine_addr, Profile::Clean);
     let clean_producer =
-        tokio::spawn(send_stream(clean_addr, 450, Arc::new(AtomicBool::new(false))));
+        tokio::spawn(send_stream(clean_addr, 900, Arc::new(AtomicBool::new(false))));
 
     let deadline = std::time::Instant::now() + PHASE_DEADLINE;
     let mut last_logged_target = f32::NAN;
@@ -414,9 +417,14 @@ async fn adaptive_depth_decays_stepwise_on_clean_stream() {
         }
         let t = s.effective_target_ms;
         if t < prev_target {
+            // Tolerate observer lag: the controller ticks every 200 ms but
+            // this poll runs every 100 ms — on a stalled CI box two ticks
+            // can land between observations, so accept 1 or 2 exact steps.
+            let drop = prev_target - t;
             assert!(
-                (prev_target - t - 1.0).abs() < 0.05,
-                "decay must step exactly 1 ms per clean window, saw {prev_target} -> {t}"
+                (drop - 1.0).abs() < 0.05 || (drop - 2.0).abs() < 0.1,
+                "decay must step exactly 1 ms per clean window (2 windows max \
+                 between polls), saw {prev_target} -> {t}"
             );
             last_logged_target = t;
             step_count += 1;

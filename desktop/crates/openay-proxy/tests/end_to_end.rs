@@ -2,9 +2,21 @@
 //! loopback UDP sockets and stop it through the `quit` flag.
 //!
 //! The proxy's listen socket binds asynchronously, so each test first sends
-//! probe datagrams until one is observed at the receiver. Probes consume
-//! one decision each, so the expected stats are recomputed from the public
-//! [`DecisionEngine`] over the exact decision window (probes, then batch).
+//! probe datagrams until one is observed at the receiver. A probe sent
+//! before `bind()` completes would be silently dropped by the kernel while
+//! still counting in the sender's bookkeeping, so the number of decision
+//! slots the probes consumed is NOT assumed up front. Instead, after
+//! shutdown the exact consumed window is derived from the proxy's own
+//! totals — every decision ends as exactly one of:
+//!
+//! - forward immediate / delayed / duplicate-original pair: contributes one
+//!   to `delayed`, plus one to `forwarded` when it also produced the
+//!   immediate duplicate copy;
+//! - drop: contributes one to `dropped`.
+//!
+//! so `decisions = forwarded − duplicated + dropped`, and the expected
+//! batch statistics are recomputed from the LAST `count` draws of that
+//! window (the leading draws are whatever the probes consumed).
 
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,7 +88,9 @@ async fn send_datagrams(count: usize, target: SocketAddr) -> Result<()> {
 /// Spawn the proxy, then wait until its listen socket is actually bound by
 /// sending probe datagrams and waiting for them at the single receiver that
 /// is also used for the batch (so nothing is lost between readiness and
-/// collection). Returns the number of probes used (1 on the usual first try).
+/// collection). How many decision slots the probes consumed is unknown by
+/// construction (see the module docs); callers derive it from the final
+/// [`ProxyStats`] via [`decisions_consumed`].
 async fn spawn_and_ready(
     profile: Profile,
     seed: u64,
@@ -84,7 +98,6 @@ async fn spawn_and_ready(
     u16,
     u16,
     UdpSocket,
-    usize,
     Arc<AtomicBool>,
     tokio::task::JoinHandle<Result<ProxyStats>>,
 )> {
@@ -96,7 +109,7 @@ async fn spawn_and_ready(
     let handle = tokio::spawn(async move { run_proxy(config, q).await });
 
     let receiver = UdpSocket::bind(addr(forward_port)).await?;
-    let mut probes = 0;
+    let mut probes = 0u32;
     loop {
         probes += 1;
         send_one(addr(listen_port)).await?;
@@ -108,12 +121,42 @@ async fn spawn_and_ready(
             "proxy did not start listening within the probe budget"
         );
     }
-    Ok((listen_port, forward_port, receiver, probes, quit, handle))
+    Ok((listen_port, forward_port, receiver, quit, handle))
+}
+
+/// Decision slots consumed by the proxy (see module docs).
+fn decisions_consumed(stats: &ProxyStats) -> u64 {
+    stats.forwarded - stats.duplicated + stats.dropped
+}
+
+/// Recompute the deterministic decisions over the whole consumed window and
+/// return the aggregate counters plus the LAST `batch` actions (the real
+/// batch; the leading draws belong to the readiness probes).
+fn replay(profile: Profile, seed: u64, decisions: u64, batch: usize) -> (ProxyStats, Vec<openay_proxy::Action>) {
+    let mut engine = DecisionEngine::new(profile, seed);
+    let mut totals = ProxyStats::default();
+    let mut tail = Vec::with_capacity(batch);
+    for i in 0..decisions {
+        let action = engine.decide();
+        match action {
+            openay_proxy::Action::ForwardImmediate => totals.forwarded += 1,
+            openay_proxy::Action::ForwardDelayed(_) => {}
+            openay_proxy::Action::ForwardImmediatePlusDelayed(_) => {
+                totals.forwarded += 1;
+                totals.duplicated += 1;
+            }
+            openay_proxy::Action::Drop => totals.dropped += 1,
+        }
+        if i >= decisions - batch as u64 {
+            tail.push(action);
+        }
+    }
+    (totals, tail)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clean_forwards_every_datagram() -> Result<()> {
-    let (listen_port, _forward_port, receiver, probes, quit, handle) =
+    let (listen_port, _forward_port, receiver, quit, handle) =
         spawn_and_ready(Profile::Clean, 1).await?;
 
     let count = 100;
@@ -128,16 +171,20 @@ async fn clean_forwards_every_datagram() -> Result<()> {
     let stats = tokio::time::timeout(Duration::from_secs(5), handle)
         .await
         .expect("proxy shut down")??;
+
     assert_eq!(got, count, "clean profile must forward the whole batch");
-    assert_eq!(stats.forwarded, (count + probes) as u64);
+    let decisions = decisions_consumed(&stats);
+    assert!(decisions >= count as u64, "window must cover the batch");
     assert_eq!(stats.dropped, 0);
     assert_eq!(stats.duplicated, 0);
+    // Clean forwards every datagram it decided on.
+    assert_eq!(stats.forwarded, decisions);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loss2_drops_exactly_the_simulated_count() -> Result<()> {
-    let (listen_port, _forward_port, receiver, probes, quit, handle) =
+    let (listen_port, _forward_port, receiver, quit, handle) =
         spawn_and_ready(Profile::Loss2, 99).await?;
 
     let count = 500;
@@ -151,28 +198,36 @@ async fn loss2_drops_exactly_the_simulated_count() -> Result<()> {
         .await
         .expect("proxy shut down")??;
 
-    // Recompute the deterministic decision counts over the exact window.
-    let mut engine = DecisionEngine::new(Profile::Loss2, 99);
-    let probe_drops = (0..probes).filter(|_| engine.decide().is_drop()).count() as u64;
-    let batch_drops = (0..count).filter(|_| engine.decide().is_drop()).count() as u64;
+    // Replay the exact consumed window (probes included, however many).
+    let decisions = decisions_consumed(&stats);
+    assert!(decisions >= count as u64, "window must cover the batch");
+    let (_, tail) = replay(Profile::Loss2, 99, decisions, count);
+    let batch_drops = tail.iter().filter(|a| a.is_drop()).count();
 
-    assert_eq!(stats.dropped, probe_drops + batch_drops);
-    assert_eq!(stats.forwarded, (count + probes) as u64 - stats.dropped);
-    assert_eq!(got, count - batch_drops as usize);
-    assert!(batch_drops > 0, "loss2 with seed 99 must drop batch datagrams");
+    assert_eq!(got, count - batch_drops, "receiver sees batch minus drops");
+    assert_eq!(
+        stats.dropped,
+        decisions - stats.forwarded,
+        "loss2: every non-forwarded decision was a drop"
+    );
+    assert_eq!(stats.duplicated, 0);
     assert!(
-        (0.01..=0.05).contains(&(stats.dropped as f64 / (count + probes) as f64)),
+        batch_drops > 0,
+        "loss2 with seed 99 must drop batch datagrams"
+    );
+    assert!(
+        (0.01..=0.05).contains(&(stats.dropped as f64 / decisions as f64)),
         "loss2 drop rate {} outside band",
-        stats.dropped as f64 / (count + probes) as f64
+        stats.dropped as f64 / decisions as f64
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn jitter30_loses_nothing_duplicates_sometimes() -> Result<()> {
-    // Seed 42: verified that the decision window includes duplicates, so
-    // the assertions below hold deterministically.
-    let (listen_port, _forward_port, receiver, probes, quit, handle) =
+    // Seed 42: verified that the batch window contains duplicates, so the
+    // assertions below hold deterministically.
+    let (listen_port, _forward_port, receiver, quit, handle) =
         spawn_and_ready(Profile::Jitter30, 42).await?;
 
     let count = 300;
@@ -187,16 +242,16 @@ async fn jitter30_loses_nothing_duplicates_sometimes() -> Result<()> {
         .await
         .expect("proxy shut down")??;
 
-    // Recompute the deterministic duplicate counts over the exact window.
-    let mut engine = DecisionEngine::new(Profile::Jitter30, 42);
-    let probe_dups = (0..probes).filter(|_| engine.decide().duplicates()).count() as u64;
-    let batch_dups = (0..count).filter(|_| engine.decide().duplicates()).count() as u64;
+    let decisions = decisions_consumed(&stats);
+    assert!(decisions >= count as u64, "window must cover the batch");
+    let (_, tail) = replay(Profile::Jitter30, 42, decisions, count);
+    let batch_dups = tail.iter().filter(|a| a.duplicates()).count();
 
     assert_eq!(stats.dropped, 0, "jitter30 never drops");
-    assert_eq!(stats.duplicated, probe_dups + batch_dups);
-    // Every original (probes + batch) is forwarded exactly once, plus dups.
-    assert_eq!(stats.forwarded, (count + probes) as u64 + stats.duplicated);
-    assert_eq!(got, count + batch_dups as usize, "batch records at receiver");
-    assert!(batch_dups > 0, "seed 42's batch window must contain a duplicate");
+    assert_eq!(got, count + batch_dups, "batch records at receiver");
+    // Every decision delivers its original exactly once (the 1 s quiet wait
+    // flushes all <=60 ms delays before shutdown), duplicates add copies.
+    assert_eq!(stats.delayed, decisions);
+    assert_eq!(stats.forwarded, decisions + stats.duplicated);
     Ok(())
 }

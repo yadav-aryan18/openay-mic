@@ -301,8 +301,9 @@ impl EngineHandle {
 
         if running {
             // The live adaptive depth: what the RT latch actually waits for.
-            s.effective_target_ms =
-                self.state.effective_target.load(Ordering::Relaxed) as f32 / SAMPLE_RATE as f32 * 1000.0;
+            s.effective_target_ms = self.state.effective_target.load(Ordering::Acquire) as f32
+                / SAMPLE_RATE as f32
+                * 1000.0;
             if let Some(jitter) = self
                 .state
                 .jitter
@@ -383,7 +384,13 @@ impl EngineHandle {
     /// exactly like the PipeWire RT callback does. With the `pipewire`
     /// feature the RT callback is that consumer; two consumers would violate
     /// the ring protocol. `None` while stopped.
+    ///
+    /// Compiled out under the `pipewire` feature: there the RT callback is
+    /// the consumer, and a second consumer popping from this handle would be
+    /// a data race on the ring's interior mutability (not merely a logic
+    /// bug), so misuse must not typecheck.
     #[doc(hidden)]
+    #[cfg(not(feature = "pipewire"))]
     pub fn jitter_for_test(&self) -> Option<Arc<JitterBuffer>> {
         self.state
             .jitter
@@ -632,9 +639,12 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
 
     // Seed the adaptive depth with the configured target and share it with
     // the RT latch (pipewire), the depth controller task, and `status()`.
+    // Release pairs with status()'s Acquire load: a snapshot that already
+    // observes `running == true` (published later by mark_running) can never
+    // see the *previous* run's stale depth here.
     let target_samples =
         (config.target_ms * SAMPLE_RATE as f32 / 1000.0).ceil() as u32;
-    state.effective_target.store(target_samples, Ordering::Relaxed);
+    state.effective_target.store(target_samples, Ordering::Release);
 
     #[cfg(feature = "pipewire")]
     let pw_thread = {

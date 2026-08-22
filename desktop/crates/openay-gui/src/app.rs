@@ -986,9 +986,15 @@ impl App {
                 // controller lifted the buffer above this setting (the
                 // "↑" in the CONSOLE card, spelled out here). Same amber
                 // attention token as the port error line; hidden otherwise.
+                // Base is the config the engine was started with — the same
+                // reference the CONSOLE card uses — so mid-drag slider edits
+                // cannot make the two indicators disagree.
                 let hint: Element<Message> =
-                    match depth_hint(self.effective_target_ms, self.target_ms, self.status.running)
-                    {
+                    match depth_hint(
+                        self.effective_target_ms,
+                        self.engine_cfg.target_ms,
+                        self.status.running,
+                    ) {
                         Some(h) => text(h)
                             .font(theme::FONT_MONO)
                             .size(10)

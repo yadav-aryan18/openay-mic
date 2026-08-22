@@ -22,6 +22,9 @@
 #
 # Logs go to /tmp/openay-cpu-*.log; ports used: 41901-41903 (private range).
 set -u
+# Pin the locale so awk/printf decimals stay dot-formatted regardless of
+# the host's LC_NUMERIC (the CPU lines are parsed as floats downstream).
+export LC_ALL=C
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
