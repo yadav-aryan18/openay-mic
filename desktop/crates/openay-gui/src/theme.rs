@@ -111,12 +111,14 @@ pub fn flat_button(theme: &iced::Theme, _status: button::Status) -> button::Styl
     }
 }
 
-/// Engraved look for secondary buttons: no fill, hairline border.
+/// Engraved look (Save settings): panel fill, hairline border. Text is CREAM
+/// at rest — the pane's only action must not read as disabled (DIM is
+/// "secondary/disabled" per design.md); hover only lifts the border.
 pub fn engraved_button(theme: &iced::Theme, status: button::Status) -> button::Style {
     let _ = theme;
     let (fg, border) = match status {
         button::Status::Hovered | button::Status::Pressed => (CREAM, DIM),
-        _ => (DIM, LINE),
+        _ => (CREAM, LINE),
     };
     button::Style {
         background: Some(iced::Background::Color(PANEL)),

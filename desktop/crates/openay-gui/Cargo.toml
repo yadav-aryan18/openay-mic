@@ -10,7 +10,10 @@ name = "openay-gui"
 path = "src/main.rs"
 
 [dependencies]
-openay-server = { path = "../openay-server" }
+# The GUI always ships the PipeWire virtual microphone: a network-only
+# console would render meters against a silent engine (this exact mismatch
+# bit us — see the VU/ring dead-meter fix).
+openay-server = { path = "../openay-server", features = ["pipewire"] }
 # Software renderer only (tiny-skia, NOT wgpu); tokio integration for the
 # async engine commands; canvas for the custom-drawn instruments.
 iced = { version = "0.13", default-features = false, features = ["tiny-skia", "tokio", "canvas"] }
@@ -24,3 +27,7 @@ if-addrs = "0.15"
 [dev-dependencies]
 # Headless layout probing in unit tests (same version as the iced tree).
 iced_core = "0.13"
+# Rasterize canvas geometry headlessly (same versions as the iced tree's
+# tiny-skia backend) so canvas bugs can be asserted pixel-exactly.
+tiny-skia = "0.11"
+iced_tiny_skia = "0.13"

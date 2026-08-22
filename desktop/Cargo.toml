@@ -20,3 +20,13 @@ license = "MIT OR Apache-2.0"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+[patch.crates-io]
+# iced_tiny_skia 0.13.0 clips translated canvas geometry against an
+# untranslated (canvas-local) clip mask whenever the fill/stroke bounds fail
+# an exact float comparison — which makes stroked circles and some filled
+# rects vanish at non-zero window positions (the MIC ring, 7 of the 24 VU
+# segments, the ON AIR dot). Vendored with a one-line fix: map the group
+# clip through the group transformation before intersecting it with the
+# window-space clip. See vendor/iced_tiny_skia/README.md.
+iced_tiny_skia = { path = "vendor/iced_tiny_skia" }

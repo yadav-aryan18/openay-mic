@@ -1595,8 +1595,6 @@ dependencies = [
 [[package]]
 name = "iced_tiny_skia"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c625d368284fcc43b0b36b176f76eff1abebe7959dd58bd8ce6897d641962a50"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -2545,10 +2543,12 @@ dependencies = [
  "dirs",
  "iced",
  "iced_core",
+ "iced_tiny_skia",
  "if-addrs",
  "ksni",
  "openay-server",
  "serde",
+ "tiny-skia",
  "toml",
 ]
 

@@ -52,6 +52,22 @@ pub struct Flags {
     pub tray: Option<TrayHandle>,
 }
 
+/// True when the environment variable `name` is set to a truthy value.
+///
+/// Used by the dev-only `OPENAY_DEBUG_*` hooks (autostart, settings pane):
+/// any value except an empty string, "0" or "false" (case-insensitive)
+/// enables the hook; an absent variable disables it. Kept pure so the
+/// parsing rules are unit-testable.
+pub(crate) fn env_flag(name: &str) -> bool {
+    match std::env::var_os(name) {
+        None => false,
+        Some(v) => {
+            let s = v.to_string_lossy();
+            !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
@@ -135,6 +151,11 @@ impl App {
         let bind_options = get_local_ips(&bind_input);
         let initial_status = flags.engine.status();
 
+        // Dev-only hook: OPENAY_DEBUG_SETTINGS=1 opens the settings slide-over
+        // right after app init so the pane can be exercised headlessly
+        // (screenshots) without input automation. Documented in main.rs.
+        let settings_open = env_flag("OPENAY_DEBUG_SETTINGS");
+
         let app = App {
             engine: flags.engine,
             engine_cfg,
@@ -146,7 +167,7 @@ impl App {
             streaming: false,
             last_tick: Instant::now(),
             window_id: None,
-            settings_open: false,
+            settings_open,
             port_input,
             bind_input,
             bind_options,
@@ -273,8 +294,14 @@ impl App {
         self.streaming = status.running && received_delta > 0;
         self.status = status;
 
-        // VU ballistics: instant attack, ~12 dB/s decay.
-        self.vu.update(status.level_peak, dt);
+        // VU ballistics: instant attack, ~12 dB/s decay. When the engine is
+        // not running the ballistics reset — an idle console shows a fully
+        // unlit ladder with no stale peak-hold bars.
+        if status.running {
+            self.vu.update(status.level_peak, dt);
+        } else {
+            self.vu = VuBallistics::default();
+        }
 
         // MIC ring smoothing (~100 ms time constant).
         let alpha = 1.0 - (-dt / RING_TAU).exp();
@@ -560,8 +587,10 @@ impl App {
                 hot,
                 lit: lit(0),
             })
-            .width(Length::Fixed(76.0))
-            .height(Length::Fixed(76.0)),
+            // 64 px inside the 76 px body region: 6 px of clearance on every
+            // side so the ring can never crowd the card label.
+            .width(Length::Fixed(64.0))
+            .height(Length::Fixed(64.0)),
         );
 
         let link_card = self.stage_card(
@@ -681,21 +710,34 @@ impl App {
     fn vu_ladder<'a>(&'a self) -> Element<'a, Message> {
         let level = self.vu.level();
         // Peak-hold: a single brighter segment at the recent max, decaying
-        // at a third of the reading's rate (design.md VU ladder spec).
+        // at a third of the reading's rate (design.md VU ladder spec). The
+        // hold marker only shows while the link is hot — an idle console
+        // must not display stale cream bars.
         let hold = self.vu.hold_segments();
-        let ladder = canvas::Canvas::new(VuLadder { lit: vu::vu_segments(level), hold })
-            .width(Length::Fill)
-            .height(Length::Fixed(128.0));
-
-        row![
-            ladder,
-            text("VU PEAK")
-                .font(theme::FONT_LABEL)
-                .size(10)
-                .color(theme::DIM),
-        ]
-        .spacing(8)
-        .align_y(alignment::Vertical::Center)
+        let hot = self.status.running && self.streaming;
+        // The ladder lives in its own panel card: same machined surface as
+        // The Chain, so LINE-color unlit segments keep one consistent
+        // contrast surface (LINE on raw ink is nearly invisible).
+        container(
+            column![
+                text("VU PEAK")
+                    .font(theme::FONT_LABEL)
+                    .size(10)
+                    .color(theme::DIM),
+                canvas::Canvas::new(VuLadder {
+                    lit: vu::vu_segments(level),
+                    hold,
+                    hot,
+                })
+                .width(Length::Fill)
+                .height(Length::Fixed(56.0)),
+            ]
+            .spacing(6)
+            .width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .padding(12)
+        .style(theme::stage_card)
         .into()
     }
 
@@ -823,10 +865,13 @@ impl App {
                 let hint: Element<Message> = if port_valid {
                     Space::new(0.0, 0.0).into()
                 } else {
+                    // Amber, not tally: design.md binds tally red to exactly
+                    // two places (the ON AIR lamp and the VU clip zone), so
+                    // field errors use the warm attention accent instead.
                     text("Port must be 1-65535")
                         .font(theme::FONT_MONO)
                         .size(10)
-                        .color(theme::TALLY)
+                        .color(theme::AMBER)
                         .into()
                 };
                 hint
@@ -1079,16 +1124,17 @@ impl<Message> Program<Message> for MenuIcon {
         let mut frame = Frame::new(renderer, bounds.size());
         let w = bounds.width;
         let h = bounds.height;
-        let stroke = Stroke {
-            width: 2.0,
-            style: canvas::Style::Solid(theme::CREAM),
-            ..Stroke::default()
-        };
+        // Three filled bars, integer-aligned so tiny-skia doesn't blur them
+        // into the panel: 10 px wide (centered), 2 px tall, at 25% / 50% /
+        // 75% of the icon height.
+        let bar_w = 10.0;
+        let bar_h = 2.0;
+        let x = ((w - bar_w) / 2.0).round();
         for frac in [0.25, 0.5, 0.75] {
-            let y = h * frac;
-            frame.stroke(
-                &Path::line(Point::new(w * 0.15, y), Point::new(w * 0.85, y)),
-                stroke,
+            let y = (h * frac).round() - (bar_h / 2.0);
+            frame.fill(
+                &Path::rectangle(Point::new(x, y), Size::new(bar_w, bar_h)),
+                theme::CREAM,
             );
         }
         vec![frame.into_geometry()]
@@ -1096,7 +1142,8 @@ impl<Message> Program<Message> for MenuIcon {
 }
 
 /// MIC level ring: line track, amber/cream arc proportional to the smoothed
-/// capture level; tally when clipping.
+/// capture level. Overload keeps the amber max (design.md binds tally red to
+/// exactly two places: the ON AIR lamp and the VU clip zone).
 struct LevelRing {
     level: f32, // 0..=1
     hot: bool,
@@ -1120,23 +1167,19 @@ impl<Message> Program<Message> for LevelRing {
         let track = Path::circle(center, r);
         let thickness = 3.0;
 
+        // Track tone: LINE is nearly invisible on the panel card, so lift it
+        // 60% of the way toward DIM — present but still "cold".
         frame.stroke(
             &track,
             Stroke {
                 width: thickness,
-                style: canvas::Style::Solid(theme::LINE),
+                style: canvas::Style::Solid(lerp_color(theme::LINE, theme::DIM, 0.6)),
                 ..Stroke::default()
             },
         );
 
         if self.level > 0.0 && self.lit {
-            let arc_color = if self.level >= vu::db_to_level(-3.0) {
-                theme::TALLY
-            } else if self.hot {
-                theme::AMBER
-            } else {
-                theme::DIM
-            };
+            let arc_color = if self.hot { theme::AMBER } else { theme::DIM };
             // Arc starts at 12 o'clock and sweeps clockwise.
             let start = -std::f32::consts::FRAC_PI_2;
             let end = start + 2.0 * std::f32::consts::PI * self.level.min(1.0);
@@ -1181,16 +1224,18 @@ impl<Message> Program<Message> for CablePulse {
         _cursor: Cursor,
     ) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
+        // Filled rect, not a stroked line (see MenuIcon): stroked straight
+        // lines render nothing on tiny-skia. 2 px wide, centered, 8 px of
+        // vertical breathing room inside the cable's slot.
         let cx = frame.center().x;
-        let line = Path::line(Point::new(cx, 4.0), Point::new(cx, bounds.height - 4.0));
-        frame.stroke(
-            &line,
-            Stroke {
-                width: 2.0,
-                style: canvas::Style::Solid(self.color),
-                line_cap: canvas::LineCap::Round,
-                ..Stroke::default()
-            },
+        let bar_w = 2.0;
+        let bar_h = (bounds.height - 8.0).max(0.0);
+        frame.fill(
+            &Path::rectangle(
+                Point::new(cx - bar_w / 2.0, (bounds.height - bar_h) / 2.0),
+                Size::new(bar_w, bar_h),
+            ),
+            self.color,
         );
         vec![frame.into_geometry()]
     }
@@ -1297,14 +1342,16 @@ impl<Message> Program<Message> for AirDot {
     }
 }
 
-/// The VU ladder: 24 horizontal segments stacked bottom-up; bottom 18 cream,
+/// The VU ladder: 24 vertical LED segments read left-to-right; bottom 18 cream,
 /// next 3 amber, top 3 tally red (clip); unlit = line. `hold` is the
 /// peak-hold segment count: the single segment just above the lit ones is
 /// drawn cream as the "recent max" marker (decays at a third of the reading
-/// rate in `vu::VuBallistics`).
+/// rate in `vu::VuBallistics`) — but only while `hot`, so an idle console
+/// never shows stale hold bars.
 struct VuLadder {
     lit: usize,
     hold: usize,
+    hot: bool,
 }
 
 impl<Message> Program<Message> for VuLadder {
@@ -1319,18 +1366,19 @@ impl<Message> Program<Message> for VuLadder {
         _cursor: Cursor,
     ) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
-        // Segment geometry: 3 px bars, 2 px gaps, full width, square corners
-        // — a machined VU face, not a pill (design.md anti-goals).
-        let seg_h = 3.0;
-        let gap = 2.0;
-        let total_h = vu::SEGMENTS as f32 * (seg_h + gap) - gap;
-        let start_y = (bounds.height - total_h) / 2.0;
-        let bar_w = bounds.width;
+        // Horizontal LED row: `SEGMENTS` vertical bars read left-to-right,
+        // geometry derived entirely from the widget bounds so the drawing can
+        // never overflow its slot (the earlier stacked-stripes design bled
+        // past the container). Bars are separated by 3 px gaps.
+        let n = vu::SEGMENTS as f32;
+        let gap = 3.0;
+        let seg_w = ((bounds.width - gap * (n - 1.0)) / n).max(1.0);
+        let bar_h = bounds.height;
 
         for i in 0..vu::SEGMENTS {
-            let y = start_y + i as f32 * (seg_h + gap);
+            let x = i as f32 * (seg_w + gap);
             // Peak-hold marker: exactly one brighter segment at the recent
-            // max, floating above the falling bars (cream, the VU-face
+            // max, floating ahead of the falling bars (cream, the VU-face
             // color). The zone colors below it keep priority.
             let color = if i < self.lit {
                 if i >= vu::RED_START {
@@ -1340,12 +1388,12 @@ impl<Message> Program<Message> for VuLadder {
                 } else {
                     theme::CREAM
                 }
-            } else if i == self.hold.saturating_sub(1) && self.hold > self.lit {
+            } else if self.hot && i == self.hold.saturating_sub(1) && self.hold > self.lit {
                 theme::CREAM
             } else {
                 theme::LINE
             };
-            let rect = Path::rectangle(Point::new(0.0, y), Size::new(bar_w, seg_h));
+            let rect = Path::rectangle(Point::new(x, 0.0), Size::new(seg_w, bar_h));
             frame.fill(&rect, color);
         }
         vec![frame.into_geometry()]
@@ -1356,18 +1404,293 @@ impl<Message> Program<Message> for VuLadder {
 mod tests {
     use super::*;
 
-    /// Build an app with real engine + temp config path (no tray).
-    fn test_app(config: Config) -> App {
-        let flags = Flags {
+    /// Serializes access to the process environment: the dev-hook tests
+    /// mutate `OPENAY_DEBUG_*`, which `App::new` reads, and tests run in
+    /// parallel in one process. `test_app` holds the lock while (re)setting
+    /// a pristine env, and the hook tests hold it across set -> App::new
+    /// -> unset, so a hook can never be observed by a concurrent test.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Standard flags for headless tests (no tray, temp config path).
+    fn test_flags(config: Config) -> Flags {
+        Flags {
             engine: openay_server::spawn_engine(None),
             config,
             config_path: std::env::temp_dir().join("openay-mic-test-config.toml"),
             tray_bus: Arc::new(crate::tray::TrayBus::default()),
             tray: None,
-        };
-        let (app, _task) = App::new(flags);
+        }
+    }
+
+    /// Build an app with real engine + temp config path (no tray).
+    fn test_app(config: Config) -> App {
+        // Neutralize the dev-only env hooks: a parallel hook test may be
+        // mutating OPENAY_DEBUG_* between set/remove, and App::new reads it.
+        let _guard = lock_env();
+        unsafe {
+            std::env::remove_var("OPENAY_DEBUG_SETTINGS");
+            std::env::remove_var("OPENAY_DEBUG_AUTOSTART");
+        }
+        let (app, _task) = App::new(test_flags(config));
         app
     }
+
+    // -----------------------------------------------------------------------
+    // Headless canvas rasterization: run a canvas Program through the real
+    // iced -> tiny-skia geometry pipeline and assert on the pixels. This is
+    // how the VU-ladder segment-vanishing regression was found and pinned
+    // (iced_tiny_skia clipped translated canvas primitives against an
+    // untranslated local clip mask; see desktop/vendor/iced_tiny_skia).
+    // -----------------------------------------------------------------------
+
+    /// Rasterize the geometry produced by a canvas program at `size` into an
+    /// RGBA buffer, mirroring what the compositor does (primitives are
+    /// translated by the group transformation, here `bounds.position`).
+    fn rasterize_program(
+        program: &dyn Fn(&iced::Renderer, iced::Rectangle) -> Vec<iced_tiny_skia::Geometry>,
+        bounds: iced::Rectangle,
+    ) -> Vec<u8> {
+        use iced_tiny_skia::Primitive;
+
+        let renderer = iced::Renderer::new(theme::FONT_MONO, 16.0.into());
+        let size = bounds.size();
+        let mut pixmap = tiny_skia::Pixmap::new(size.width as u32, size.height as u32)
+            .expect("pixmap");
+        let tx = tiny_skia::Transform::from_translate(bounds.x, bounds.y);
+
+        for geometry in program(&renderer, bounds) {
+            let primitives: Vec<Primitive> = match geometry {
+                iced_tiny_skia::Geometry::Live { primitives, .. } => primitives,
+                iced_tiny_skia::Geometry::Cache(cache) => cache.primitives.to_vec(),
+            };
+            for primitive in primitives {
+                match primitive {
+                    Primitive::Fill { path, paint, rule } => {
+                        let path = path.transform(tx).expect("transformed path");
+                        pixmap.fill_path(
+                            &path,
+                            &paint,
+                            rule,
+                            tiny_skia::Transform::identity(),
+                            None,
+                        );
+                    }
+                    Primitive::Stroke { path, paint, stroke } => {
+                        let path = path.transform(tx).expect("transformed path");
+                        pixmap.stroke_path(
+                            &path,
+                            &paint,
+                            &stroke,
+                            tiny_skia::Transform::identity(),
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+        pixmap.data().to_vec()
+    }
+
+    /// Column coverage: for every column, whether any non-transparent pixel
+    /// exists. Gaps between bars are legitimate; empty bar columns are not.
+    fn columns_with_ink(buffer: &[u8], width: u32, height: u32) -> Vec<bool> {
+        (0..width)
+            .map(|x| {
+                (0..height).any(|y| buffer[(y * width + x) as usize * 4 + 3] > 0)
+            })
+            .collect()
+    }
+
+    /// Count pixels whose RGB matches a design token (±2 per channel for
+    /// rasterizer rounding); alpha > 0 required.
+    fn count_color(buffer: &[u8], color: iced::Color) -> usize {
+        // tiny-skia pixmaps are premultiplied BGRA on little-endian.
+        let want = [
+            (color.b * 255.0).round() as i16,
+            (color.g * 255.0).round() as i16,
+            (color.r * 255.0).round() as i16,
+        ];
+        buffer
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[3] > 0)
+            .filter(|p| {
+                p[..3]
+                    .iter()
+                    .zip(want)
+                    .all(|(got, want)| (i16::from(*got) - want).abs() <= 2)
+            })
+            .count()
+    }
+
+    /// STATE->PIXELS contract: a ladder built with `lit=19` (a healthy 0.4
+    /// full-scale signal) must paint 19 zone-colored bars — cream below,
+    /// amber and tally in the upper zones. Guards the dead-meter class of
+    /// bugs (state updates that never reach pixels).
+    #[test]
+    fn vu_ladder_lit_19_paints_zone_colors() {
+        let bounds = iced::Rectangle::new(
+            iced::Point::new(0.0, 0.0),
+            iced::Size::new(404.0, 56.0),
+        );
+        let buf = rasterize_program(
+            &|renderer, bounds| {
+                let program = VuLadder { lit: 19, hold: 0, hot: true };
+                <VuLadder as Program<Message>>::draw(
+                    &program,
+                    &(),
+                    renderer,
+                    &iced::Theme::default(),
+                    bounds,
+                    iced::mouse::Cursor::default(),
+                )
+            },
+            bounds,
+        );
+        // Segment area at this geometry: 19 lit bars × ~14 px × 56 px minus
+        // edge antialiasing; the unlit tail keeps its LINE bars.
+        assert!(
+            count_color(&buf, theme::CREAM) > 8_000,
+            "cream zone must render for lit=19"
+        );
+        // One amber bar at this geometry ≈ 730 px.
+        assert!(
+            (400..2_000).contains(&count_color(&buf, theme::AMBER)),
+            "exactly the amber zone must render for lit=19"
+        );
+        assert_eq!(
+            count_color(&buf, theme::TALLY),
+            0,
+            "lit=19 is below the clip zone"
+        );
+        assert!(
+            count_color(&buf, theme::LINE) < 6_000,
+            "most bars must be lit at level 0.4"
+        );
+    }
+
+    /// STATE->PIXELS contract for the MIC ring: a smoothed 0.4 level paints
+    /// an amber arc (hot) over the lifted track, and stays below the VU clip
+    /// zone (0.4 < -3 dB full scale). Guards the same dead-meter class
+    /// of bugs as the lit=19 ladder test, on the ring's arc geometry.
+    #[test]
+    fn level_ring_04_paints_amber_arc() {
+        let bounds = iced::Rectangle::new(
+            iced::Point::new(0.0, 0.0),
+            iced::Size::new(64.0, 64.0),
+        );
+        let buf = rasterize_program(
+            &|renderer, bounds| {
+                let program = LevelRing {
+                    level: 0.4,
+                    hot: true,
+                    lit: true,
+                };
+                <LevelRing as Program<Message>>::draw(
+                    &program,
+                    &(),
+                    renderer,
+                    &iced::Theme::default(),
+                    bounds,
+                    iced::mouse::Cursor::default(),
+                )
+            },
+            bounds,
+        );
+        // Arc swept at level 0.4: 40% of the 56 px-diameter ring at 3 px
+        // stroke width ≈ 210 px; angular antialiasing shaves the edges.
+        let amber = count_color(&buf, theme::AMBER);
+        assert!(
+            (120..=600).contains(&amber),
+            "one amber arc must render for level 0.4, got {amber} px"
+        );
+        assert_eq!(
+            count_color(&buf, theme::TALLY),
+            0,
+            "level 0.4 is below the -3 dB clip zone"
+        );
+        // The ring's full-circle track (LINE lifted 60% toward DIM) must
+        // still be present under/around the arc.
+        let track = lerp_color(theme::LINE, theme::DIM, 0.6);
+        let track_px = count_color(&buf, track);
+        assert!(
+            track_px > 200,
+            "ring track must render around the arc, got {track_px} px"
+        );
+    }
+
+    /// Every one of the 24 VU bar columns must contain ink at lit=19: gaps
+    /// between bars are legitimate (they are never painted), but an entirely
+    /// empty bar column means a segment vanished from the raster (the
+    /// translated-clip regression the suite header describes).
+    #[test]
+    fn vu_ladder_every_bar_column_has_ink() {
+        let bounds = iced::Rectangle::new(
+            iced::Point::new(0.0, 0.0),
+            iced::Size::new(404.0, 56.0),
+        );
+        let buf = rasterize_program(
+            &|renderer, bounds| {
+                let program = VuLadder { lit: 19, hold: 0, hot: true };
+                <VuLadder as Program<Message>>::draw(
+                    &program,
+                    &(),
+                    renderer,
+                    &iced::Theme::default(),
+                    bounds,
+                    iced::mouse::Cursor::default(),
+                )
+            },
+            bounds,
+        );
+        let cols = columns_with_ink(&buf, 404, 56);
+        // Bar geometry: seg_w = (404 - 23*3)/24 ≈ 13.96 with 3 px gaps, so
+        // a bar occupies [i*(seg_w+gap), +seg_w]; probe each bar's center.
+        let gap = 3.0;
+        let n = vu::SEGMENTS as f32;
+        let seg_w = ((404.0 - gap * (n - 1.0)) / n).max(1.0);
+        for i in 0..vu::SEGMENTS {
+            let center = (i as f32 * (seg_w + gap) + seg_w / 2.0) as usize;
+            assert!(
+                center < cols.len() && cols[center],
+                "bar {i} column {center} has no ink"
+            );
+        }
+    }
+
+    /// OPENAY_DEBUG_AUTOSTART=1 is parsed by the dev hook in main.rs (which
+    /// sends the same Start command as the ON AIR toggle); engine behaviour
+    /// under it is covered by the engine smoke tests.
+    #[test]
+    fn debug_autostart_hook_flag_parses() {
+        let name = "OPENAY_DEBUG_AUTOSTART";
+        let _guard = lock_env();
+        unsafe { std::env::set_var(name, "1") };
+        assert!(env_flag(name));
+        unsafe { std::env::remove_var(name) };
+        assert!(!env_flag(name));
+    }
+
+    /// OPENAY_DEBUG_SETTINGS=1 opens the settings pane on startup.
+    #[test]
+    fn debug_settings_hook_opens_the_pane() {
+        let name = "OPENAY_DEBUG_SETTINGS";
+        let _guard = lock_env();
+        unsafe { std::env::set_var(name, "1") };
+        let (app, _task) = App::new(test_flags(Config::default()));
+        assert!(app.settings_open, "settings pane must be open under the hook");
+        unsafe { std::env::remove_var(name) };
+    }
+
+    // -----------------------------------------------------------------------
+    // Headless widget-tree layout: lay the real view out through
+    // iced_core and inspect the geometry the compositor will use.
+    // -----------------------------------------------------------------------
 
     /// Lay the app's view out headlessly with a real tiny-skia renderer.
     fn layout(app: &App, width: f32, height: f32) -> iced_core::layout::Node {
@@ -1563,8 +1886,7 @@ mod tests {
 
     #[test]
     fn layout_settings_overlay_matches_design() {
-        let app = test_app(Config::default());
-        let mut app = app;
+        let mut app = test_app(Config::default());
         app.settings_open = true;
         let node = layout(&app, 460.0, 600.0);
         assert_finite_layout(&node);

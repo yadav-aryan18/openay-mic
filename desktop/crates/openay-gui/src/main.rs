@@ -58,6 +58,25 @@ fn main() -> iced::Result {
     // The engine: created once, reused across settings changes.
     let engine = openay_server::spawn_engine(None);
 
+    // DEV-ONLY HOOK (documented; never used by the shipped product):
+    //
+    //   OPENAY_DEBUG_AUTOSTART=1
+    //
+    // sends the same `EngineCommand::Start` the ON AIR toggle sends, right
+    // after app init. The engine is cold until the lamp is pressed
+    // (`spawn_engine` never auto-starts), so the UI test harness sets this
+    // variable to exercise the hot/streaming rendering path (amber cables,
+    // lit VU, moving ring, ON AIR styling) without input automation. The
+    // config used is exactly the one `App::new` would send via
+    // `App::toggle_air`, so the behaviour is identical to a real press.
+    if app::env_flag("OPENAY_DEBUG_AUTOSTART") {
+        let sender = engine.cmd();
+        let cfg = config.to_engine();
+        if let Err(e) = sender.blocking_send(openay_server::EngineCommand::Start(cfg)) {
+            eprintln!("openay-gui: OPENAY_DEBUG_AUTOSTART start failed: {e}");
+        }
+    }
+
     // System tray (best-effort; the app works without one). If registration
     // fails or the desktop has no StatusNotifierWatcher, warn once and
     // continue — the app stays fully usable as a plain window, and the
