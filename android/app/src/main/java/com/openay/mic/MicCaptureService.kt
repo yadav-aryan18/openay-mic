@@ -38,6 +38,9 @@ class MicCaptureService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var statsJob: Job? = null
+    // Previous session's xrun count; a refresh seeing a higher value logs a
+    // warning (increase tracking only — the notification text is untouched).
+    private var lastXruns = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -112,6 +115,10 @@ class MicCaptureService : Service() {
             return START_NOT_STICKY
         }
 
+        // Fresh xrun baseline for the new session: the stats refresh only
+        // warns about increases that happen while this session runs.
+        lastXruns = 0
+
         statsJob = serviceScope.launch {
             while (isActive) {
                 delay(STATS_INTERVAL_MS)
@@ -129,6 +136,13 @@ class MicCaptureService : Service() {
             val sent = json.optInt("sent", 0)
             val overruns = json.optInt("ring_overruns", 0)
             val xruns = json.optInt("xruns", 0)
+            if (xruns > lastXruns) {
+                Log.w(
+                    TAG,
+                    "xruns increased: $lastXruns -> $xruns (+${xruns - lastXruns}) sent=$sent"
+                )
+            }
+            lastXruns = xruns
             val lastError = json.optString("last_error")
             val text = buildString {
                 append("sent=$sent · overruns=$overruns · xruns=$xruns")
@@ -177,6 +191,7 @@ class MicCaptureService : Service() {
     private fun stopCaptureAndSelf() {
         statsJob?.cancel()
         statsJob = null
+        lastXruns = 0
         if (nativeRunning()) nativeStop()
         stopSelf()
     }
@@ -214,6 +229,7 @@ class MicCaptureService : Service() {
         // stop the native session, and only then notify the framework.
         statsJob?.cancel()
         statsJob = null
+        lastXruns = 0
         serviceScope.cancel()
         if (nativeRunning()) nativeStop()
         super.onDestroy()

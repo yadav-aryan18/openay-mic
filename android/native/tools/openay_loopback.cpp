@@ -47,8 +47,11 @@ void Usage(FILE* f) {
             "  recv-tcp <port> <count> [payload_size=480]\n"
             "  bench <udp|tcp> <port> <count> [payload_size=480]\n"
             "  tone-udp <host> <port> <seconds> [freq=440] [codec=pcm]\n"
+            "    [--onset-after <N>]  N leading 480-sample silence frames, then\n"
+            "    the sine (N=0 or absent: sine from frame 0)\n"
             "    streams REAL sine audio (TestSource -> CapturePipeline, 10 ms\n"
-            "    frames) as OpenAY packets; prints TONE stats and exits 0 iff\n"
+            "    frames) as OpenAY packets; prints TONE stats (incl. onset_packet\n"
+            "    = 0-based index of the first non-silent packet) and exits 0 iff\n"
             "    the stream stayed healthy (no overruns, no send/encode errors).\n");
 }
 
@@ -431,10 +434,12 @@ bool ParseDouble(const char* s, double* out) {
 }
 
 int ToneUdp(const std::string& host, uint16_t port, double seconds,
-            double freq, const std::string& codec) {
+            double freq, const std::string& codec, size_t onset_frames) {
     const openay::CodecType ct =
         codec == "opus" ? openay::CodecType::Opus : openay::CodecType::Pcm;
-    openay::TestSource source(freq);  // 440 Hz default, 480-sample frames
+    // 440 Hz default, 0.4 * 32767 amplitude, 480-sample frames; onset_frames
+    // leading silence frames gate the sine (0 keeps today's behavior).
+    openay::TestSource source(freq, 0.4 * 32767.0, 480, onset_frames);
     openay::CapturePipeline pipe;
     if (!pipe.Configure(&source, openay::TransportType::Udp, host, port, ct,
                         10)) {
@@ -454,10 +459,18 @@ int ToneUdp(const std::string& host, uint16_t port, double seconds,
     const uint64_t packets = pipe.packets_sent();
     const uint64_t overruns = pipe.ring_overruns();
     const uint64_t send_errors = pipe.send_errors();
-    printf("TONE seconds=%.1f packets=%llu overruns=%llu send_errors=%llu\n",
+    // onset_packet derives from actual accounting, not the configured N: the
+    // pipeline packetizes exactly one 480-sample frame per packet with seq
+    // from 0, so the 0-based index of the first non-silent packet equals the
+    // number of silence frames the source actually handed over (counted by
+    // TestSource; read after Stop() joined the generator thread).
+    const uint64_t onset_packet = source.silence_frames_delivered();
+    printf("TONE seconds=%.1f packets=%llu overruns=%llu send_errors=%llu "
+           "onset_packet=%llu onset_frames=%zu\n",
            seconds, static_cast<unsigned long long>(packets),
            static_cast<unsigned long long>(overruns),
-           static_cast<unsigned long long>(send_errors));
+           static_cast<unsigned long long>(send_errors),
+           static_cast<unsigned long long>(onset_packet), onset_frames);
     const bool healthy = pipe.Healthy() && overruns == 0 && send_errors == 0 &&
                          pipe.encode_errors() == 0;
     return healthy ? 0 : 1;
@@ -548,24 +561,41 @@ int main(int argc, char** argv) {
         return Bench(argv[2], port, count, payload);
     }
     if (cmd == "tone-udp") {
-        if (argc < 5 || argc > 7) {
-            Usage(stderr);
-            return 2;
+        // Positionals: <host> <port> <seconds> [freq=440] [codec=pcm], plus
+        // an optional --onset-after <N> flag accepted anywhere after the
+        // subcommand (N leading 480-sample silence frames).
+        std::vector<std::string> pos;
+        uint64_t onset_after = 0;
+        bool have_onset = false;
+        bool bad = false;
+        for (int i = 2; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--onset-after") == 0) {
+                if (have_onset || i + 1 >= argc ||
+                    !ParseCount(argv[++i], &onset_after)) {
+                    bad = true;
+                    break;
+                }
+                have_onset = true;
+            } else {
+                pos.push_back(argv[i]);
+            }
         }
         uint16_t port = 0;
         double seconds = 0.0, freq = 440.0;
-        if (!ParseU16(argv[3], &port) || !ParseDouble(argv[4], &seconds) ||
-            (argc >= 6 && !ParseDouble(argv[5], &freq))) {
+        const std::string codec = pos.size() >= 5 ? pos[4] : "pcm";
+        if (bad || pos.size() < 3 || pos.size() > 5 ||
+            !ParseU16(pos[1].c_str(), &port) ||
+            !ParseDouble(pos[2].c_str(), &seconds) ||
+            (pos.size() >= 4 && !ParseDouble(pos[3].c_str(), &freq))) {
             Usage(stderr);
             return 2;
         }
-        const std::string codec = argc >= 7 ? argv[6] : "pcm";
         if (codec != "pcm" && codec != "opus") {
             fprintf(stderr, "openay: tone-udp: unknown codec '%s' (use pcm|opus)\n",
                     codec.c_str());
             return 2;
         }
-        return ToneUdp(argv[2], port, seconds, freq, codec);
+        return ToneUdp(pos[0], port, seconds, freq, codec, onset_after);
     }
 
     fprintf(stderr, "openay_loopback: unknown command '%s'\n", cmd.c_str());
