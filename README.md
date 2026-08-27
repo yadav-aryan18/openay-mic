@@ -13,7 +13,7 @@ solutions like WO Mic on latency, security, and UX.
 | `android/`        | Android client — Kotlin/Compose UI, C++ NDK capture engine (Oboe), transports |
 | `android/native/` | Portable C++ core (protocol + transports); host-buildable for fast testing  |
 | `desktop/`        | Rust server — protocol/transport crates, PipeWire virtual-mic node, native GUI |
-| `scripts/`        | Environment setup (`env.sh`) and test orchestration                         |
+| `scripts/`        | Environment template (`env.sh.example`) and test orchestration               |
 
 ## Transports & codecs
 
@@ -27,8 +27,12 @@ solutions like WO Mic on latency, security, and UX.
 
 All tooling is user-space; no root required.
 
+Create your local environment once from the committed template — the
+machine-specific copy is gitignored and never committed:
+
 ```bash
-source scripts/env.sh        # Rust, cmake, pkg-config(libopus), JDK, ANDROID_HOME
+cp scripts/env.sh.example scripts/env.sh    # adjust the marked ADJUST values
+source scripts/env.sh                       # Rust, cmake, pkg-config(libopus), JDK, ANDROID_HOME
 
 # Desktop (Rust)
 cargo test --workspace                       # unit + golden-vector + codec tests
@@ -57,6 +61,45 @@ scripts/latency_probe.sh     # software ingest->present latency (p50/p95)
 scripts/cpu_profile.sh       # idle / PCM / Opus %CPU + RSS, --assert budgets
 scripts/gen_click_track.py   # acoustic click track for the hardware audit
 ```
+
+## Reproducing the environment
+
+`scripts/env.sh.example` documents every toolchain input; the header of the
+file you copy is the authoritative checklist. In brief:
+
+1. **Rust** — install via [rustup](https://rustup.rs).
+2. **C/C++ toolchain** — a conda env (or your distro's packages) providing
+   `cmake`, `pkg-config`, `libopus` + headers, `openjdk`, `meson`, `ninja`,
+   and `glib`. The example file shows the one-line `conda create` command.
+3. **Android SDK** — point `ANDROID_HOME` at it; the project's Gradle wrapper
+   and NDK usage are pinned in `android/`.
+4. **User-space PipeWire** — build from source into `$PW_PREFIX` at the same
+   version your system daemon runs (`pw-cli --version`); the meson commands
+   are in the example file. `pipewire-rs` compiles against these headers, and
+   `LD_LIBRARY_PATH` makes our binaries load this matching `libpipewire`
+   while talking to the system daemon over the standard socket.
+5. **bindgen inputs** — `LIBCLANG_PATH` (any libclang) and
+   `BINDGEN_EXTRA_CLANG_ARGS` (GCC headers), with defaults that may need
+   adjusting per host; both are marked ADJUST in the example file.
+
+If `scripts/env.sh` is missing, the runner scripts
+(`run_phase2.sh`, `run_phase6.sh`, `latency_probe.sh`, `cpu_profile.sh`) exit
+with instructions instead of failing later in a build.
+
+## Licenses
+
+- **Project code** — [MIT](LICENSE) (Copyright © 2026 Aryan Yadav).
+- **Fonts** — Chakra Petch and IBM Plex Mono are distributed under the
+  SIL Open Font License 1.1; the license texts ship alongside the fonts in
+  [`shared/fonts/`](shared/fonts/) (`ChakraPetch-OFL.txt`,
+  `IBMPlexMono-OFL.txt`) and apply to the copies bundled in the Android app
+  (`android/app/src/main/res/font/`).
+- **Vendored `iced_tiny_skia`** — a patched fork of the MIT-licensed
+  upstream (`desktop/vendor/iced_tiny_skia/`); its
+  [MIT license](desktop/vendor/iced_tiny_skia/LICENSE) and patch notes are
+  kept in that directory.
+- Third-party dependencies (crates.io crates, Oboe, Opus, PipeWire) are
+  pulled from upstream at build time and remain under their own licenses.
 
 ## Status
 
