@@ -4,13 +4,12 @@ This file is the single source of truth for the packet format shared by the
 Android client (C++/Kotlin) and the desktop server (Rust). Any change here
 must be reflected in both implementations and in `test-vectors.json`.
 
-## Deviation from PLAN.md
+## Design rationale: 6-byte header
 
-PLAN.md specifies a 4-byte header with 1-byte fields. A 1-byte payload-length
+An earlier 4-byte header draft used 1-byte fields. A 1-byte payload-length
 field caps packets at 255 bytes, which cannot carry a 10 ms raw PCM frame at
-48 kHz mono 16-bit (960 bytes) — one of the plan's own requirements. The
-header is therefore **6 bytes** with 16-bit sequence and length fields.
-Everything else follows the plan.
+48 kHz mono 16-bit (960 bytes) — a hard requirement of the capture pipeline.
+The header is therefore **6 bytes** with 16-bit sequence and length fields.
 
 ## Packet layout
 
