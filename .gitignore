@@ -10,6 +10,9 @@ build-*/
 # Rust
 Cargo.lock.orig
 
+# Local environment (created from scripts/env.sh.example; machine-specific)
+/scripts/env.sh
+
 # Android / Gradle
 android/.gradle/
 android/build/

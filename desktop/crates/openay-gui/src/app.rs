@@ -2421,8 +2421,16 @@ mod tests {
 
     #[test]
     fn render_ui_snapshots() {
-        let artifact_dir = "./artifacts";
-        
+        // Snapshots land in a temp dir by default so the test runs on any
+        // machine without touching the source tree; set OPENAY_SNAPSHOT_DIR
+        // to inspect or diff the PNGs.
+        let dir = match std::env::var_os("OPENAY_SNAPSHOT_DIR") {
+            Some(path) => std::path::PathBuf::from(path),
+            None => std::env::temp_dir().join("openay-gui-snapshots"),
+        };
+        std::fs::create_dir_all(&dir).expect("create snapshot dir");
+        let artifact_dir = dir.display().to_string();
+
         // 1. Cold state at 1x and 1.5x (HiDPI)
         let app = test_app(Config::default());
         render_element_to_png(&app, 460, 600, 1.0, &format!("{artifact_dir}/render_cold.png"));

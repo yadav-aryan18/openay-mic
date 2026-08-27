@@ -36,6 +36,11 @@ set -u
 export LC_ALL=C
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+if [ ! -f "$ROOT/scripts/env.sh" ]; then
+  echo "error: scripts/env.sh not found — copy scripts/env.sh.example to" >&2
+  echo "       scripts/env.sh and adjust the marked values (see README)." >&2
+  exit 1
+fi
 source "$ROOT/scripts/env.sh"
 
 RUNS=12

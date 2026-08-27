@@ -1,12 +1,8 @@
-# Build-time pkg-config (via scripts/env.sh) resolves libopus to the conda
-# env at ~/miniconda3/envs/openay (libopus 1.6.1). At runtime the loader
-# would otherwise fall back to the system libopus (1.4), which is measurably
-# worse and fails the codec quality test. Embed a RUNPATH to the conda lib
-# dir so every workspace binary/test finds the same libopus it was built
-# against. `--enable-new-dtags` keeps system-first resolution for all other
-# libraries (LD_LIBRARY_PATH still wins if set).
-[target.x86_64-unknown-linux-gnu]
-rustflags = [
-    "-C", "link-arg=-Wl,-rpath,/opt/openay-conda-env/lib",
-    "-C", "link-arg=-Wl,--enable-new-dtags",
-]
+# Runtime library resolution is intentionally NOT configured here: cargo
+# config files cannot expand environment variables, and hard-coding an
+# absolute rpath (as this file once did) breaks every other machine.
+# Instead, scripts/env.sh (created from scripts/env.sh.example) exports
+# LD_LIBRARY_PATH pointing at the toolchain env's lib dir (libopus the
+# binaries were built against) and the user-space PipeWire build
+# (libpipewire). Source that script before running any workspace binary,
+# test, or benchmark.
