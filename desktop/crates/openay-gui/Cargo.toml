@@ -12,8 +12,11 @@ path = "src/main.rs"
 [dependencies]
 # The GUI always ships the PipeWire virtual microphone: a network-only
 # console would render meters against a silent engine (this exact mismatch
-# bit us — see the VU/ring dead-meter fix).
-openay-server = { path = "../openay-server", features = ["pipewire"] }
+# bit us — see the VU/ring dead-meter fix). It also always ships the
+# Bluetooth SPP receive path (BT chip in the settings transport control):
+# without the feature the engine would only answer a BT selection with a
+# "built without Bluetooth support" error.
+openay-server = { path = "../openay-server", features = ["pipewire", "bluetooth"] }
 # Software renderer only (tiny-skia, NOT wgpu); tokio integration for the
 # async engine commands; canvas for the custom-drawn instruments.
 iced = { version = "0.13", default-features = false, features = ["tiny-skia", "tokio", "canvas"] }

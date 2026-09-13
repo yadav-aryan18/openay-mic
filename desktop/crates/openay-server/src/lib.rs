@@ -1,13 +1,16 @@
 //! OpenAY Mic desktop receiver engine (library form).
 //!
 //! The `openay-server` CLI and the `openay-gui` console both drive the same
-//! engine: a network receive pipeline (UDP/TCP) that decodes OpenAY audio
-//! packets into `f32` samples, feeds a lock-free jitter buffer, and — with
-//! the `pipewire` feature — exposes the audio as a PipeWire virtual
-//! microphone source node (`openay_mic`).
+//! engine: a network receive pipeline (UDP/TCP/Bluetooth SPP) that decodes
+//! OpenAY audio packets into `f32` samples, feeds a lock-free jitter buffer,
+//! and — with the `pipewire` feature — exposes the audio as a PipeWire
+//! virtual microphone source node (`openay_mic`).
 //!
 //! The receive/jitter pipeline works without PipeWire; the virtual source is
-//! compiled in with `--features pipewire`.
+//! compiled in with `--features pipewire`. Bluetooth SPP receive is opt-in
+//! with `--features bluetooth` (`Transport::Bluetooth`); without it the
+//! engine starts and immediately reports a clean "built without Bluetooth
+//! support" error for that transport.
 //!
 //! # Architecture
 //!
@@ -41,8 +44,12 @@ mod ingest;
 #[cfg(feature = "pipewire")]
 mod pw;
 
+use std::collections::VecDeque;
 use std::fmt;
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -50,7 +57,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use openay_jitter::{DepthController, DepthParams, JitterBuffer, RealClock};
 use openay_protocol::PayloadType;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 use crate::ingest::Ingest;
 
@@ -76,11 +85,18 @@ const PEAK_SCALE: u32 = 65_535;
 pub use openay_jitter::{MAX_PREBUFFER_MS, MIN_PREBUFFER_MS};
 
 /// Transport protocol the engine listens on.
+///
+/// `Bluetooth` is the Serial Port Profile receive path: the engine registers
+/// the "OpenAY Mic SPP" service with BlueZ and serves accepted RFCOMM
+/// connections with the same byte-stream framing as TCP. Compiled only with
+/// the `bluetooth` feature; without it a `Start` on this transport fails
+/// cleanly ("built without Bluetooth support").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Transport {
     #[default]
     Udp,
     Tcp,
+    Bluetooth,
 }
 
 impl Transport {
@@ -89,6 +105,128 @@ impl Transport {
         match self {
             Transport::Udp => "udp",
             Transport::Tcp => "tcp",
+            Transport::Bluetooth => "bt",
+        }
+    }
+}
+
+/// Type-erased bidirectional byte stream handed to the stream-transport
+/// serving loop ([`serve_packet_stream`]). TCP sockets, RFCOMM streams, and
+/// test-injected in-process streams all erase to this (read/write halves
+/// boxed separately — `dyn AsyncRead + AsyncWrite` trait objects are not
+/// expressible), so one accept loop and one connection-serving core serve
+/// every stream transport. Implements `AsyncRead + AsyncWrite + Unpin` and
+/// is `Send`, so it slots straight into `TcpPacketStream`.
+///
+/// Dropping the value drops both halves and closes the connection.
+#[doc(hidden)]
+pub struct BoxedByteStream {
+    read: Box<dyn AsyncRead + Unpin + Send>,
+    write: Box<dyn AsyncWrite + Unpin + Send>,
+}
+
+impl BoxedByteStream {
+    /// Erase a concrete bidirectional byte stream.
+    pub fn new<S>(stream: S) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let (read, write) = tokio::io::split(stream);
+        BoxedByteStream {
+            read: Box::new(read),
+            write: Box::new(write),
+        }
+    }
+}
+
+impl AsyncRead for BoxedByteStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut *self.as_mut().read).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for BoxedByteStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, io::Error>> {
+        Pin::new(&mut *self.as_mut().write).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), io::Error>> {
+        Pin::new(&mut *self.as_mut().write).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), io::Error>> {
+        Pin::new(&mut *self.as_mut().write).poll_shutdown(cx)
+    }
+}
+
+/// Shared slot holding the display name (Bluetooth MAC address) of the
+/// device currently connected over the BT transport. `None` = waiting for a
+/// paired device to connect (or transport not running).
+pub type BtDeviceSlot = Arc<Mutex<Option<String>>>;
+
+/// Test hook: an in-process stand-in for the BlueZ SPP server.
+///
+/// The engine's Bluetooth loop pops pre-connected byte streams from this
+/// queue and serves each with the **exact** production connection loop
+/// (framing, resync, sequence handling) it uses for accepted RFCOMM
+/// connections — so a test can drive the real engine over a duplex stream
+/// without any Bluetooth hardware. Pass one to
+/// [`spawn_engine_with_bt_source`]; `push`ed connections are `accept`ed in
+/// FIFO order (sequential pushes model sequential phone reconnects).
+///
+/// Test-support API, deliberately `#[doc(hidden)]`: never used in
+/// production (the production source is `openay_transport::RfcommServer`).
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct InjectedBtSource {
+    inner: Arc<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
+    queue: Mutex<VecDeque<(BoxedByteStream, String)>>,
+    notify: Notify,
+}
+
+impl InjectedBtSource {
+    /// Queue a pre-connected byte stream for the engine's BT loop to accept.
+    /// `peer` labels the connection in logs and the status line.
+    pub fn push(&self, stream: BoxedByteStream, peer: &str) {
+        self.inner
+            .queue
+            .lock()
+            .expect("injected bt queue poisoned")
+            .push_back((stream, peer.to_string()));
+        self.inner.notify.notify_one();
+    }
+
+    /// Pop the next queued connection, pending until one arrives.
+    async fn accept_next(&self) -> (BoxedByteStream, String) {
+        loop {
+            let popped = self
+                .inner
+                .queue
+                .lock()
+                .expect("injected bt queue poisoned")
+                .pop_front();
+            if let Some(conn) = popped {
+                return conn;
+            }
+            self.inner.notify.notified().await;
         }
     }
 }
@@ -127,6 +265,13 @@ impl CodecMode {
 
 /// Configuration for the receive pipeline. See [`EngineConfig::validated`]
 /// for the normalization rules (port range, target clamp).
+///
+/// `bind` and `port` are socket parameters for the UDP/TCP transports only.
+/// When `transport` is [`Transport::Bluetooth`] the BT loop ignores both —
+/// the SPP profile registers on the default BlueZ adapter and listens on an
+/// SDP-published RFCOMM channel — but the values are still stored and shown
+/// (GUI standby display, status line), so they must remain valid
+/// (`validated()` does not special-case Bluetooth).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EngineConfig {
     pub transport: Transport,
@@ -362,6 +507,25 @@ impl EngineHandle {
             .clone()
     }
 
+    /// Display name (Bluetooth MAC address) of the device currently
+    /// connected over the [`Transport::Bluetooth`] transport, `None` while
+    /// waiting for a paired device to connect (or while stopped — the slot
+    /// belongs to the current run, like the counters).
+    ///
+    /// Deliberately outside [`EngineStatus`]: the status snapshot stays
+    /// `Copy` for cheap polling, and the device label is auxiliary display
+    /// state (the GUI status line reads `BT · <device>` from this).
+    pub fn bt_device(&self) -> Option<String> {
+        let slot = self
+            .state
+            .bt_device
+            .lock()
+            .expect("engine bt_device mutex poisoned")
+            .clone()?;
+        let current = slot.lock().expect("bt device slot mutex poisoned").clone();
+        current
+    }
+
     /// The canonical `SRV transport=...` stats line of the last *stopped*
     /// run (printed once by the CLI). `take`-ing it consumes it; it is also
     /// cleared at the beginning of every `Start`, so a failed start never
@@ -428,6 +592,16 @@ struct EngineState {
     /// Timing knobs for the per-pipeline depth controller (set by
     /// [`spawn_engine_tuned`], default [`DepthParams`] otherwise).
     depth_params: DepthParams,
+    /// Test hook: injected Bluetooth connection source (set by
+    /// [`spawn_engine_with_bt_source`]). `None` = the production BlueZ SPP
+    /// server. Mirrors [`EngineState::depth_params`]: engine-lifetime state
+    /// consumed by `start_pipeline`, not per-run.
+    bt_inject: Option<InjectedBtSource>,
+    /// The current run's connected-BT-device slot (see [`BtDeviceSlot`]).
+    /// `None` while stopped. Set by `start_pipeline`, cleared by
+    /// `stop_pipeline`; the BT loop writes the connected device address
+    /// into it for the status display.
+    bt_device: Mutex<Option<BtDeviceSlot>>,
 }
 
 impl Default for EngineState {
@@ -443,6 +617,8 @@ impl Default for EngineState {
             peak: Arc::new(AtomicU32::new(0)),
             effective_target: Arc::new(AtomicU32::new(0)),
             depth_params: DepthParams::default(),
+            bt_inject: None,
+            bt_device: Mutex::new(None),
         }
     }
 }
@@ -508,9 +684,29 @@ pub fn spawn_engine_tuned(
     initial: Option<EngineConfig>,
     depth_params: DepthParams,
 ) -> EngineHandle {
+    spawn_engine_with_bt_source(initial, depth_params, None)
+}
+
+/// Test-hook variant of [`spawn_engine_tuned`]: additionally takes an
+/// optional [`InjectedBtSource`], which replaces the BlueZ SPP server as the
+/// engine's Bluetooth connection source. The BT loop then serves each
+/// `push`ed stream with the exact production connection loop — this is how
+/// `tests/bluetooth_link.rs` drives a real engine over in-process duplex
+/// streams without Bluetooth hardware.
+///
+/// With `bt_source == None` (production, and every other entry point) the
+/// engine registers the SPP profile with BlueZ when started on
+/// [`Transport::Bluetooth`].
+#[doc(hidden)]
+pub fn spawn_engine_with_bt_source(
+    initial: Option<EngineConfig>,
+    depth_params: DepthParams,
+    bt_source: Option<InjectedBtSource>,
+) -> EngineHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
     let state = Arc::new(EngineState {
         depth_params,
+        bt_inject: bt_source,
         ..EngineState::default()
     });
     // The config is only "defaults for the first Start": publish it for the
@@ -636,6 +832,9 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
     let jitter = Arc::new(JitterBuffer::new(capacity_samples));
     let quit = Arc::new(AtomicBool::new(false));
     let ingest = Arc::new(Mutex::new(Ingest::new(jitter.clone(), config.codec.only())));
+    // Display slot for the connected Bluetooth device (cleared per run, like
+    // the counters); only the BT loop writes to it.
+    let bt_device: BtDeviceSlot = Arc::new(Mutex::new(None));
 
     // Seed the adaptive depth with the configured target and share it with
     // the RT latch (pipewire), the depth controller task, and `status()`.
@@ -676,6 +875,8 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
         jitter.clone(),
         state.effective_target.clone(),
         quit.clone(),
+        bt_device.clone(),
+        state.bt_inject.clone(),
     ));
     let retarget = spawn_depth_controller(
         jitter.clone(),
@@ -688,6 +889,10 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
     *state.config.lock().expect("engine config mutex poisoned") = Some(config);
     *state.jitter.lock().expect("engine jitter mutex poisoned") = Some(jitter.clone());
     *state.ingest.lock().expect("engine ingest mutex poisoned") = Some(ingest.clone());
+    *state
+        .bt_device
+        .lock()
+        .expect("engine bt_device mutex poisoned") = Some(bt_device);
     *state
         .started_at
         .lock()
@@ -842,6 +1047,10 @@ async fn stop_pipeline(p: Pipeline, state: &Arc<EngineState>) {
     *state.jitter.lock().expect("engine jitter mutex poisoned") = None;
     *state.ingest.lock().expect("engine ingest mutex poisoned") = None;
     *state
+        .bt_device
+        .lock()
+        .expect("engine bt_device mutex poisoned") = None;
+    *state
         .started_at
         .lock()
         .expect("engine uptime mutex poisoned") = None;
@@ -850,17 +1059,310 @@ async fn stop_pipeline(p: Pipeline, state: &Arc<EngineState>) {
 
 /// Run the receive pipeline until `quit` is set, then return the final
 /// stats line.
+///
+/// The Bluetooth transport needs the `bluetooth` feature; without it a
+/// Start on that transport returns an error immediately, which the engine
+/// reaper turns into `last_error` + `running == false` (the same path a UDP
+/// bind failure takes — the pipeline technically starts and dies at once).
 async fn run_network(
     config: EngineConfig,
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
     effective_target: Arc<AtomicU32>,
     quit: Arc<AtomicBool>,
+    bt_device: BtDeviceSlot,
+    bt_inject: Option<InjectedBtSource>,
 ) -> Result<String> {
     match config.transport {
         Transport::Udp => udp_loop(&config, ingest, jitter, effective_target, quit).await,
         Transport::Tcp => tcp_loop(&config, ingest, jitter, effective_target, quit).await,
+        #[cfg(feature = "bluetooth")]
+        Transport::Bluetooth => {
+            bt_loop(
+                &config,
+                ingest,
+                jitter,
+                effective_target,
+                quit,
+                bt_device,
+                bt_inject,
+            )
+            .await
+        }
+        #[cfg(not(feature = "bluetooth"))]
+        Transport::Bluetooth => {
+            let _ = (bt_device, bt_inject);
+            Err(anyhow::anyhow!(
+                "built without Bluetooth support (rebuild openay-server with the `bluetooth` feature)"
+            ))
+        }
     }
+}
+
+/// The future returned by [`ConnSource::accept`]: the next connection
+/// (stream + peer label), or `None` when the source is exhausted.
+type AcceptFuture<'a> =
+    Pin<Box<dyn Future<Output = io::Result<Option<(BoxedByteStream, String)>>> + Send + 'a>>;
+
+/// A source of incoming byte-stream connections for the stream transports
+/// (TCP, Bluetooth SPP). Erases the listener/socket specifics so one accept
+/// loop serves every stream transport, and so tests can inject in-process
+/// streams (see [`InjectedBtSource`]).
+///
+/// The returned future is **cancel-safe**: dropping it before it resolves
+/// never loses an already-accepted connection, and no partial accept state
+/// is kept across calls (a fresh future is built for each poll round of the
+/// accept loop).
+trait ConnSource: Send {
+    /// Wait for the next incoming connection. `Ok(None)` means the source
+    /// has no more connections and the loop should end (test injectors);
+    /// `Err` is fatal, like an accept error on a listener.
+    fn accept(&mut self) -> AcceptFuture<'_>;
+}
+
+/// [`ConnSource`] over a TCP listener (the `tcp` transport).
+struct TcpSource {
+    listener: tokio::net::TcpListener,
+}
+
+impl ConnSource for TcpSource {
+    fn accept(&mut self) -> AcceptFuture<'_> {
+        Box::pin(async {
+            let (stream, peer) = self.listener.accept().await?;
+            Ok(Some((BoxedByteStream::new(stream), peer.to_string())))
+        })
+    }
+}
+
+/// [`ConnSource`] over the BlueZ RFCOMM SPP server (the `bt` transport,
+/// feature `bluetooth`).
+#[cfg(feature = "bluetooth")]
+struct RfcommSource {
+    server: openay_transport::RfcommServer,
+}
+
+#[cfg(feature = "bluetooth")]
+impl ConnSource for RfcommSource {
+    fn accept(&mut self) -> AcceptFuture<'_> {
+        Box::pin(async {
+            let (stream, device) = self
+                .server
+                .accept_with_device()
+                .await
+                .map_err(|e| io::Error::other(format!("Bluetooth SPP accept failed: {e}")))?;
+            Ok(Some((BoxedByteStream::new(stream), device.to_string())))
+        })
+    }
+}
+
+/// [`ConnSource`] fed by an [`InjectedBtSource`] (test hook): pops the
+/// queue, pending until the next connection is pushed.
+impl ConnSource for InjectedBtSource {
+    fn accept(&mut self) -> AcceptFuture<'_> {
+        Box::pin(async { Ok(Some(self.accept_next().await)) })
+    }
+}
+
+/// Serve one accepted byte-stream connection: apply OpenAY packet framing
+/// and feed every packet into the shared ingest path. This is the *whole*
+/// per-connection policy for TCP and Bluetooth — identical handling of
+/// framing, bad-magic resync, malformed payloads, and sequence tracking
+/// (all inside `Ingest`); a peer error only ends the connection, never the
+/// pipeline. Exits when the peer closes or `quit` is set.
+async fn serve_packet_stream(
+    stream: BoxedByteStream,
+    peer: String,
+    ingest: Arc<Mutex<Ingest>>,
+    quit: Arc<AtomicBool>,
+) {
+    let mut framed = openay_transport::tcp::TcpPacketStream::new(stream);
+    loop {
+        if quit.load(Ordering::Relaxed) {
+            break;
+        }
+        match framed.next_packet().await {
+            Ok(pkt) => {
+                let mut g = ingest.lock().expect("ingest mutex poisoned");
+                if g.ingest_packet(pkt.kind, pkt.seq, &pkt.payload).is_err() {
+                    // Counted inside ingest_packet.
+                }
+            }
+            Err(e) => {
+                eprintln!("openay-server: connection {peer} closed: {e}");
+                break;
+            }
+        }
+    }
+}
+
+/// The shared accept loop for stream transports (TCP, Bluetooth): wait for
+/// connections, hand each to [`serve_packet_stream`] on its own task (one
+/// stalled client cannot block ingestion from others), poll `quit`, print
+/// rate-limited underrun lines and periodic stats, and finish with the
+/// canonical stats line for `transport`.
+///
+/// `device_slot` (Bluetooth only) records the currently connected device
+/// label for the status display: set to the peer label on accept, cleared
+/// when that connection's serving task ends.
+async fn stream_accept_loop(
+    transport: Transport,
+    source: &mut dyn ConnSource,
+    ingest: Arc<Mutex<Ingest>>,
+    jitter: Arc<JitterBuffer>,
+    effective_target: Arc<AtomicU32>,
+    quit: Arc<AtomicBool>,
+    device_slot: Option<BtDeviceSlot>,
+) -> Result<String> {
+    let mut last_stats = Instant::now();
+    let mut last_underruns = jitter.underruns();
+    let mut last_underrun_log: Option<Instant> = None;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            r = source.accept() => {
+                match r {
+                    Ok(Some((stream, peer))) => {
+                        eprintln!(
+                            "openay-server: {} connection from {peer}",
+                            transport.as_str()
+                        );
+                        if let Some(slot) = &device_slot {
+                            *slot.lock().expect("bt device slot mutex poisoned") =
+                                Some(peer.clone());
+                        }
+                        let conn_ingest = ingest.clone();
+                        let conn_quit = quit.clone();
+                        let conn_slot = device_slot.clone();
+                        // Label for the clear below: `peer` itself is moved
+                        // into the serve call.
+                        let peer_label = peer.clone();
+                        tokio::spawn(async move {
+                            serve_packet_stream(stream, peer, conn_ingest, conn_quit).await;
+                            // Connection over: clear the device slot only if
+                            // it still names THIS connection — an overlapping
+                            // later connection must not be un-shown by an
+                            // earlier one ending.
+                            if let Some(slot) = conn_slot {
+                                let mut g =
+                                    slot.lock().expect("bt device slot mutex poisoned");
+                                if g.as_deref() == Some(peer_label.as_str()) {
+                                    *g = None;
+                                }
+                            }
+                        });
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(e).context("accept error"),
+                }
+            }
+        }
+        if quit.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Some(line) = underrun_episode_line(
+            &jitter,
+            &effective_target,
+            &mut last_underruns,
+            &mut last_underrun_log,
+        ) {
+            eprintln!("{line}");
+        }
+        if last_stats.elapsed() >= STATS_INTERVAL {
+            println!("{}", stats_line(transport, &ingest, &jitter));
+            last_stats = Instant::now();
+        }
+    }
+    Ok(stats_line(transport, &ingest, &jitter))
+}
+
+/// TCP receive loop: back-to-back framed packets via `TcpPacketStream`; each
+/// accepted connection is handled by its own task, so one stalled client
+/// cannot block ingestion from others.
+async fn tcp_loop(
+    config: &EngineConfig,
+    ingest: Arc<Mutex<Ingest>>,
+    jitter: Arc<JitterBuffer>,
+    effective_target: Arc<AtomicU32>,
+    quit: Arc<AtomicBool>,
+) -> Result<String> {
+    let addr = SocketAddr::new(config.bind, config.port);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding TCP {addr}"))?;
+    eprintln!("openay-server: TCP listening on {addr}");
+
+    let mut source = TcpSource { listener };
+    stream_accept_loop(
+        Transport::Tcp,
+        &mut source,
+        ingest,
+        jitter,
+        effective_target,
+        quit,
+        None,
+    )
+    .await
+}
+
+/// Bluetooth SPP receive loop (feature `bluetooth`): register the OpenAY
+/// Mic SPP profile with BlueZ on the default adapter, then serve accepted
+/// RFCOMM connections through the same ingest path as TCP
+/// ([`stream_accept_loop`] + [`serve_packet_stream`]). One connection at a
+/// time from a phone is the normal case, but sequential reconnects are
+/// handled: the loop keeps accepting until `quit`.
+///
+/// `config.bind`/`config.port` are ignored here (SPP listens via the SDP
+/// record, not a socket) — they remain stored for display. Dropping the
+/// source (loop exit, normal or fatal) unregisters the SPP profile.
+///
+/// `bt_inject`, when set (test hook), replaces the BlueZ server with
+/// pre-connected in-process streams — no D-Bus, no adapter.
+#[cfg(feature = "bluetooth")]
+async fn bt_loop(
+    config: &EngineConfig,
+    ingest: Arc<Mutex<Ingest>>,
+    jitter: Arc<JitterBuffer>,
+    effective_target: Arc<AtomicU32>,
+    quit: Arc<AtomicBool>,
+    device_slot: BtDeviceSlot,
+    bt_inject: Option<InjectedBtSource>,
+) -> Result<String> {
+    // A type-erased source: either the test injector or the real BlueZ SPP
+    // server (owned here, so it lives exactly as long as the loop and
+    // unregisters the profile on drop).
+    let mut source: Box<dyn ConnSource> = if let Some(inject) = bt_inject {
+        eprintln!(
+            "openay-server: BT test source active (no BlueZ registration) — \
+             bind {} port {} ignored for SPP",
+            config.bind, config.port
+        );
+        Box::new(inject)
+    } else {
+        let server = openay_transport::RfcommServer::register_default()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Bluetooth SPP setup failed (is the BlueZ daemon running \
+                 and an adapter powered?): {e}"
+                )
+            })?;
+        eprintln!(
+            "openay-server: BT SPP profile registered (OpenAY Mic SPP) — \
+             waiting for a paired device to connect"
+        );
+        Box::new(RfcommSource { server })
+    };
+
+    stream_accept_loop(
+        Transport::Bluetooth,
+        source.as_mut(),
+        ingest,
+        jitter,
+        effective_target,
+        quit,
+        Some(device_slot),
+    )
+    .await
 }
 
 /// UDP receive loop: one datagram == one packet (protocol spec). Malformed
@@ -904,9 +1406,12 @@ async fn udp_loop(
         if quit.load(Ordering::Relaxed) {
             break;
         }
-        if let Some(line) =
-            underrun_episode_line(&jitter, &effective_target, &mut last_underruns, &mut last_underrun_log)
-        {
+        if let Some(line) = underrun_episode_line(
+            &jitter,
+            &effective_target,
+            &mut last_underruns,
+            &mut last_underrun_log,
+        ) {
             eprintln!("{line}");
         }
         if last_stats.elapsed() >= STATS_INTERVAL {
@@ -915,71 +1420,6 @@ async fn udp_loop(
         }
     }
     Ok(stats_line(Transport::Udp, &ingest, &jitter))
-}
-
-/// TCP receive loop: back-to-back framed packets via `TcpPacketStream`; each
-/// accepted connection is handled by its own task, so one stalled client
-/// cannot block ingestion from others.
-async fn tcp_loop(
-    config: &EngineConfig,
-    ingest: Arc<Mutex<Ingest>>,
-    jitter: Arc<JitterBuffer>,
-    effective_target: Arc<AtomicU32>,
-    quit: Arc<AtomicBool>,
-) -> Result<String> {
-    let addr = SocketAddr::new(config.bind, config.port);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding TCP {addr}"))?;
-    eprintln!("openay-server: TCP listening on {addr}");
-
-    let mut last_stats = Instant::now();
-    let mut last_underruns = jitter.underruns();
-    let mut last_underrun_log: Option<Instant> = None;
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
-            r = listener.accept() => {
-                let (stream, peer) = r.context("accept error")?;
-                eprintln!("openay-server: TCP connection from {peer}");
-                let conn_ingest = ingest.clone();
-                let conn_quit = quit.clone();
-                tokio::spawn(async move {
-                    let mut framed = openay_transport::tcp::TcpPacketStream::new(stream);
-                    loop {
-                        if conn_quit.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        match framed.next_packet().await {
-                            Ok(pkt) => {
-                                let mut g = conn_ingest.lock().expect("ingest mutex poisoned");
-                                if g.ingest_packet(pkt.kind, pkt.seq, &pkt.payload).is_err() {
-                                    // Counted inside ingest_packet.
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("openay-server: TCP connection {peer} closed: {e}");
-                                break;
-                            }
-                        }
-                    }
-                });
-            }
-        }
-        if quit.load(Ordering::Relaxed) {
-            break;
-        }
-        if let Some(line) =
-            underrun_episode_line(&jitter, &effective_target, &mut last_underruns, &mut last_underrun_log)
-        {
-            eprintln!("{line}");
-        }
-        if last_stats.elapsed() >= STATS_INTERVAL {
-            println!("{}", stats_line(Transport::Tcp, &ingest, &jitter));
-            last_stats = Instant::now();
-        }
-    }
-    Ok(stats_line(Transport::Tcp, &ingest, &jitter))
 }
 
 /// Watch the underrun counter on every 200 ms wake; when it increased,
@@ -1107,6 +1547,43 @@ mod tests {
         assert_eq!(CodecMode::Opus.as_str(), "opus");
     }
 
+    /// The Bluetooth transport string ("bt" — the SRV line and GUI status
+    /// line are load-bearing formats).
+    #[test]
+    fn transport_bluetooth_as_str_is_bt() {
+        assert_eq!(Transport::Bluetooth.as_str(), "bt");
+        assert_ne!(Transport::Bluetooth, Transport::default());
+    }
+
+    /// Bluetooth config: validation is unchanged (bind/port must stay
+    /// valid even though the BT loop ignores them — they are still stored
+    /// for display), and the rest of the config passes through untouched.
+    #[test]
+    fn bluetooth_config_validates_like_the_others() {
+        let cfg = EngineConfig {
+            transport: Transport::Bluetooth,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 41_700,
+            codec: CodecMode::Auto,
+            target_ms: 10.0,
+            capacity_ms: 100.0,
+        };
+        assert_eq!(
+            cfg.validated().unwrap(),
+            cfg,
+            "valid bt config passes through"
+        );
+        // Port rules still apply: a bt Start is rejected exactly like udp/tcp.
+        let bad = EngineConfig {
+            transport: Transport::Bluetooth,
+            port: 0,
+            ..EngineConfig::default()
+        };
+        assert_eq!(bad.validated(), Err(ConfigError::InvalidPort(0)));
+        // Standby default is still UDP.
+        assert_eq!(EngineConfig::default().transport, Transport::Udp);
+    }
+
     #[test]
     fn default_config_matches_cli_defaults() {
         let cfg = EngineConfig::default();
@@ -1146,7 +1623,10 @@ mod tests {
             None,
             "a second increase within 5 s is throttled"
         );
-        assert_eq!(last_underruns, 3, "the counter advances even when throttled");
+        assert_eq!(
+            last_underruns, 3,
+            "the counter advances even when throttled"
+        );
     }
 
     /// While stopped the snapshot reports the configured target as the

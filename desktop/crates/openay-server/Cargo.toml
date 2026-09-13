@@ -18,7 +18,7 @@ openay-protocol = { path = "../openay-protocol" }
 openay-transport = { path = "../openay-transport" }
 openay-codec = { path = "../openay-codec" }
 openay-jitter = { path = "../openay-jitter" }
-tokio = { version = "1", features = ["net", "macros", "rt-multi-thread", "time", "signal"] }
+tokio = { version = "1", features = ["net", "macros", "rt-multi-thread", "time", "signal", "sync"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 
@@ -28,6 +28,11 @@ default = []
 # libpipewire-0.3 and libspa-0.2 (pkg-config), so this feature is opt-in and
 # requires those libraries at build time.
 pipewire = ["dep:pipewire"]
+# Bluetooth SPP receive via BlueZ (bluer). Opt-in like `pipewire`: the crate
+# compiles without it (selecting the `bt` transport then fails cleanly at
+# runtime), and running it needs a system bluetoothd (D-Bus) — no Bluetooth
+# hardware is required at build time.
+bluetooth = ["openay-transport/bluetooth"]
 
 [dependencies.pipewire]
 version = "0.8"
@@ -37,3 +42,7 @@ optional = true
 # In-process lossy proxy for the adaptive-depth validation scenarios only
 # (never a runtime dependency: the production receiver does not use it).
 openay-proxy = { path = "../openay-proxy" }
+# In-process duplex byte streams for the injected Bluetooth-link test
+# (tests/bluetooth_link.rs): the same tokio io-util traits the engine
+# already uses, enabled explicitly for the test target.
+tokio = { version = "1", features = ["io-util", "macros", "rt", "time"] }

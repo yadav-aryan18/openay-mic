@@ -23,7 +23,7 @@ use std::pin::Pin;
 use std::task::Context;
 
 use bluer::rfcomm::{Profile, ProfileHandle, Role, Stream};
-use bluer::{Error, ErrorKind, Session, Uuid};
+use bluer::{Address, Error, ErrorKind, Session, Uuid};
 // Trait import only (name kept private to avoid clashing with rfcomm::Stream).
 use futures_core::Stream as _;
 
@@ -100,6 +100,13 @@ impl RfcommServer {
     /// Errors when the profile has been unregistered or the D-Bus session
     /// died.
     pub async fn accept(&mut self) -> bluer::Result<Stream> {
+        self.accept_with_device().await.map(|(stream, _)| stream)
+    }
+
+    /// Like [`accept`](Self::accept), but also returns the remote device
+    /// address (for caller-side display, e.g. a "BT · <device>" status
+    /// line).
+    pub async fn accept_with_device(&mut self) -> bluer::Result<(Stream, Address)> {
         let req = self.next_request().await.ok_or_else(|| Error {
             kind: ErrorKind::NotRegistered,
             message: "OpenAY SPP profile is no longer registered".to_string(),
@@ -107,7 +114,7 @@ impl RfcommServer {
         let device = req.device();
         let stream = req.accept()?;
         log::info!("Accepted RFCOMM connection from {device}");
-        Ok(stream)
+        Ok((stream, device))
     }
 
     /// Convenience: accept one connection and immediately apply packet

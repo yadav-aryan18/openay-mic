@@ -174,8 +174,8 @@ fn setup_source(shared: PwShared) -> Result<()> {
         eprintln!("openay-server: requesting {key} = {value}");
         stream_props.insert(key, value);
     }
-    let stream = pw::stream::Stream::new(&core, "openay-mic", stream_props)
-        .context("creating stream")?;
+    let stream =
+        pw::stream::Stream::new(&core, "openay-mic", stream_props).context("creating stream")?;
 
     let _listener = stream
         .add_local_listener_with_user_data(shared.clone())
@@ -495,7 +495,9 @@ mod tests {
 
     #[test]
     fn node_latency_invalid_inputs_are_ignored_not_fatal() {
-        for bad in ["0", "0/48000", "480/0", "-5", "abc", "480/", "/48000", "4.8"] {
+        for bad in [
+            "0", "0/48000", "480/0", "-5", "abc", "480/", "/48000", "4.8",
+        ] {
             assert_eq!(parse_node_latency(Some(bad)), None, "{bad} must be ignored");
         }
     }

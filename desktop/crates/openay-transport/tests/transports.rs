@@ -200,6 +200,10 @@ async fn tcp_two_packets_back_to_back() {
 
 #[cfg(feature = "bluetooth")]
 mod bluetooth {
+    use std::time::Duration;
+
+    use openay_transport::RfcommServer;
+
     #[tokio::test]
     #[ignore = "requires Bluetooth hardware and a BlueZ D-Bus stack"]
     async fn rfcomm_adapter_presence() {
@@ -225,5 +229,39 @@ mod bluetooth {
             "INFO: Bluetooth adapters present ({}), not attempting real RFCOMM connections",
             names.join(", ")
         );
+    }
+
+    /// Live smoke: register the OpenAY Mic SPP profile on the default
+    /// adapter exactly like the server's BT loop does, print the adapter
+    /// address, hold the registration for ~2 s, then drop (unregister).
+    ///
+    /// Never connects to anything — a real RFCOMM link needs the user's
+    /// paired phone. Run explicitly on a host with BlueZ running:
+    ///
+    /// ```text
+    /// cargo test -p openay-transport --features bluetooth \
+    ///   --test transports bluetooth_spp_registration -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires Bluetooth hardware and a running bluetoothd (BlueZ)"]
+    async fn bluetooth_spp_registration() {
+        let server = RfcommServer::register_default()
+            .await
+            .expect("SPP profile must register on the default adapter");
+        let adapter = server
+            .session()
+            .default_adapter()
+            .await
+            .expect("default adapter");
+        println!(
+            "OK: OpenAY Mic SPP profile registered on {} ({})",
+            adapter.name(),
+            adapter.address().await.expect("adapter address")
+        );
+        // Hold the profile so an operator can see it in bluetoothctl
+        // (`show` / `sdptool`), then drop: unregistering must not hang.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        drop(server);
+        println!("OK: profile dropped (unregistered)");
     }
 }
