@@ -23,6 +23,28 @@ solutions like WO Mic on latency, security, and UX.
   (`OPUS_APPLICATION_RESTRICTED_LOWDELAY`, 10 ms frames).
 - Wire format: see [`shared/protocol.md`](shared/protocol.md).
 
+## Bluetooth quick start (SPP / RFCOMM)
+
+The Bluetooth transport carries the exact TCP-style framing over RFCOMM;
+the desktop registers a standard Serial Port Profile service and the phone
+connects to it as a client. One-time setup:
+
+1. Pair the phone with the desktop (`bluetoothctl` → `pairable on` →
+   pair from the phone's Bluetooth settings, or `bluetoothctl pair <addr>`).
+2. Desktop: build with the feature and run
+   `openay-server --transport bt` (or pick **BT** in `openay-gui`).
+   Startup logs `BT SPP profile registered (OpenAY Mic SPP) — waiting for a
+   paired device to connect`; the `openay_mic` virtual source behaves
+   exactly as with the other transports.
+3. Phone: transport **BT** → pick the paired desktop from the picker →
+   **ON AIR**. The app connects to the desktop's SPP service and streams;
+   errors surface on the notification and the network card.
+
+Requirements: a BlueZ stack with a powered adapter on the desktop
+(`bluetoothctl list`); the phone must be bonded (SPP connects only to
+paired devices). Without the `bluetooth` feature the server rejects BT with
+a clear rebuild hint; the rest of the engine is unaffected.
+
 ## Building & testing (Phase 6 state)
 
 All tooling is user-space; no root required.
