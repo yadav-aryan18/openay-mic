@@ -34,6 +34,17 @@ public:
     // "last_error".
     bool Configure(TransportType transport, const std::string& host,
                    uint16_t port, CodecType codec, int frame_ms);
+
+    // Bluetooth (RFCOMM/SPP via the Kotlin bridge) variant of Configure: `fd`
+    // is the write end of the Kotlin pipe handed over by NativeBridge's
+    // nativeStartBt. OWNERSHIP: the engine takes the fd on entry — success or
+    // failure — and closes it exactly once (with the pipeline sink: on Stop,
+    // when a later Configure/ConfigureBt replaces the pipeline, or at engine
+    // teardown). The Kotlin side must detachFd() before the call and never
+    // close it. `device_address` is display-only (StatsJson "host"; "port"
+    // is 0).
+    bool ConfigureBt(int fd, const std::string& device_address,
+                     CodecType codec, int frame_ms);
     bool Start();
     void Stop();
     bool IsRunning() const;
@@ -44,6 +55,8 @@ public:
     //  "sent":1234,"bytes":1186560,"ring_overruns":0,"encode_errors":0,
     //  "send_errors":0,"xruns":0,"callback_us_p50":0,"last_error":"",
     //  "level_peak":40}
+    // For BT runs "transport" is "bt", "host" is the device address and
+    // "port" is 0.
     std::string StatsJson() const;
 
     // Input level peak (0..32767) since the last call, consumed and reset;

@@ -22,12 +22,12 @@ namespace openay {
 // ---------------------------------------------------------------------------
 // BytePipe — abstract byte-stream seam.
 //
-// Reserved as the extension point for transports that cannot be expressed as
-// a POSIX socket created by this library — most importantly the Bluetooth
-// RFCOMM (SPP) bridge that Phase 3 will wire from Kotlin through JNI on
-// Android. RFCOMM is a byte stream with the same framing/resync rules as TCP,
-// so a future BytePipe implementation can reuse TcpConn's framing logic once
-// a JNI file descriptor is handed over; nothing in this file wires it yet.
+// Extension point for transports that cannot be expressed as a POSIX socket
+// created by this library — most importantly the Bluetooth RFCOMM (SPP)
+// bridge wired from Kotlin through JNI on Android. RFCOMM is a byte stream
+// with the same framing/resync rules as TCP, so the BytePipe implementation
+// (FdBytePipe below) reuses TcpConn's framing logic once a JNI file
+// descriptor is handed over.
 //
 // Implementations must be safe to call from a single receiving thread plus a
 // single sending thread (or externally synchronized).
@@ -181,6 +181,54 @@ public:
 
 private:
     TcpConn conn_;
+};
+
+// ---------------------------------------------------------------------------
+// FdBytePipe — BytePipe over an owned file descriptor: the Bluetooth bridge.
+//
+// Native owns no Bluetooth socket code (the NDK has none): Kotlin connects
+// the RFCOMM (SPP) socket, creates a pipe, and hands native the write end's
+// fd; a Kotlin pump coroutine forwards pipe bytes into the socket. This
+// class is native's write side — Push() writes to that fd with the same
+// full-write loop as TcpConn::Send, so the wire bytes are identical to the
+// TCP framing and the desktop's stream decoder works unchanged.
+//
+// Ownership: the fd is OWNED. The constructor takes it over and the
+// destructor closes it exactly once — the JNI layer takes ownership of the
+// fd handed over by nativeStartBt, and the Kotlin side must detachFd() the
+// write end before the call (it never closes it afterwards). A negative fd
+// is accepted but inert: Valid() is false and Push fails immediately.
+//
+// SIGPIPE: socket fds take the send(MSG_NOSIGNAL) path; a non-socket fd
+// (the production pipe) falls back to write() permanently after the first
+// ENOTSOCK. write() to a broken pipe is safe on Android because ART blocks
+// SIGPIPE process-wide (writes return EPIPE instead of raising); host tests
+// use socketpairs, which keep the MSG_NOSIGNAL path.
+//
+// Threading: Push/Pull target the pipeline's single network thread (same
+// contract as BytePipe: one sender thread, or externally synchronized).
+// ---------------------------------------------------------------------------
+class FdBytePipe : public BytePipe {
+public:
+    explicit FdBytePipe(int fd) : fd_(fd) {}  // takes ownership of fd
+    ~FdBytePipe() override;
+
+    FdBytePipe(const FdBytePipe&) = delete;
+    FdBytePipe& operator=(const FdBytePipe&) = delete;
+
+    bool Valid() const { return fd_ >= 0; }
+    int fd() const { return fd_; }
+
+    // Write-all loop; false on error or closed pipe (terminal for the link).
+    bool Push(const uint8_t* data, size_t size) override;
+
+    // read() passthrough; unused by the send-only bridge but completes the
+    // BytePipe seam for a future desktop->phone direction.
+    ssize_t Pull(uint8_t* data, size_t max_size) override;
+
+private:
+    int fd_ = -1;
+    bool socket_ = true;  // false once send() reports ENOTSOCK (pipe fd)
 };
 
 }  // namespace openay

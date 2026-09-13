@@ -27,6 +27,7 @@
 // Config rules: frame_ms is 5 or 10. Opus is 10 ms only (shared/protocol.md:
 // "Opus: exactly one Opus packet per audio frame; 10 ms frames"); requesting
 // Opus with frame_ms 5 fails Configure with PipelineError::InvalidConfig.
+// Bluetooth configures via ConfigureBt(fd) instead — host/port do not apply.
 #ifndef OPENAY_CAPTURE_PIPELINE_H
 #define OPENAY_CAPTURE_PIPELINE_H
 
@@ -47,7 +48,7 @@ namespace openay {
 
 class OpusEncoder;  // opaque handle; only capture_pipeline.cpp touches it
 
-enum class TransportType { Udp, Tcp };
+enum class TransportType { Udp, Tcp, Bt };
 enum class CodecType { Pcm, Opus };
 
 // Sticky pipeline error codes, exposed via last_error() / PipelineErrorName.
@@ -102,6 +103,16 @@ public:
                    const std::string& host, uint16_t port, CodecType codec,
                    int frame_ms, size_t ring_capacity_bytes = 16384);
 
+    // Bluetooth (RFCOMM/SPP via the Kotlin bridge) variant: `fd` is the write
+    // end of the Kotlin pipe handed over by NativeBridge's nativeStartBt —
+    // OWNED from entry, closed exactly once by the sink whether this
+    // configuration succeeds or fails (the Kotlin side detached it before the
+    // call and never closes it). host/port do not apply: the fd IS the link,
+    // and the sink writes TCP-identical framing into it. Must be called while
+    // stopped (Stop() is called internally, as in Configure()).
+    bool ConfigureBt(IAudioSource* source, int fd, CodecType codec, int frame_ms,
+                     size_t ring_capacity_bytes = 16384);
+
     bool Start();  // false + last_error() on source failure
     void Stop();   // idempotent; drains <= 50 ms, joins, closes the sink
 
@@ -149,6 +160,16 @@ private:
     // Pops one frame, encodes, sends; true on full success. On failure the
     // error counters + last_error are set (frame is dropped, stream lives).
     bool ProcessFrame(uint16_t* seq, Packet* pkt);
+
+    // frame_ms / codec preflight shared by Configure() and ConfigureBt();
+    // sets last_error and returns false on failure.
+    bool ValidateFrameAndCodec(int frame_ms, CodecType codec);
+    // Shared tail of both configures: ring + scratch sizing, codec creation,
+    // member stores, callback wiring. sink_ must be created already.
+    bool FinishConfigure(IAudioSource* source, TransportType transport,
+                         const std::string& host, uint16_t port,
+                         CodecType codec, int frame_ms,
+                         size_t ring_capacity_bytes);
 
     IAudioSource* source_ = nullptr;
     std::unique_ptr<SpscRingBuffer> ring_;

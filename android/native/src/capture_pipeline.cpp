@@ -37,6 +37,24 @@ private:
     TcpClient tcp_;
 };
 
+// Bluetooth (RFCOMM/SPP via the Kotlin pump): the sink writes the exact TCP
+// wire framing (EncodePacket: 6-byte header + payload, written in full) into
+// the pipe fd Kotlin handed over, so the desktop's stream decoder works
+// unchanged. The fd is OWNED by the FdBytePipe — closed exactly once when
+// this sink is destroyed (Stop / re-configure / engine teardown).
+class FdPacketSink : public IPacketSink {
+public:
+    explicit FdPacketSink(int fd) : pipe_(std::make_unique<FdBytePipe>(fd)) {}
+    bool Send(const Packet& p) override {
+        const std::vector<uint8_t> wire = EncodePacket(p);
+        return pipe_->Push(wire.data(), wire.size());
+    }
+    bool Valid() const override { return pipe_->Valid(); }
+
+private:
+    std::unique_ptr<FdBytePipe> pipe_;
+};
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -72,6 +90,70 @@ bool CapturePipeline::Configure(IAudioSource* source, TransportType transport,
                           std::memory_order_relaxed);
         return false;
     }
+    if (!ValidateFrameAndCodec(frame_ms, codec)) return false;
+
+    // --- sink --------------------------------------------------------------
+    if (transport == TransportType::Udp) {
+        sink_ = std::make_unique<UdpPacketSink>(host, port);
+    } else if (transport == TransportType::Bt) {
+        // Bluetooth configures via ConfigureBt(fd); host/port do not apply.
+        last_error_.store(static_cast<int>(PipelineError::InvalidConfig),
+                          std::memory_order_relaxed);
+        return false;
+    } else {
+        sink_ = std::make_unique<TcpPacketSink>(host, port);
+    }
+    if (!sink_->Valid()) {
+        last_error_.store(static_cast<int>(PipelineError::SinkOpen),
+                          std::memory_order_relaxed);
+        return false;
+    }
+
+    return FinishConfigure(source, transport, host, port, codec, frame_ms,
+                           ring_capacity_bytes);
+}
+
+bool CapturePipeline::ConfigureBt(IAudioSource* source, int fd, CodecType codec,
+                                  int frame_ms, size_t ring_capacity_bytes) {
+    // The fd is owned from entry: the sink below closes it exactly once
+    // (destructor) whether this configuration succeeds or fails. The JNI
+    // layer never closes it; Kotlin detached the write end on hand-over.
+    auto sink = std::make_unique<FdPacketSink>(fd);
+
+    Stop();  // any prior run
+
+    last_error_.store(static_cast<int>(PipelineError::None),
+                      std::memory_order_relaxed);
+    packets_sent_.store(0, std::memory_order_relaxed);
+    bytes_sent_.store(0, std::memory_order_relaxed);
+    encode_errors_.store(0, std::memory_order_relaxed);
+    send_errors_.store(0, std::memory_order_relaxed);
+    callback_idx_.store(0, std::memory_order_relaxed);
+    level_peak_.store(0, std::memory_order_relaxed);
+
+    // --- validate (mirrors Configure(); host/port do not apply — the fd IS
+    // the link) --------------------------------------------------------------
+    if (!source) {
+        last_error_.store(static_cast<int>(PipelineError::InvalidConfig),
+                          std::memory_order_relaxed);
+        return false;  // `sink` destructs here: fd closed
+    }
+    if (!sink->Valid()) {
+        // A negative fd means nothing was handed over — a configuration
+        // error (the link never existed), not a transport failure like
+        // Configure()'s SinkOpen.
+        last_error_.store(static_cast<int>(PipelineError::InvalidConfig),
+                          std::memory_order_relaxed);
+        return false;
+    }
+    if (!ValidateFrameAndCodec(frame_ms, codec)) return false;
+
+    sink_ = std::move(sink);
+    return FinishConfigure(source, TransportType::Bt, "", 0, codec, frame_ms,
+                           ring_capacity_bytes);
+}
+
+bool CapturePipeline::ValidateFrameAndCodec(int frame_ms, CodecType codec) {
     if (frame_ms != 5 && frame_ms != 10) {
         last_error_.store(static_cast<int>(PipelineError::InvalidConfig),
                           std::memory_order_relaxed);
@@ -91,7 +173,14 @@ bool CapturePipeline::Configure(IAudioSource* source, TransportType transport,
         return false;
     }
 #endif
+    return true;
+}
 
+bool CapturePipeline::FinishConfigure(IAudioSource* source,
+                                      TransportType transport,
+                                      const std::string& host, uint16_t port,
+                                      CodecType codec, int frame_ms,
+                                      size_t ring_capacity_bytes) {
     frame_ms_ = frame_ms;
     frame_samples_ = static_cast<size_t>(frame_ms) * 48;
     frame_bytes_ = frame_samples_ * 2;
@@ -103,18 +192,6 @@ bool CapturePipeline::Configure(IAudioSource* source, TransportType transport,
     scratch_.resize(frame_bytes_);
     pcm_bytes_.resize(frame_bytes_);
     pcm_samples_.resize(frame_samples_);
-
-    // --- sink --------------------------------------------------------------
-    if (transport == TransportType::Udp) {
-        sink_ = std::make_unique<UdpPacketSink>(host, port);
-    } else {
-        sink_ = std::make_unique<TcpPacketSink>(host, port);
-    }
-    if (!sink_->Valid()) {
-        last_error_.store(static_cast<int>(PipelineError::SinkOpen),
-                          std::memory_order_relaxed);
-        return false;
-    }
 
     // --- codec -------------------------------------------------------------
 #ifdef OPENAY_HAVE_OPUS
@@ -163,6 +240,7 @@ void CapturePipeline::Stop() {
         // Still release a previous run's resources (sink fd, callback).
         if (source_) source_->Stop();
         sink_.reset();
+        source_ = nullptr;
         return;
     }
     // 1) Stop the source: no further callbacks can run after this returns.
@@ -173,6 +251,12 @@ void CapturePipeline::Stop() {
     running_.store(false, std::memory_order_relaxed);
     // 3) Close the sink.
     sink_.reset();
+    // 4) Drop the non-owned source pointer: by the time the pipeline itself
+    // is destroyed the source may already be gone (the engine's member
+    // destruction order frees it first; a re-configure frees the replaced
+    // source). Start() after Stop() already fails on the reset sink, so
+    // clearing the pointer changes no observable behavior.
+    source_ = nullptr;
 }
 
 // ---------------------------------------------------------------------------
