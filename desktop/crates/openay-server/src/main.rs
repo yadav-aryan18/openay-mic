@@ -56,11 +56,42 @@ struct Args {
     /// Jitter buffer capacity in ms of audio.
     #[arg(long, default_value_t = 100.0)]
     capacity_ms: f32,
+    /// Play received audio on a local output device (ALSA on Linux, WASAPI
+    /// on Windows) instead of the PipeWire virtual microphone. Requires the
+    /// `audio-output` build feature.
+    #[arg(long)]
+    output: bool,
+    /// With --output: case-insensitive substring of the output device name
+    /// to select (omit for the host default). Requires the `audio-output`
+    /// build feature.
+    #[arg(long, requires = "output")]
+    output_device: Option<String>,
+    /// List available output device names and exit. Requires the
+    /// `audio-output` build feature.
+    #[arg(long)]
+    list_devices: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Audio-output requests in a build without the feature: clean error
+    // before anything else runs (same pattern as a `bt` request without the
+    // `bluetooth` feature).
+    #[cfg(not(feature = "audio-output"))]
+    if args.output || args.output_device.is_some() || args.list_devices {
+        anyhow::bail!("built without audio output support (rebuild with --features audio-output)");
+    }
+
+    // `--list-devices`: print the host's output device names and exit 0.
+    #[cfg(feature = "audio-output")]
+    if args.list_devices {
+        for name in openay_server::list_output_devices() {
+            println!("{name}");
+        }
+        return Ok(());
+    }
 
     let target_ms = args.target_ms.clamp(MIN_PREBUFFER_MS, MAX_PREBUFFER_MS);
     if (args.target_ms - target_ms).abs() > f32::EPSILON {
@@ -88,10 +119,20 @@ async fn main() -> Result<()> {
         },
         target_ms,
         capacity_ms: args.capacity_ms,
+        #[cfg(feature = "audio-output")]
+        audio_output: args.output,
+        #[cfg(feature = "audio-output")]
+        output_device: args.output_device.clone(),
     }
     .validated()
     .map_err(|e: ConfigError| anyhow::anyhow!(e))?;
 
+    // The config is both the standby defaults for the handle and the first
+    // Start payload; clone it only when the audio-output feature makes
+    // EngineConfig non-Copy (identical observable behavior either way).
+    #[cfg(feature = "audio-output")]
+    let handle = spawn_engine(Some(config.clone()));
+    #[cfg(not(feature = "audio-output"))]
     let handle = spawn_engine(Some(config));
 
     // Cold-start contract: spawn_engine never binds or starts a pipeline —

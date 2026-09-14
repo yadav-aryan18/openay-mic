@@ -38,6 +38,18 @@ fn free_udp_port() -> u16 {
     socket.local_addr().expect("local addr").port()
 }
 
+/// A fresh headless engine config for `port` (loopback bind, UDP, auto
+/// codec, default 10 ms target / 100 ms capacity). Every call builds a NEW
+/// value: with the `audio-output` feature `EngineConfig` is not `Copy`, so
+/// call sites that send the config more than once need distinct values.
+fn headless_config(port: u16) -> EngineConfig {
+    EngineConfig {
+        bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port,
+        ..EngineConfig::default()
+    }
+}
+
 /// Poll `status` until `pred` holds or the timeout elapses.
 fn wait_until<F: Fn(&openay_server::EngineStatus) -> bool>(
     handle: &openay_server::EngineHandle,
@@ -81,22 +93,13 @@ fn rt() -> tokio::runtime::Runtime {
 #[test]
 fn engine_receives_udp_packets_without_pipewire() {
     let port = free_udp_port();
-    let config = EngineConfig {
-        transport: Transport::Udp,
-        bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        port,
-        codec: CodecMode::Auto,
-        target_ms: 10.0,
-        capacity_ms: 100.0,
-    }
-    .validated()
-    .expect("config valid");
+    let config = headless_config(port).validated().expect("config valid");
     assert!(config.target_ms >= MIN_PREBUFFER_MS && config.target_ms <= MAX_PREBUFFER_MS);
 
     let handle = spawn_engine(Some(config));
 
     // Cold-start contract: spawn_engine(Some(config)) must NOT bind or run —
-    // the config is only the standby/default. Counters are zero, the config
+    // the config is only the standby defaults. Counters are zero; the config
     // fields are still reported for the standby display.
     let cold = handle.status();
     assert_zeroed(&cold);
@@ -115,7 +118,7 @@ fn engine_receives_udp_packets_without_pipewire() {
     rt.block_on(async {
         handle
             .cmd()
-            .send(EngineCommand::Start(config))
+            .send(EngineCommand::Start(headless_config(port)))
             .await
             .expect("send Start");
     });
@@ -232,23 +235,20 @@ fn engine_receives_udp_packets_without_pipewire() {
 #[cfg(feature = "pipewire")]
 fn live_stream_folds_level_peak_with_pipewire() {
     let port = free_udp_port();
-    let config = EngineConfig {
-        transport: Transport::Udp,
-        bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        port,
-        codec: CodecMode::Pcm,
-        target_ms: 10.0,
-        capacity_ms: 100.0,
-    }
-    .validated()
-    .expect("config valid");
-    let handle = spawn_engine(Some(config));
+    let handle = spawn_engine(Some(
+        EngineConfig {
+            codec: CodecMode::Pcm,
+            ..headless_config(port)
+        }
+        .validated()
+        .expect("config valid"),
+    ));
     let rt = rt();
 
     rt.block_on(async {
         handle
             .cmd()
-            .send(EngineCommand::Start(config))
+            .send(EngineCommand::Start(headless_config(port)))
             .await
             .expect("send Start");
     });
@@ -316,15 +316,7 @@ fn live_stream_folds_level_peak_with_pipewire() {
 #[test]
 fn engine_restarts_on_same_handle() {
     let port = free_udp_port();
-    let config = EngineConfig {
-        transport: Transport::Udp,
-        bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        port,
-        codec: CodecMode::Auto,
-        target_ms: 10.0,
-        capacity_ms: 100.0,
-    };
-    let handle = spawn_engine(Some(config));
+    let handle = spawn_engine(Some(headless_config(port)));
 
     // Cold-start contract: the engine is idle even though a config was given.
     assert!(!handle.status().running, "engine must be cold after spawn");
@@ -335,7 +327,7 @@ fn engine_restarts_on_same_handle() {
     rt.block_on(async {
         handle
             .cmd()
-            .send(EngineCommand::Start(config))
+            .send(EngineCommand::Start(headless_config(port)))
             .await
             .expect("send Start");
     });
@@ -362,7 +354,7 @@ fn engine_restarts_on_same_handle() {
     let config2 = EngineConfig {
         codec: CodecMode::Pcm,
         target_ms: 20.0,
-        ..config
+        ..headless_config(port)
     };
     rt.block_on(async {
         handle
@@ -401,15 +393,7 @@ fn bind_conflict_reports_error_and_recovers() {
     // Hold a UDP socket so the engine's bind must fail.
     let holder = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind holder");
     let port = holder.local_addr().expect("holder local addr").port();
-    let config = EngineConfig {
-        transport: Transport::Udp,
-        bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        port,
-        codec: CodecMode::Auto,
-        target_ms: 10.0,
-        capacity_ms: 100.0,
-    };
-    let handle = spawn_engine(Some(config));
+    let handle = spawn_engine(Some(headless_config(port)));
     // Cold even with a config on a *taken* port: spawn never binds.
     assert!(
         !handle.status().running,
@@ -422,7 +406,7 @@ fn bind_conflict_reports_error_and_recovers() {
     rt.block_on(async {
         handle
             .cmd()
-            .send(EngineCommand::Start(config))
+            .send(EngineCommand::Start(headless_config(port)))
             .await
             .expect("send Start");
     });
@@ -451,7 +435,7 @@ fn bind_conflict_reports_error_and_recovers() {
     let port2 = free_udp_port();
     let config2 = EngineConfig {
         port: port2,
-        ..config
+        ..headless_config(port)
     };
     rt.block_on(async {
         handle
@@ -517,15 +501,7 @@ fn bind_conflict_reports_error_and_recovers() {
 #[test]
 fn rapid_start_stop_churn_does_not_leak_threads() {
     let port = free_udp_port();
-    let config = EngineConfig {
-        transport: Transport::Udp,
-        bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        port,
-        codec: CodecMode::Auto,
-        target_ms: 10.0,
-        capacity_ms: 100.0,
-    };
-    let handle = spawn_engine(Some(config));
+    let handle = spawn_engine(Some(headless_config(port)));
     assert!(!handle.status().running, "engine must be cold after spawn");
 
     let rt = rt();
@@ -533,7 +509,7 @@ fn rapid_start_stop_churn_does_not_leak_threads() {
         rt.block_on(async {
             handle
                 .cmd()
-                .send(EngineCommand::Start(config))
+                .send(EngineCommand::Start(headless_config(port)))
                 .await
                 .expect("send Start");
         })
