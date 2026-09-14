@@ -62,6 +62,28 @@ scripts/cpu_profile.sh       # idle / PCM / Opus %CPU + RSS, --assert budgets
 scripts/gen_click_track.py   # acoustic click track for the hardware audit
 ```
 
+## Windows client
+
+The same `openay-server` binary also cross-compiles for Windows
+(`x86_64-pc-windows-msvc`), turning any Windows 10+ PC into the receiver:
+audio renders to any output device — install a virtual audio cable (e.g.
+VB-Cable) to expose the stream to other apps as a microphone. Build it on a
+Linux host, entirely in user space (no Visual Studio, no admin), with
+
+```bash
+scripts/build_windows.sh    # stages dist/openay-windows/:
+                            #   openay-server.exe + README-WINDOWS.txt
+```
+
+The script uses [cargo-xwin](https://github.com/rust-cross/cargo-xwin) (MSVC
+CRT/SDK fetched to a cache, clang/lld-link for codegen) and degrades to a
+compile-only check gate with a clear error when linking is not possible on
+the host. `README-WINDOWS.txt` is the end-user quick start: firewall rule
+for inbound UDP/TCP 41700, Wi-Fi (app → UDP → `PC-IP:41700`) vs USB
+(`adb.exe forward tcp:41700 tcp:41700`, app → TCP → `127.0.0.1:41700`)
+usage, and the audio-output flags (`--output`, `--list-devices`,
+`--output-device <name>`). No admin rights are needed to run the exe.
+
 ## Reproducing the environment
 
 `scripts/env.sh.example` documents every toolchain input; the header of the
@@ -162,3 +184,9 @@ with instructions instead of failing later in a build.
   - `scripts/run_phase6.sh`: 11/11 checks pass (builds, ctest, cargo
     workspace + headless adaptive scenarios, python self-tests, proxy
     delivery-ratio smoke, latency-probe verdict, CPU budget assertions)
+- [x] Windows client — `scripts/build_windows.sh` cross-compiles the same
+  `openay-server` for `x86_64-pc-windows-msvc` via a user-space cargo-xwin
+  toolchain and stages `dist/openay-windows/` (`openay-server.exe` +
+  quick-start docs); cpal `audio-output` feature renders the decoded stream
+  (virtual audio cable exposes it as a microphone). See
+  [README-WINDOWS.txt](README-WINDOWS.txt)
