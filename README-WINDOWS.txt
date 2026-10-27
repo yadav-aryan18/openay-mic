@@ -55,6 +55,25 @@ Audio output options
 feature (enabled in the distributed exe); a build without it still
 receives on the network but has no playback.
 
+Collecting logs for bug reports
+-------------------------------
+Use the wrapper instead of the bare exe and every session is captured
+automatically (console + a timestamped file under
+%USERPROFILE%\OpenAY-logs\):
+
+    .\openay-log.ps1 --transport udp --output
+    .\openay-log.ps1 --transport tcp --output --output-device "CABLE Input"
+
+(If script execution is blocked: powershell -ExecutionPolicy Bypass
+-File .\openay-log.ps1 ...) The wrapper also snapshots --list-devices
+into the log directory. If something misbehaves, zip that OpenAY-logs
+folder and attach it.
+
+Phone side (optional, needs USB debugging): while testing, capture the
+app's own log in a second terminal:
+
+    adb logcat -s MicCaptureService:* openaymic:* > phone.logcat
+
 Common flags
 ------------
   --transport udp|tcp     transport to receive on (default udp)

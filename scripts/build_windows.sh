@@ -291,6 +291,14 @@ else
 fi
 check "copy README-WINDOWS.txt -> dist/openay-windows/" "$README_OK"
 
+# Session logger: wraps the exe so every test run is captured to a
+# timestamped log directory (see the "Collecting logs" section of
+# README-WINDOWS.txt). Only staged with the exe it wraps.
+if [ "$EXE_OK" -eq 0 ]; then
+  cp -f "$ROOT/scripts/openay-log.ps1" "$DIST/"
+  check "copy openay-log.ps1 -> dist/openay-windows/" 0
+fi
+
 if [ "$XWIN_OK" -ne 0 ]; then
   echo "== Fallback: compile-only gate for $TARGET =="
   GATE_OK=1
