@@ -1,0 +1,63 @@
+# Continuous integration for OpenAY Mic.
+#
+# Linux job: full Rust workspace (unit, golden-vector, codec, GUI) plus the
+# C++ host suite — the same gates as scripts/run_phase6.sh, minus the
+# hardware-dependent probes (no PipeWire daemon or audio device on runners).
+# Windows job: the headless receiver suite and a release build of both
+# executables, exercising the cpal/WASAPI audio-output path's compilation.
+
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install audio and toolchain dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libopus-dev libpipewire-0.3-dev \
+            clang libclang-dev \
+            cmake ninja-build g++ pkg-config
+      - name: Rust workspace tests
+        working-directory: desktop
+        run: cargo test --workspace
+      - name: Rust clippy
+        working-directory: desktop
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: C++ host tests
+        run: |
+          cmake -S android/native -B android/native/build-host -DCMAKE_BUILD_TYPE=Release
+          cmake --build android/native/build-host -j
+          ctest --test-dir android/native/build-host --output-on-failure
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Headless receiver tests
+        working-directory: desktop
+        run: cargo test -p openay-server
+      - name: Build both executables (WASAPI output)
+        working-directory: desktop
+        run: cargo build --release -p openay-gui -p openay-server --features openay-server/audio-output
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/openay-windows | Out-Null
+          Copy-Item desktop/target/release/openay-gui.exe  dist/openay-windows/
+          Copy-Item desktop/target/release/openay-server.exe dist/openay-windows/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openay-windows-ci
+          path: dist/openay-windows/
