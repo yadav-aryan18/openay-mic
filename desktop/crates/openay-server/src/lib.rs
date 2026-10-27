@@ -37,9 +37,14 @@
 //! [`Start`]: EngineCommand::Start
 //! [`Stop`]: EngineCommand::Stop
 
+#[cfg(feature = "audio-output")]
+pub mod audio;
 mod ingest;
 #[cfg(feature = "pipewire")]
 mod pw;
+
+#[cfg(feature = "audio-output")]
+pub use audio::list_output_devices;
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -127,7 +132,20 @@ impl CodecMode {
 
 /// Configuration for the receive pipeline. See [`EngineConfig::validated`]
 /// for the normalization rules (port range, target clamp).
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// The two audio-output fields exist only in builds with the `audio-output`
+/// feature: they are cfg-gated (like the fields they drive) so the headless
+/// and PipeWire-only builds keep byte-identical semantics — an `EngineConfig`
+/// without the feature simply cannot express an audio-output request, and the
+/// The two output fields exist in EVERY build (platform parity): on Linux
+/// the GUI leaves them unset (the PipeWire virtual mic is the output), on
+/// Windows it sets `audio_output` (WASAPI playback). Requesting playback in
+/// a build without the `audio-output` feature fails cleanly at Start (the
+/// Bluetooth pattern — a loud, explicit capability error, never silence).
+///
+/// `EngineConfig` is `Clone` but deliberately NOT `Copy` (`output_device`
+/// holds a `String`); call sites that used to copy must clone explicitly.
+#[derive(Debug, Clone, PartialEq)]
 pub struct EngineConfig {
     pub transport: Transport,
     pub bind: IpAddr,
@@ -138,6 +156,15 @@ pub struct EngineConfig {
     pub target_ms: f32,
     /// Jitter buffer capacity in ms of audio.
     pub capacity_ms: f32,
+    /// Play the decoded audio on a platform output device (cpal: ALSA on
+    /// Linux, WASAPI on Windows) instead of the PipeWire virtual microphone.
+    /// Requires the `audio-output` build feature at Start; when set, the
+    /// audio thread takes precedence over the `pipewire` feature's virtual
+    /// mic (an explicit playback request wins over the implicit source).
+    pub audio_output: bool,
+    /// Case-insensitive substring selecting the output device (`None` = the
+    /// host default). Only consulted while `audio_output` is set.
+    pub output_device: Option<String>,
 }
 
 impl Default for EngineConfig {
@@ -149,6 +176,8 @@ impl Default for EngineConfig {
             codec: CodecMode::Auto,
             target_ms: 10.0,
             capacity_ms: DEFAULT_CAPACITY_MS,
+            audio_output: false,
+            output_device: None,
         }
     }
 }
@@ -248,8 +277,9 @@ pub struct EngineStatus {
     pub effective_target_ms: f32,
 }
 
-/// Commands sent to the engine.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Commands sent to the engine (`Clone`, never `Copy` — `Start` carries
+/// [`EngineConfig`], which holds an output-device `String`).
+#[derive(Debug, Clone, PartialEq)]
 pub enum EngineCommand {
     /// Start (or restart with) the given config. A running pipeline is
     /// stopped first.
@@ -282,12 +312,15 @@ impl EngineHandle {
     /// `Stop`.
     pub fn status(&self) -> EngineStatus {
         let running = self.state.running.load(Ordering::Relaxed);
-        let cfg = self
-            .state
-            .config
-            .lock()
-            .expect("engine config mutex poisoned")
-            .unwrap_or_default();
+        let cfg = {
+            let guard = self
+                .state
+                .config
+                .lock()
+                .expect("engine config mutex poisoned");
+            guard.clone()
+        }
+        .unwrap_or_default();
         // Always consume the peak accumulator (it is stale once stopped);
         // only report it while running.
         let level_peak = self.state.peak.swap(0, Ordering::Relaxed) as f32 / PEAK_SCALE as f32;
@@ -608,16 +641,18 @@ struct Pipeline {
     jitter: Arc<JitterBuffer>,
     ingest: Arc<Mutex<Ingest>>,
     quit: Arc<AtomicBool>,
-    net_task: tokio::task::JoinHandle<Result<String>>,
+    net_task: tokio::task::JoinHandle<anyhow::Result<String>>,
     retarget: tokio::task::JoinHandle<()>,
     #[cfg(feature = "pipewire")]
-    pw_thread: Option<std::thread::JoinHandle<Result<()>>>,
+    pw_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    #[cfg(feature = "audio-output")]
+    audio_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
 }
 
 impl Pipeline {
     /// True when the pipeline can no longer serve audio: the quit flag was
-    /// set (Stop or PipeWire failure) and both tasks have exited, or the
-    /// network task ended on its own (fatal bind/I/O error).
+    /// set (Stop or audio/PipeWire failure) and all spawned arms have exited,
+    /// or the network task ended on its own (fatal bind/I/O error).
     fn is_done(&self) -> bool {
         let net_done = self.net_task.is_finished();
         #[cfg(feature = "pipewire")]
@@ -627,7 +662,14 @@ impl Pipeline {
             .is_none_or(std::thread::JoinHandle::is_finished);
         #[cfg(not(feature = "pipewire"))]
         let pw_done = true;
-        self.quit.load(Ordering::Relaxed) && net_done && pw_done
+        #[cfg(feature = "audio-output")]
+        let audio_done = self
+            .audio_thread
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished);
+        #[cfg(not(feature = "audio-output"))]
+        let audio_done = true;
+        self.quit.load(Ordering::Relaxed) && net_done && pw_done && audio_done
             || net_done && !self.quit.load(Ordering::Relaxed)
     }
 }
@@ -640,6 +682,12 @@ impl Pipeline {
 /// therefore never surfaces stale numbers).
 async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Result<Pipeline> {
     let config = config.validated().map_err(|e| anyhow::anyhow!(e))?;
+    #[cfg(not(feature = "audio-output"))]
+    if config.audio_output {
+        return Err(anyhow::anyhow!(
+            "built without audio output support (rebuild with --features audio-output)"
+        ));
+    }
     state.clear_error();
     state.clear_last_stats_line();
     state.peak.store(0, Ordering::Relaxed);
@@ -658,29 +706,83 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
         (config.target_ms * SAMPLE_RATE as f32 / 1000.0).ceil() as u32;
     state.effective_target.store(target_samples, Ordering::Release);
 
-    #[cfg(feature = "pipewire")]
-    let pw_thread = {
+    // Base depth for the depth controller (extracted before `config` moves).
+    let base_target_ms = config.target_ms;
+
+    // Audio output thread (feature `audio-output`): plays the decoded stream
+    // on a real output device via cpal. Spawned only on an explicit request;
+    // see `audio` for the RT contract this thread's callback implements.
+    #[cfg(feature = "audio-output")]
+    let audio_thread = if config.audio_output {
         let streaming = Arc::new(AtomicBool::new(false));
         let (setup_tx, setup_rx) = std::sync::mpsc::channel();
-        let shared = pw::PwShared {
+        let shared = audio::AudioShared {
             jitter: jitter.clone(),
             streaming,
             quit: quit.clone(),
             target_samples: state.effective_target.clone(),
             peak_level: state.peak.clone(),
+            stream_error: Arc::new(Mutex::new(None)),
         };
+        let output_device = config.output_device.clone();
         let thread = std::thread::Builder::new()
-            .name("openay-pipewire".into())
-            .spawn(move || pw::run_pipewire(shared, setup_tx))
-            .context("spawning PipeWire thread")?;
-        // A PipeWire setup failure ends the whole pipeline: record the
-        // error and set the quit flag (the engine reaps it on its next tick).
-        spawn_pw_monitor(quit.clone(), setup_rx, state);
+            .name("openay-audio".into())
+            .spawn(move || audio::run_audio_output(shared, output_device, setup_tx))
+            .context("spawning audio output thread")?;
+        // A device/setup failure ends the whole pipeline: record the error
+        // and set the quit flag (the engine reaps it on its next tick).
+        spawn_setup_monitor(quit.clone(), setup_rx, state, "audio output");
         Some(thread)
+    } else {
+        None
     };
 
-    #[cfg(not(feature = "pipewire"))]
+    #[cfg(feature = "pipewire")]
+    let pw_thread = {
+        // An explicit audio-output request takes precedence over the
+        // virtual-mic arm: the audio thread drives the device, so the pw
+        // graph is not built alongside it.
+        #[cfg(feature = "audio-output")]
+        let audio_requested = config.audio_output;
+        #[cfg(not(feature = "audio-output"))]
+        let audio_requested = false;
+        if audio_requested {
+            None
+        } else {
+            let streaming = Arc::new(AtomicBool::new(false));
+            let (setup_tx, setup_rx) = std::sync::mpsc::channel();
+            let shared = pw::PwShared {
+                jitter: jitter.clone(),
+                streaming,
+                quit: quit.clone(),
+                target_samples: state.effective_target.clone(),
+                peak_level: state.peak.clone(),
+            };
+            let thread = std::thread::Builder::new()
+                .name("openay-pipewire".into())
+                .spawn(move || pw::run_pipewire(shared, setup_tx))
+                .context("spawning PipeWire thread")?;
+            // A PipeWire setup failure ends the whole pipeline: record the
+            // error and set the quit flag (the engine reaps it on its next tick).
+            spawn_setup_monitor(quit.clone(), setup_rx, state, "PipeWire");
+            Some(thread)
+        }
+    };
+
+    #[cfg(all(not(feature = "pipewire"), not(feature = "audio-output")))]
     eprintln!("openay-server: built without PipeWire support — network+jitter only");
+    // With audio-output compiled in, only an explicit `--output` run has a
+    // consumer; claiming "network+jitter only" there would be misleading.
+    #[cfg(all(not(feature = "pipewire"), feature = "audio-output"))]
+    if !config.audio_output {
+        eprintln!("openay-server: no audio output requested — network+jitter only");
+    }
+
+    // Publish the run's config before `config` moves into the network task
+    // Publish the run's config before `config` moves into the network task
+    // (EngineConfig is never Copy — it carries the output-device String).
+    let config_for_state = config.clone();
+    *state.config.lock().expect("engine config mutex poisoned") = Some(config_for_state);
 
     let net = tokio::spawn(run_network(
         config,
@@ -693,12 +795,11 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
         jitter.clone(),
         ingest.clone(),
         state.effective_target.clone(),
-        config.target_ms,
+        base_target_ms,
         state.depth_params,
         quit.clone(),
     );
 
-    *state.config.lock().expect("engine config mutex poisoned") = Some(config);
     *state.jitter.lock().expect("engine jitter mutex poisoned") = Some(jitter.clone());
     *state.ingest.lock().expect("engine ingest mutex poisoned") = Some(ingest.clone());
     *state
@@ -715,6 +816,8 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
         retarget,
         #[cfg(feature = "pipewire")]
         pw_thread,
+        #[cfg(feature = "audio-output")]
+        audio_thread,
     })
 }
 
@@ -781,14 +884,17 @@ fn spawn_depth_controller(
     })
 }
 
-/// Watch the PipeWire setup channel. A setup failure (or an unexpected
-/// thread exit) stops the pipeline and records the error. A normal shutdown
-/// (Stop sets `quit` first) is not an error and is ignored.
-#[cfg(feature = "pipewire")]
-fn spawn_pw_monitor(
+/// Watch the setup channel of a spawned pipeline thread (`label` names the
+/// subsystem in the error strings — e.g. "PipeWire" or "audio output"). A
+/// setup failure (or an unexpected thread exit) stops the pipeline and
+/// records the error. A normal shutdown (Stop sets `quit` first) is not an
+/// error and is ignored.
+#[cfg(any(feature = "pipewire", feature = "audio-output"))]
+fn spawn_setup_monitor(
     quit: Arc<AtomicBool>,
     setup_rx: std::sync::mpsc::Receiver<Result<(), String>>,
     state: &Arc<EngineState>,
+    label: &'static str,
 ) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -799,13 +905,48 @@ fn spawn_pw_monitor(
             return;
         }
         let msg = match recv {
-            Ok(Ok(Err(e))) => format!("PipeWire setup failed: {e}"),
-            Ok(Ok(Ok(()))) => "PipeWire thread exited unexpectedly".to_string(),
-            Ok(Err(_)) | Err(_) => "PipeWire setup channel closed unexpectedly".to_string(),
+            Ok(Ok(Err(e))) => format!("{label} setup failed: {e}"),
+            Ok(Ok(Ok(()))) => format!("{label} thread exited unexpectedly"),
+            Ok(Err(_)) | Err(_) => format!("{label} setup channel closed unexpectedly"),
         };
         state.set_error(msg);
         quit.store(true, Ordering::Relaxed);
     });
+}
+
+/// Reap a pipeline output thread (PipeWire or audio output) that polls the
+/// quit flag every 50 ms: give it up to ~3 s to wind down, then report how
+/// it ended. A normal shutdown (quit set by Stop first) is silent.
+#[cfg(any(feature = "pipewire", feature = "audio-output"))]
+async fn reap_output_thread(
+    thread: std::thread::JoinHandle<anyhow::Result<()>>,
+    label: &'static str,
+    state: &Arc<EngineState>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if thread.is_finished() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "openay-server: {label} thread did not exit within 3 s; leaving it to process exit"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    match thread.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            // A real failure (e.g. a recorded audio stream error) must be
+            // visible to status()/GUI, not just on stderr.
+            let msg = format!("{label} error: {e:#}");
+            eprintln!("openay-server: {msg}");
+            state.set_error(msg);
+        }
+        Err(_) => eprintln!("openay-server: {label} thread panicked"),
+    }
 }
 
 /// Tear the pipeline down: signal quit, await the network task (which
@@ -834,26 +975,11 @@ async fn stop_pipeline(p: Pipeline, state: &Arc<EngineState>) {
 
     #[cfg(feature = "pipewire")]
     if let Some(thread) = p.pw_thread {
-        // Give the loop up to ~3 s to wind down (it polls the quit flag
-        // every 50 ms), then reap the thread.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if thread.is_finished() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                eprintln!(
-                    "openay-server: PipeWire thread did not exit within 3 s; leaving it to process exit"
-                );
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        match thread.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("openay-server: PipeWire error: {e:#}"),
-            Err(_) => eprintln!("openay-server: PipeWire thread panicked"),
-        }
+        reap_output_thread(thread, "PipeWire", state).await;
+    }
+    #[cfg(feature = "audio-output")]
+    if let Some(thread) = p.audio_thread {
+        reap_output_thread(thread, "audio output", state).await;
     }
 
     // The canonical stats line survives the stop; the snapshot counters do
@@ -1160,9 +1286,36 @@ mod tests {
             codec: CodecMode::Pcm,
             target_ms: 17.0,
             capacity_ms: 200.0,
+            audio_output: false,
+            output_device: Some("cable".to_string()),
         };
         let v = cfg.validated().unwrap();
-        assert_eq!(v, cfg, "already-valid config passes through unchanged");
+        assert_eq!(v.transport, Transport::Tcp);
+        assert_eq!(v.bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(v.port, 4321);
+        assert_eq!(v.codec, CodecMode::Pcm);
+        assert_eq!(v.target_ms, 17.0);
+        assert_eq!(v.capacity_ms, 200.0);
+        #[cfg(feature = "audio-output")]
+        {
+            assert!(!v.audio_output, "validation never enables audio output");
+            assert_eq!(v.output_device.as_deref(), Some("cable"));
+        }
+    }
+
+    /// The audio-output request passes through `validated()` untouched
+    /// (feature-gated: the fields only exist with the feature).
+    #[test]
+    #[cfg(feature = "audio-output")]
+    fn validated_passes_audio_output_through() {
+        let cfg = EngineConfig {
+            audio_output: true,
+            output_device: Some("cable".to_string()),
+            ..EngineConfig::default()
+        };
+        let v = cfg.validated().unwrap();
+        assert!(v.audio_output);
+        assert_eq!(v.output_device.as_deref(), Some("cable"));
     }
 
     #[test]
@@ -1186,6 +1339,11 @@ mod tests {
         assert_eq!(cfg.codec, CodecMode::Auto);
         assert_eq!(cfg.target_ms, 10.0);
         assert_eq!(cfg.capacity_ms, 100.0);
+        #[cfg(feature = "audio-output")]
+        {
+            assert!(!cfg.audio_output, "audio output is opt-in");
+            assert_eq!(cfg.output_device, None, "default device unless requested");
+        }
         assert!(cfg.validated().is_ok());
     }
 
@@ -1237,15 +1395,15 @@ mod tests {
     /// configured value (the depth controller then adjusts it from there).
     #[test]
     fn start_seeds_effective_target_with_config() {
-        let cfg = EngineConfig {
-            transport: Transport::Udp,
+        // A fresh config per call site (EngineConfig is not Copy with the
+        // audio-output feature, and both spawn defaults and Start carry one).
+        let cfg = || EngineConfig {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 41_701,
-            codec: CodecMode::Auto,
             target_ms: 12.0,
-            capacity_ms: 100.0,
+            ..EngineConfig::default()
         };
-        let handle = spawn_engine(Some(cfg));
+        let handle = spawn_engine(Some(cfg()));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1253,7 +1411,7 @@ mod tests {
         rt.block_on(async {
             handle
                 .cmd()
-                .send(EngineCommand::Start(cfg))
+                .send(EngineCommand::Start(cfg()))
                 .await
                 .expect("send Start");
         });

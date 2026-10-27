@@ -26,3 +26,6 @@ android/.idea/
 .vscode/
 .idea/
 .DS_Store
+
+# Windows build artifacts (produced by scripts/build_windows.sh)
+/dist/
