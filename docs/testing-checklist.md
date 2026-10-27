@@ -34,7 +34,8 @@ openay-server --features openay-server/pipewire`; Windows
 3. Speak; verify with a recording:
    `pw-cat --record --target openay_mic --rate 48000 --channels 1 --format s16 /tmp/t.wav`
    then `pw-play /tmp/t.wav`.
-4. Select "OpenAY Mic" as the microphone in Discord/OBS/Audacity; confirm speech.
+4. Select "OpenAY Mic" as the microphone in any VoIP or recording
+   application; confirm speech.
 5. Resilience probes: toggle phone ON AIR off/on (underrun + re-prebuffer in the
    log; audio recovers); pause 60 s (depth stays — no decay while idle); let it
    run 10 min (no drift).
@@ -47,10 +48,11 @@ openay-server --features openay-server/pipewire`; Windows
    transport/port; the phone's audio renders on the default output.
 2. Headless alternative: `.\openay-log.ps1 --list-devices` (pick a device name),
    then `.\openay-log.ps1 --transport udp --output`.
-3. As a microphone for apps: install VB-Cable (or similar), set "CABLE Input"
-   as the DEFAULT playback device in Windows Sound settings (GUI path), or
-   `--output-device "CABLE Input"` (headless path); in the consumer app select
-   "CABLE Output" as its microphone.
+3. As a microphone for apps: install a virtual-audio-cable driver (any
+   package that exposes a playback device routed to a recording device), set
+   the cable's playback side as the DEFAULT output in Windows Sound settings
+   (GUI path) or pass its name via `--output-device` (headless path); in the
+   consumer application select the cable's recording side as its microphone.
 4. USB path: `adb.exe forward tcp:41700 tcp:41700` → app TCP → 127.0.0.1:41700.
 5. Same resilience probes as Ubuntu; close the window / Ctrl-C; the log path
    is printed (openay-log.ps1 wraps the headless exe; the GUI writes its
