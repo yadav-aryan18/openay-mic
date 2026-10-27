@@ -17,7 +17,7 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -25,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libopus-dev libpipewire-0.3-dev \
+            libopus-dev libpipewire-0.3-dev libdbus-1-dev \
             clang libclang-dev \
             cmake ninja-build g++ pkg-config
       - name: Rust workspace tests
@@ -43,8 +43,26 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      # audiopus_sys's own CMake build of libopus fails on Windows runners;
+      # prebuild a static /MT libopus with intrinsics disabled and hand it to
+      # the build script via its LIBOPUS_LIB_DIR escape hatch (same recipe as
+      # scripts/build_windows.sh).
+      - name: Prebuild static libopus for audiopus_sys
+        shell: pwsh
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+          $opusSrc = Get-ChildItem "$cargoHome/registry/src/*/audiopus_sys-*/opus" -Directory |
+            Sort-Object Name -Descending | Select-Object -First 1
+          $prefix = "$PWD/target/xwin-libopus"
+          cmake -S $opusSrc.FullName -B $prefix/build `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX=$prefix -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DOPUS_DISABLE_INTRINSICS=ON -DOPUS_BUILD_SHARED_LIBRARY=OFF `
+            -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF
+          cmake --build $prefix/build --config Release --target install
+          "LIBOPUS_LIB_DIR=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Headless receiver tests
         working-directory: desktop
         run: cargo test -p openay-server
