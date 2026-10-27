@@ -212,7 +212,7 @@ build_prebuilt_opus() { # -> 0 on success
   write_opus_toolchain "$tc" "$llvm_ar" || return 1
   cmake -S "$OPUS_SRC" -B "$OPUS_PREFIX/build" -G Ninja \
       -DCMAKE_TOOLCHAIN_FILE="$tc/x86_64-pc-windows-msvc-toolchain.cmake" \
-      -DCMAKE_POLICY_DEFAULT_CMP0091=NEW \
+      -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$OPUS_PREFIX" \
       -DOPUS_DISABLE_INTRINSICS=ON -DOPUS_BUILD_SHARED_LIBRARY=OFF \
       -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF >>"$LOG" 2>&1 &&

@@ -68,7 +68,7 @@ jobs:
             Sort-Object Name -Descending | Select-Object -First 1
           $prefix = "$PWD/target/xwin-libopus"
           cmake -S $opusSrc.FullName -B $prefix/build `
-            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_INSTALL_PREFIX=$prefix -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
             -DOPUS_DISABLE_INTRINSICS=ON -DOPUS_BUILD_SHARED_LIBRARY=OFF `
             -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF
