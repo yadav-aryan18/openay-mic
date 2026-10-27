@@ -27,7 +27,22 @@ jobs:
           sudo apt-get install -y \
             libopus-dev libpipewire-0.3-dev libdbus-1-dev \
             clang libclang-dev \
-            cmake ninja-build g++ pkg-config
+            cmake ninja-build g++ pkg-config \
+            pipewire pipewire-bin wireplumber
+      # The engine's PipeWire-arm integration tests need a live daemon: run a
+      # minimal headless stack (daemon + session manager) on the standard
+      # user socket. No audio hardware is required for the virtual source.
+      - name: Start headless PipeWire daemon
+        run: |
+          mkdir -p /tmp/xdg
+          chmod 700 /tmp/xdg
+          echo "XDG_RUNTIME_DIR=/tmp/xdg" | Out-File -FilePath $env:GITHUB_ENV -Append 2>/dev/null || echo "XDG_RUNTIME_DIR=/tmp/xdg" >> "$GITHUB_ENV"
+          nohup pipewire >/tmp/pipewire.log 2>&1 &
+          sleep 1
+          nohup wireplumber >/tmp/wireplumber.log 2>&1 &
+          sleep 2
+          XDG_RUNTIME_DIR=/tmp/xdg pw-cli info 0 >/dev/null
+          echo "PipeWire daemon reachable"
       - name: Rust workspace tests
         working-directory: desktop
         run: cargo test --workspace
