@@ -106,6 +106,10 @@ pub struct App {
     autostart: bool,
     start_minimized: bool,
     reduce_motion: bool,
+    // Windows output-device selection (persisted; None = system default).
+    // No in-app picker yet — routing is configured via Windows Sound
+    // settings / the virtual cable's default-device state.
+    output_device: Option<String>,
     dirty: bool,
     // Persistence
     config: Config,
@@ -158,6 +162,7 @@ impl App {
         let autostart = config.autostart;
         let start_minimized = config.start_minimized;
         let reduce_motion = config.reduce_motion;
+        let output_device = config.output_device.clone();
         let bind_options = get_local_ips(&bind_input);
         let initial_status = flags.engine.status();
 
@@ -187,6 +192,7 @@ impl App {
             autostart,
             start_minimized,
             reduce_motion,
+            output_device,
             dirty: false,
             config,
             config_path: flags.config_path,
@@ -362,7 +368,7 @@ impl App {
             }
         }
         if self.tray_bus.take_start() {
-            tasks.push(self.engine_cmd(EngineCommand::Start(self.engine_cfg)));
+            tasks.push(self.engine_cmd(EngineCommand::Start(self.engine_cfg.clone())));
         }
         if self.tray_bus.take_stop() {
             tasks.push(self.engine_cmd(EngineCommand::Stop));
@@ -393,7 +399,7 @@ impl App {
                 self.stagger = true;
                 self.stagger_t = 0.0;
             }
-            self.engine_cmd(EngineCommand::Start(self.engine_cfg))
+            self.engine_cmd(EngineCommand::Start(self.engine_cfg.clone()))
         }
     }
 
@@ -435,6 +441,7 @@ impl App {
             autostart: self.autostart,
             start_minimized: self.start_minimized,
             reduce_motion: self.reduce_motion,
+            output_device: self.output_device.clone(),
         };
         let engine_cfg = cfg.to_engine();
 
@@ -449,7 +456,7 @@ impl App {
         let was_running = self.status.running;
 
         self.config = cfg.clone();
-        self.engine_cfg = engine_cfg;
+        self.engine_cfg = engine_cfg.clone();
         self.dirty = false;
 
         // Persist + (if running) restart the engine with the new config.

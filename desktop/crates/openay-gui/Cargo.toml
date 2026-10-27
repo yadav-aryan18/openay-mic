@@ -10,19 +10,29 @@ name = "openay-gui"
 path = "src/main.rs"
 
 [dependencies]
-# The GUI always ships the PipeWire virtual microphone: a network-only
-# console would render meters against a silent engine (this exact mismatch
-# bit us — see the VU/ring dead-meter fix).
-openay-server = { path = "../openay-server", features = ["pipewire"] }
+# Platform output backend, selected by target: the SAME console ships with
+# the PipeWire virtual microphone on Linux and WASAPI playback (cpal
+# audio-output) on Windows — one GUI source, one engine, per-OS audio arm.
+# Base entry carries no features; the target tables add exactly one.
+openay-server = { path = "../openay-server" }
 # Software renderer only (tiny-skia, NOT wgpu); tokio integration for the
 # async engine commands; canvas for the custom-drawn instruments.
 iced = { version = "0.13", default-features = false, features = ["tiny-skia", "tokio", "canvas"] }
-ksni = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 anyhow = "1"
 dirs = "6"
 if-addrs = "0.15"
+
+[target.'cfg(not(windows))'.dependencies]
+# Linux (and every other Unix): the virtual microphone is the product.
+openay-server = { path = "../openay-server", features = ["pipewire"] }
+ksni = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Windows: local playback via cpal/WASAPI (a system-wide virtual mic needs
+# a kernel driver — out of scope; see README-WINDOWS.txt).
+openay-server = { path = "../openay-server", features = ["audio-output"] }
 
 [dev-dependencies]
 # Headless layout probing in unit tests (same version as the iced tree).

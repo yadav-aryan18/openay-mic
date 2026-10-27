@@ -263,13 +263,14 @@ FEATURES="--features audio-output"
 echo "== Windows cross-build (cargo xwin build --release) =="
 XWIN_OK=1
 if command -v cargo-xwin >/dev/null 2>&1; then
-  (cd desktop && cargo xwin build --release --target "$TARGET" -p openay-server $FEATURES >>"$LOG" 2>&1)
+  (cd desktop && cargo xwin build --release --target "$TARGET" -p openay-server -p openay-gui $FEATURES >>"$LOG" 2>&1)
   XWIN_OK=$?
 fi
-check "cargo xwin build openay-server" "$XWIN_OK"
+check "cargo xwin build openay-server + openay-gui" "$XWIN_OK"
 
 echo "== Dist staging =="
 EXE="desktop/target/$TARGET/release/openay-server.exe"
+GUI_EXE="desktop/target/$TARGET/release/openay-gui.exe"
 EXE_OK=1
 if [ "$XWIN_OK" -eq 0 ] && [ -f "$ROOT/$EXE" ]; then
   rm -rf "$DIST"
@@ -281,6 +282,14 @@ else
   mkdir -p "$DIST"   # still stage the docs below
 fi
 check "copy openay-server.exe -> dist/openay-windows/" "$EXE_OK"
+
+# The GUI console (same Iced app as Linux; WASAPI output on Windows).
+GUI_OK=1
+if [ "$XWIN_OK" -eq 0 ] && [ -f "$ROOT/$GUI_EXE" ]; then
+  cp -f "$ROOT/$GUI_EXE" "$DIST/"
+  GUI_OK=0
+fi
+check "copy openay-gui.exe -> dist/openay-windows/" "$GUI_OK"
 
 README_OK=1
 if [ -f "$README_WIN" ]; then

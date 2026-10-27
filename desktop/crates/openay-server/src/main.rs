@@ -106,6 +106,8 @@ async fn main() -> Result<()> {
 
     let bind = resolve_bind(&args.bind, args.port).await?;
     let config = EngineConfig {
+        audio_output: args.output,
+        output_device: args.output_device.clone(),
         transport: match args.transport {
             TransportArg::Udp => Transport::Udp,
             TransportArg::Tcp => Transport::Tcp,
@@ -119,21 +121,14 @@ async fn main() -> Result<()> {
         },
         target_ms,
         capacity_ms: args.capacity_ms,
-        #[cfg(feature = "audio-output")]
-        audio_output: args.output,
-        #[cfg(feature = "audio-output")]
-        output_device: args.output_device.clone(),
     }
     .validated()
     .map_err(|e: ConfigError| anyhow::anyhow!(e))?;
 
     // The config is both the standby defaults for the handle and the first
-    // Start payload; clone it only when the audio-output feature makes
-    // EngineConfig non-Copy (identical observable behavior either way).
-    #[cfg(feature = "audio-output")]
+    // Start payload (EngineConfig is never Copy — clone for the handle, move
+    // into the Start payload below).
     let handle = spawn_engine(Some(config.clone()));
-    #[cfg(not(feature = "audio-output"))]
-    let handle = spawn_engine(Some(config));
 
     // Cold-start contract: spawn_engine never binds or starts a pipeline —
     // the config it was given is just the defaults for the first Start. Send

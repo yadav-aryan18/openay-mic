@@ -17,7 +17,12 @@ use openay_server::{CodecMode, EngineConfig, Transport};
 /// Config file name inside the config dir.
 pub const CONFIG_FILE: &str = "config.toml";
 /// Autostart entry file name (in `~/.config/autostart/`).
+/// Autostart entry file name: a freedesktop `.desktop` entry on Linux/Unix,
+/// a `.cmd` launcher dropped into the Startup folder on Windows.
+#[cfg(unix)]
 pub const AUTOSTART_FILE: &str = "openay-mic.desktop";
+#[cfg(windows)]
+pub const AUTOSTART_FILE: &str = "openay-mic.cmd";
 /// Directory the app keeps its config in (relative to the XDG config dir).
 pub const CONFIG_DIR: &str = "openay-mic";
 /// Default listen port (protocol spec).
@@ -40,6 +45,9 @@ pub struct Config {
     pub start_minimized: bool,
     /// Drop cable pulses and the power-on stagger (accessibility).
     pub reduce_motion: bool,
+    /// Windows: case-insensitive substring of the output device to render
+    /// into (`None` = system default). Unused on Linux (PipeWire routing).
+    pub output_device: Option<String>,
 }
 
 impl Default for Config {
@@ -52,6 +60,7 @@ impl Default for Config {
             autostart: false,
             start_minimized: false,
             reduce_motion: false,
+            output_device: None,
         }
     }
 }
@@ -67,6 +76,13 @@ impl Config {
     }
 
     /// The config as an engine config (bind parsed; unparseable -> 0.0.0.0).
+    ///
+    /// The output request is the platform's product surface: on Linux the
+    /// PipeWire virtual microphone (audio_output stays false), on Windows
+    /// WASAPI playback on the chosen device (the audio-output feature is
+    /// enabled there by the GUI's dependency table). Device routing is
+    /// configured in the OS's own way on each platform (WirePlumber /
+    /// Windows Sound settings).
     pub fn to_engine(&self) -> EngineConfig {
         let bind = self
             .bind
@@ -79,6 +95,8 @@ impl Config {
             codec: self.codec_mode(),
             target_ms: self.target_ms,
             capacity_ms: 100.0,
+            audio_output: cfg!(windows),
+            output_device: self.output_device.clone(),
         }
     }
 }
@@ -90,10 +108,26 @@ pub fn config_dir() -> Result<PathBuf> {
     Ok(base.join(CONFIG_DIR))
 }
 
-/// The autostart directory: `$XDG_CONFIG_HOME/autostart`.
+/// The autostart directory: `$XDG_CONFIG_HOME/autostart` on Unix, the
+/// per-user Startup folder (`%APPDATA%\Microsoft\Windows\Start
+/// Menu\Programs\Startup`) on Windows.
+#[cfg(unix)]
 pub fn autostart_dir() -> Result<PathBuf> {
     let base = dirs::config_dir().context("no XDG config home")?;
     Ok(base.join("autostart"))
+}
+
+#[cfg(windows)]
+pub fn autostart_dir() -> Result<PathBuf> {
+    // dirs exposes XDG-style bases only; the per-user Startup folder hangs
+    // off the Roaming profile, which `dirs::config_dir` also resolves to.
+    let base = dirs::config_dir().context("no Roaming AppData directory")?;
+    Ok(base
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup"))
 }
 
 /// The config file path.
@@ -136,6 +170,7 @@ pub fn save_config(config: &Config, path: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// The `.desktop` autostart entry for this binary (`$argv0`).
+#[cfg(unix)]
 pub fn autostart_entry(exec_path: &str) -> String {
     format!(
         "[Desktop Entry]\n\
@@ -160,6 +195,7 @@ pub struct AutostartEntry {
 
 /// Parse a `.desktop` entry; returns `None` if it is not an `Application`
 /// entry or lacks an `Exec` line.
+#[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_autostart(contents: &str) -> Option<AutostartEntry> {
     let mut exec = None;
@@ -207,6 +243,26 @@ pub fn remove_autostart(path: &Path) -> Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
     }
+}
+
+/// The Windows autostart entry: a minimal launcher script. `start ""` with
+/// the quoted path detaches the console launch from the script.
+#[cfg(windows)]
+pub fn autostart_entry(exec_path: &str) -> String {
+    format!("@start \"\" \"{exec_path}\"\r\n")
+}
+
+/// The Windows parse counterpart: a `.cmd` entry is whatever non-empty
+/// launcher text was written (the Exec line is reconstructed loosely).
+#[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse_autostart(contents: &str) -> Option<AutostartEntry> {
+    let exec = contents.lines().find(|l| l.starts_with("@start"))?;
+    Some(AutostartEntry {
+        exec: exec.to_string(),
+        name: "OpenAY Mic".to_string(),
+        enabled: true,
+    })
 }
 
 /// Apply the `autostart` preference: writes or removes the entry using
@@ -279,6 +335,7 @@ mod tests {
             autostart: true,
             start_minimized: true,
             reduce_motion: true,
+            output_device: Some("CABLE Input".to_string()),
         };
         let text = config_to_toml(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
@@ -297,6 +354,7 @@ mod tests {
             autostart: false,
             start_minimized: true,
             reduce_motion: false,
+            output_device: None,
         };
         save_config(&cfg, &path).unwrap();
         let loaded = load_config(&path).unwrap();

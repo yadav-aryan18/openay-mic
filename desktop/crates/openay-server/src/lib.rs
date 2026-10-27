@@ -137,10 +137,15 @@ impl CodecMode {
 /// feature: they are cfg-gated (like the fields they drive) so the headless
 /// and PipeWire-only builds keep byte-identical semantics — an `EngineConfig`
 /// without the feature simply cannot express an audio-output request, and the
-/// CLI rejects `--output` in such builds with a clean error (the Bluetooth
-/// pattern, where an unrepresentable request cannot reach the engine).
+/// The two output fields exist in EVERY build (platform parity): on Linux
+/// the GUI leaves them unset (the PipeWire virtual mic is the output), on
+/// Windows it sets `audio_output` (WASAPI playback). Requesting playback in
+/// a build without the `audio-output` feature fails cleanly at Start (the
+/// Bluetooth pattern — a loud, explicit capability error, never silence).
+///
+/// `EngineConfig` is `Clone` but deliberately NOT `Copy` (`output_device`
+/// holds a `String`); call sites that used to copy must clone explicitly.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(feature = "audio-output"), derive(Copy))]
 pub struct EngineConfig {
     pub transport: Transport,
     pub bind: IpAddr,
@@ -153,14 +158,12 @@ pub struct EngineConfig {
     pub capacity_ms: f32,
     /// Play the decoded audio on a platform output device (cpal: ALSA on
     /// Linux, WASAPI on Windows) instead of the PipeWire virtual microphone.
-    /// Requires the `audio-output` feature. When set, the audio thread takes
-    /// precedence over the `pipewire` feature's virtual mic (an explicit
-    /// playback request wins over the implicit virtual source).
-    #[cfg(feature = "audio-output")]
+    /// Requires the `audio-output` build feature at Start; when set, the
+    /// audio thread takes precedence over the `pipewire` feature's virtual
+    /// mic (an explicit playback request wins over the implicit source).
     pub audio_output: bool,
     /// Case-insensitive substring selecting the output device (`None` = the
     /// host default). Only consulted while `audio_output` is set.
-    #[cfg(feature = "audio-output")]
     pub output_device: Option<String>,
 }
 
@@ -173,9 +176,7 @@ impl Default for EngineConfig {
             codec: CodecMode::Auto,
             target_ms: 10.0,
             capacity_ms: DEFAULT_CAPACITY_MS,
-            #[cfg(feature = "audio-output")]
             audio_output: false,
-            #[cfg(feature = "audio-output")]
             output_device: None,
         }
     }
@@ -276,13 +277,9 @@ pub struct EngineStatus {
     pub effective_target_ms: f32,
 }
 
-/// Commands sent to the engine.
-///
-/// `Copy` is only derivable without the `audio-output` feature (`Start`
-/// carries [`EngineConfig`], which gains a `String`-holding field with that
-/// feature); callers that rely on `Copy` are compiled without the feature.
+/// Commands sent to the engine (`Clone`, never `Copy` — `Start` carries
+/// [`EngineConfig`], which holds an output-device `String`).
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(feature = "audio-output"), derive(Copy))]
 pub enum EngineCommand {
     /// Start (or restart with) the given config. A running pipeline is
     /// stopped first.
@@ -321,11 +318,7 @@ impl EngineHandle {
                 .config
                 .lock()
                 .expect("engine config mutex poisoned");
-            #[cfg(feature = "audio-output")]
-            let cfg = guard.clone();
-            #[cfg(not(feature = "audio-output"))]
-            let cfg = *guard;
-            cfg
+            guard.clone()
         }
         .unwrap_or_default();
         // Always consume the peak accumulator (it is stale once stopped);
@@ -689,6 +682,12 @@ impl Pipeline {
 /// therefore never surfaces stale numbers).
 async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Result<Pipeline> {
     let config = config.validated().map_err(|e| anyhow::anyhow!(e))?;
+    #[cfg(not(feature = "audio-output"))]
+    if config.audio_output {
+        return Err(anyhow::anyhow!(
+            "built without audio output support (rebuild with --features audio-output)"
+        ));
+    }
     state.clear_error();
     state.clear_last_stats_line();
     state.peak.store(0, Ordering::Relaxed);
@@ -780,12 +779,9 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
     }
 
     // Publish the run's config before `config` moves into the network task
-    // (a clone with the audio-output feature, where EngineConfig is not Copy;
-    // a plain move otherwise — identical observable behavior).
-    #[cfg(feature = "audio-output")]
+    // Publish the run's config before `config` moves into the network task
+    // (EngineConfig is never Copy — it carries the output-device String).
     let config_for_state = config.clone();
-    #[cfg(not(feature = "audio-output"))]
-    let config_for_state = config;
     *state.config.lock().expect("engine config mutex poisoned") = Some(config_for_state);
 
     let net = tokio::spawn(run_network(
@@ -1290,9 +1286,7 @@ mod tests {
             codec: CodecMode::Pcm,
             target_ms: 17.0,
             capacity_ms: 200.0,
-            #[cfg(feature = "audio-output")]
             audio_output: false,
-            #[cfg(feature = "audio-output")]
             output_device: Some("cable".to_string()),
         };
         let v = cfg.validated().unwrap();

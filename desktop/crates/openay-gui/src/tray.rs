@@ -1,17 +1,30 @@
-//! System tray icon via ksni (freedesktop StatusNotifierItem), on a
-//! dedicated thread.
+//! System tray icon: ksni (freedesktop StatusNotifierItem) on Unix, on a
+//! dedicated thread; window-only (no tray) on Windows.
 //!
 //! The tray mirrors the engine state (idle / armed / live) with three
 //! generated 24x24 pixmaps and exposes Show Console / Start / Stop / Quit.
 //! Requests flow to the GUI through a shared [`TrayBus`] of atomics that the
 //! application consumes on each tick (the tray has no access to the GUI's
 //! window or config).
+//!
+//! Platform split: [`TrayBus`] and the state constants are the
+//! platform-neutral contract (pure atomics); only the ksni service is
+//! Unix-specific. On Windows [`spawn_tray`] deliberately fails — `main`
+//! already treats a missing tray as "window-only mode" (the window close
+//! button quits, `--minimized` is ignored), which is the documented
+//! behavior there. Windows tray support would need a Win32 tray-icon
+//! integration into iced's event loop; not built yet.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+#[cfg(unix)]
+use anyhow::Result;
+#[cfg(windows)]
+use anyhow::{anyhow, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 
-use anyhow::Result;
-
+#[cfg(unix)]
 use crate::icons;
 
 /// Tray states, in the same order as `icons::ICONS`.
@@ -29,6 +42,7 @@ pub struct TrayBus {
 }
 
 impl TrayBus {
+    #[cfg(unix)]
     fn request(&self, which: &AtomicBool) {
         which.store(true, Ordering::Relaxed);
     }
@@ -59,10 +73,12 @@ impl TrayBus {
 }
 
 /// Owned handle to the running tray service.
+#[cfg(unix)]
 pub struct TrayHandle {
     handle: ksni::Handle<AppIndicator>,
 }
 
+#[cfg(unix)]
 impl TrayHandle {
     /// Update the tray icon + tooltip state (idle/armed/live).
     pub fn set_state(&self, state: u8) {
@@ -71,9 +87,20 @@ impl TrayHandle {
     }
 }
 
-/// Spawn the tray and return a handle. Start/Stop requests are routed
-/// through the [`TrayBus`] and serviced by the GUI's tick (which owns the
-/// config).
+/// Windows stub: the app runs window-only (no Win32 tray integration yet).
+#[cfg(windows)]
+pub struct TrayHandle;
+
+#[cfg(windows)]
+impl TrayHandle {
+    /// No-op on Windows (no tray to update).
+    pub fn set_state(&self, _state: u8) {}
+}
+
+/// Unix: spawn the ksni tray and return a handle. Start/Stop requests are
+/// routed through the [`TrayBus`] and serviced by the GUI's tick (which owns
+/// the config).
+#[cfg(unix)]
 pub fn spawn_tray(bus: Arc<TrayBus>) -> Result<TrayHandle> {
     let indicator = AppIndicator {
         state: Arc::new(AtomicU8::new(STATE_IDLE)),
@@ -85,12 +112,24 @@ pub fn spawn_tray(bus: Arc<TrayBus>) -> Result<TrayHandle> {
     Ok(TrayHandle { handle })
 }
 
+/// Windows: fail cleanly — main falls back to window-only mode with a
+/// one-line warning, exactly like a Unix desktop without a
+/// StatusNotifierWatcher.
+#[cfg(windows)]
+pub fn spawn_tray(_bus: Arc<TrayBus>) -> Result<TrayHandle> {
+    Err(anyhow!(
+        "system tray not supported on this platform yet (window-only mode)"
+    ))
+}
+
 /// The ksni StatusNotifierItem implementation.
+#[cfg(unix)]
 struct AppIndicator {
     state: Arc<AtomicU8>,
     bus: Arc<TrayBus>,
 }
 
+#[cfg(unix)]
 impl AppIndicator {
     fn show(&mut self) {
         self.bus.request(&self.bus.show);
@@ -123,6 +162,7 @@ impl AppIndicator {
     }
 }
 
+#[cfg(unix)]
 impl ksni::Tray for AppIndicator {
     fn id(&self) -> String {
         "openay-mic".to_string()

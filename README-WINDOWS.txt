@@ -55,6 +55,23 @@ Audio output options
 feature (enabled in the distributed exe); a build without it still
 receives on the network but has no playback.
 
+The GUI console (openay-gui.exe)
+--------------------------------
+The dist also ships openay-gui.exe — the same studio console as on Linux
+(The Chain, VU ladder, ON AIR toggle, settings slide-over, persisted
+config), rendering the phone's audio with WASAPI instead of PipeWire:
+
+    .\openay-gui.exe
+
+It starts stopped (cold); press ON AIR, pick transport/port like on Linux.
+Audio renders on the system DEFAULT output device — to feed other apps,
+install a virtual audio cable, set "CABLE Input" as the default playback
+device in Windows Sound settings, and select "CABLE Output" in the consumer
+app (or edit output_device in %APPDATA%\openay-mic\config.toml).
+Differences from Linux, on purpose: no system tray (window close quits —
+same contract), autostart uses the Startup folder, audio routing happens
+in Windows Sound settings instead of WirePlumber.
+
 Collecting logs for bug reports
 -------------------------------
 Use the wrapper instead of the bare exe and every session is captured

@@ -1,9 +1,12 @@
+#![cfg_attr(windows, allow(dead_code))]
 //! Tray icon pixel data, generated ONCE by `tools/gen_icons.py`
 //! (committed generator; rerun it to regenerate). Each icon is a 24x24 RGBA
 //! bitmap consumed by the ksni StatusNotifierItem (raw pixmap, no PNG
 //! decoding needed).
 
 /// Icon states, in the same order as the tray states.
+// The pixmap set feeds the Unix (ksni) tray only; the Windows build ships
+// window-only today, so the constants are dead there.
 pub const ICONS: [&[u8]; 3] = [&IDLE, &ARMED, &LIVE];
 
 /// 24x24 RGBA tray icon (`idle`).
