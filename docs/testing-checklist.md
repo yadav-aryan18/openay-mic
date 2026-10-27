@@ -9,7 +9,8 @@ with logging wired in so any misbehavior is captured for debugging.
 |----|-----|------|--------------|
 | Ubuntu | GUI console | `~/dev/OpenAY-Mic` → `scripts/devlog.sh --gui` | `openay_mic` virtual source (select as mic in any app) |
 | Ubuntu | Headless server | `scripts/devlog.sh` | same, no window |
-| Windows | Receiver exe | `WD-SN570 drive:\openay-mic-win\dist\openay-windows\` → `.\openay-log.ps1 --output` | plays on the chosen output device (virtual cable = mic for apps) |
+| Windows | GUI console | same folder → `openay-gui.exe` | same as the Linux GUI; audio on the default output device |
+| Windows | Receiver exe | same folder → `.\openay-log.ps1 --output` | plays on the chosen output device (virtual cable = mic for apps) |
 
 Builds are refreshed with: Ubuntu `cargo build --release -p openay-gui -p
 openay-server --features openay-server/pipewire`; Windows
@@ -41,14 +42,19 @@ openay-server --features openay-server/pipewire`; Windows
 
 ## Windows session (10 minutes)
 
-1. In `dist\openay-windows\`: `.\openay-log.ps1 --list-devices` (pick a device name).
-2. Plain monitoring: `.\openay-log.ps1 --transport udp --output` → start the phone →
-   hear the tone/voice on the default output.
-3. As a microphone for apps: install VB-Cable (or similar), then
-   `.\openay-log.ps1 --transport udp --output --output-device "CABLE Input"`;
-   in the consumer app select "CABLE Output" as its microphone.
+1. In `dist\openay-windows\`: launch `openay-gui.exe` — the same console as
+   Ubuntu (ON AIR toggle, settings, meters). Press ON AIR after setting the
+   transport/port; the phone's audio renders on the default output.
+2. Headless alternative: `.\openay-log.ps1 --list-devices` (pick a device name),
+   then `.\openay-log.ps1 --transport udp --output`.
+3. As a microphone for apps: install VB-Cable (or similar), set "CABLE Input"
+   as the DEFAULT playback device in Windows Sound settings (GUI path), or
+   `--output-device "CABLE Input"` (headless path); in the consumer app select
+   "CABLE Output" as its microphone.
 4. USB path: `adb.exe forward tcp:41700 tcp:41700` → app TCP → 127.0.0.1:41700.
-5. Same resilience probes as Ubuntu; Ctrl-C; the log path is printed.
+5. Same resilience probes as Ubuntu; close the window / Ctrl-C; the log path
+   is printed (openay-log.ps1 wraps the headless exe; the GUI writes its
+   config to %APPDATA%\openay-mic\).
 
 ## If something misbehaves
 
