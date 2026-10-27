@@ -36,13 +36,13 @@ jobs:
         run: |
           mkdir -p /tmp/xdg
           chmod 700 /tmp/xdg
-          echo "XDG_RUNTIME_DIR=/tmp/xdg" | Out-File -FilePath $env:GITHUB_ENV -Append 2>/dev/null || echo "XDG_RUNTIME_DIR=/tmp/xdg" >> "$GITHUB_ENV"
+          echo "XDG_RUNTIME_DIR=/tmp/xdg" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR=/tmp/xdg
           nohup pipewire >/tmp/pipewire.log 2>&1 &
           sleep 1
           nohup wireplumber >/tmp/wireplumber.log 2>&1 &
           sleep 2
-          XDG_RUNTIME_DIR=/tmp/xdg pw-cli info 0 >/dev/null
-          echo "PipeWire daemon reachable"
+          pw-cli info 0 >/dev/null && echo "PipeWire daemon reachable"
       - name: Rust workspace tests
         working-directory: desktop
         run: cargo test --workspace
@@ -65,6 +65,7 @@ jobs:
       # the build script via its LIBOPUS_LIB_DIR escape hatch (same recipe as
       # scripts/build_windows.sh).
       - name: Prebuild static libopus for audiopus_sys
+        working-directory: desktop
         shell: pwsh
         run: |
           cargo fetch --target x86_64-pc-windows-msvc
