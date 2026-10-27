@@ -37,7 +37,7 @@
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crate::{MAX_PREBUFFER_MS, MIN_PREBUFFER_MS};
+use crate::{MAX_PREBUFFER_MS, MIN_PREBUFFER_MS, TARGET_PREBUFFER_MS};
 
 /// A clock readable as an elapsed [`Duration`].
 ///
@@ -93,7 +93,11 @@ impl DepthParams {
     /// Clamp the knobs to safe values (non-negative steps, hold ≥ 1 ms so
     /// the window always advances).
     fn sanitized(self) -> Self {
-        let window = if self.decay_window.is_zero() {
+        // Sub-millisecond windows are rejected: the decay loop advances one
+        // window per iteration, and a 1 ns window over a 200 ms tick would
+        // spin ~2*10^5 iterations per tick (multi-second hangs measured with
+        // a 1 ns window). The documented floor is 1 ms.
+        let window = if self.decay_window < Duration::from_millis(1) {
             Duration::from_millis(1)
         } else {
             self.decay_window
@@ -168,7 +172,14 @@ impl<C: Clock> DepthController<C> {
     /// `[MIN_PREBUFFER_MS, MAX_PREBUFFER_MS]`; params are sanitized
     /// (non-negative steps, hold ≥ 1 ms).
     pub fn with_params(clock: C, base_ms: f32, params: DepthParams) -> Self {
-        let base_ms = base_ms.clamp(MIN_PREBUFFER_MS, MAX_PREBUFFER_MS);
+        // NaN passes through f32::clamp unchanged and would silently disable
+        // both the decay floor (f32::max ignores NaN) and the rise ceiling —
+        // a non-finite base falls back to the nominal target instead.
+        let base_ms = if base_ms.is_finite() {
+            base_ms.clamp(MIN_PREBUFFER_MS, MAX_PREBUFFER_MS)
+        } else {
+            TARGET_PREBUFFER_MS
+        };
         DepthController {
             clock,
             params: params.sanitized(),
@@ -279,6 +290,53 @@ mod tests {
             },
         );
         (clock, c)
+    }
+
+    #[test]
+    fn sub_millisecond_window_is_clamped_to_one_ms() {
+        // A 1 ns window would spin the decay loop ~2*10^5 iterations per
+        // 200 ms tick (multi-second hangs measured); sanitized() clamps to
+        // 1 ms so one tick after 200 ms applies exactly 200 bounded steps
+        // and lands on the floor.
+        let clock = FakeClock::new();
+        let mut c = DepthController::with_params(
+            clock.clone(),
+            5.0, // the decay floor
+            DepthParams {
+                rise_ms: 2.0,
+                decay_window: Duration::from_nanos(1),
+                decay_step_ms: 1.0,
+            },
+        );
+        c.on_underrun(); // raise to 7 ms and arm the window at t=0
+        clock.advance(Duration::from_millis(200));
+        let t0 = std::time::Instant::now();
+        let target = c.on_tick(true);
+        // The unclamped 1 ns window spins ~2*10^8 iterations here (4.4 s
+        // measured); the 1 ms clamp makes this tick bounded and fast.
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "sub-ms window must not spin the decay loop"
+        );
+        assert_eq!(
+            target, 5.0,
+            "200 bounded steps of 1 ms decay floor out at the base"
+        );
+    }
+
+    #[test]
+    fn non_finite_base_falls_back_to_nominal_target() {
+        // NaN passes f32::clamp unchanged and would disable both the decay
+        // floor and the rise ceiling; the constructor falls back instead.
+        let (clock, mut c) = controller_60s(f32::NAN);
+        assert_eq!(c.on_tick(true), TARGET_PREBUFFER_MS);
+        c.on_underrun();
+        assert_eq!(c.target_ms(), TARGET_PREBUFFER_MS + 2.0);
+        // Decay floors at the recovered base instead of sinking unbounded:
+        // 120 windows x 1 ms step = 120 ms of decay from 12 ms -> the base.
+        c.on_tick(true); // arm the post-underrun window
+        clock.advance(Duration::from_secs(120));
+        assert_eq!(c.on_tick(true), TARGET_PREBUFFER_MS);
     }
 
     #[test]

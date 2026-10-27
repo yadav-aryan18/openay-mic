@@ -182,10 +182,14 @@ impl Default for EngineConfig {
 }
 
 /// Errors from [`EngineConfig::validated`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConfigError {
     /// Port 0 is not a valid listen port for a session.
     InvalidPort(u16),
+    /// A non-finite `target_ms` (NaN/+inf/-inf, e.g. from a corrupt config
+    /// file or `--target-ms nan`): `f32::clamp` passes NaN through and the
+    /// sample conversion would saturate the prebuffer latch to 0 samples.
+    InvalidTargetMs(f32),
 }
 
 impl fmt::Display for ConfigError {
@@ -193,6 +197,9 @@ impl fmt::Display for ConfigError {
         match self {
             ConfigError::InvalidPort(port) => {
                 write!(f, "invalid port {port}: must be in 1..=65535")
+            }
+            ConfigError::InvalidTargetMs(v) => {
+                write!(f, "invalid target_ms {v}: must be a finite number of milliseconds")
             }
         }
     }
@@ -204,10 +211,15 @@ impl EngineConfig {
     /// Validate and normalize a config:
     ///
     /// - `port` must be `1..=65535` (otherwise `Err(InvalidPort)`);
+    /// - `target_ms` must be finite (otherwise `Err(InvalidTargetMs)` — a
+    ///   NaN would survive the clamp below and zero the prebuffer latch);
     /// - `target_ms` is clamped into `[MIN_PREBUFFER_MS, MAX_PREBUFFER_MS]`.
     pub fn validated(self) -> Result<EngineConfig, ConfigError> {
         if self.port == 0 {
             return Err(ConfigError::InvalidPort(self.port));
+        }
+        if !self.target_ms.is_finite() {
+            return Err(ConfigError::InvalidTargetMs(self.target_ms));
         }
         Ok(EngineConfig {
             target_ms: self.target_ms.clamp(MIN_PREBUFFER_MS, MAX_PREBUFFER_MS),
@@ -785,6 +797,7 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
     ));
     let retarget = spawn_depth_controller(
         jitter.clone(),
+        ingest.clone(),
         state.effective_target.clone(),
         base_target_ms,
         state.depth_params,
@@ -825,6 +838,7 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
 /// [`EngineState::depth_params`].
 fn spawn_depth_controller(
     jitter: Arc<JitterBuffer>,
+    ingest: Arc<Mutex<Ingest>>,
     effective_target: Arc<AtomicU32>,
     base_ms: f32,
     params: DepthParams,
@@ -835,6 +849,12 @@ fn spawn_depth_controller(
         // The counter starts at 0 for every fresh run (Start resets the
         // buffer); only underruns observed *after* this task starts count.
         let mut last_underruns = jitter.underruns();
+        // Decay accrues only while audio is actually FLOWING: a paused
+        // sender (engine still running) must not earn clean-window decay —
+        // on_tick(false) discards the window so the network-proven depth is
+        // kept for the resume. "Flowing" = the ingest received counter
+        // advanced since the last tick.
+        let mut last_received = 0u64;
         let mut tick = tokio::time::interval(DEPTH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await; // discard the immediate first tick
@@ -846,7 +866,13 @@ fn spawn_depth_controller(
                         depth.on_underrun();
                         last_underruns = underruns;
                     }
-                    let target_ms = depth.on_tick(true);
+                    let received = ingest
+                        .lock()
+                        .expect("ingest mutex poisoned")
+                        .received;
+                    let flowing = received > last_received;
+                    last_received = received;
+                    let target_ms = depth.on_tick(flowing);
                     effective_target.store(
                         (target_ms * SAMPLE_RATE as f32 / 1000.0).ceil() as u32,
                         Ordering::Relaxed,
@@ -1063,6 +1089,12 @@ async fn tcp_loop(
         .with_context(|| format!("binding TCP {addr}"))?;
     eprintln!("openay-server: TCP listening on {addr}");
 
+    // Per-connection tasks are tracked so a Stop reclaims them: abort_all
+    // cancels a task parked in next_packet() on an idle socket (quit is only
+    // checked between packets), and the Arc clones held per connection die
+    // with the tasks instead of outliving the pipeline.
+    let mut conns = tokio::task::JoinSet::new();
+
     let mut last_stats = Instant::now();
     let mut last_underruns = jitter.underruns();
     let mut last_underrun_log: Option<Instant> = None;
@@ -1074,7 +1106,7 @@ async fn tcp_loop(
                 eprintln!("openay-server: TCP connection from {peer}");
                 let conn_ingest = ingest.clone();
                 let conn_quit = quit.clone();
-                tokio::spawn(async move {
+                conns.spawn(async move {
                     let mut framed = openay_transport::tcp::TcpPacketStream::new(stream);
                     loop {
                         if conn_quit.load(Ordering::Relaxed) {
@@ -1095,6 +1127,14 @@ async fn tcp_loop(
                     }
                 });
             }
+            // Reap finished connection tasks (frees their Arcs promptly).
+            joined = conns.join_next(), if !conns.is_empty() => {
+                if let Some(Err(e)) = joined {
+                    if e.is_panic() {
+                        eprintln!("openay-server: TCP connection task panicked");
+                    }
+                }
+            }
         }
         if quit.load(Ordering::Relaxed) {
             break;
@@ -1109,6 +1149,11 @@ async fn tcp_loop(
             last_stats = Instant::now();
         }
     }
+    // Deterministic teardown: stop every connection task (an abort lands at
+    // the next await; the sync ingest critical section always completes)
+    // BEFORE the final stats line, so the shutdown counters are final.
+    conns.abort_all();
+    while conns.join_next().await.is_some() {}
     Ok(stats_line(Transport::Tcp, &ingest, &jitter))
 }
 
@@ -1182,6 +1227,31 @@ mod tests {
             ..EngineConfig::default()
         };
         assert_eq!(cfg.validated(), Err(ConfigError::InvalidPort(0)));
+    }
+
+    #[test]
+    fn validated_rejects_non_finite_target_ms() {
+        // f32::clamp passes NaN through, and the sample conversion would
+        // saturate the prebuffer latch to 0 samples — non-finite values must
+        // be rejected before they reach the engine.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let cfg = EngineConfig {
+                target_ms: bad,
+                ..EngineConfig::default()
+            };
+            match cfg.validated() {
+                Err(ConfigError::InvalidTargetMs(v)) => {
+                    // assert_eq! would compare NaN != NaN; compare NaN-ness
+                    // and the finite values separately.
+                    if bad.is_nan() {
+                        assert!(v.is_nan(), "NaN must be preserved in the error");
+                    } else {
+                        assert_eq!(v, bad);
+                    }
+                }
+                other => panic!("{bad} must be rejected, got {other:?}"),
+            }
+        }
     }
 
     #[test]
