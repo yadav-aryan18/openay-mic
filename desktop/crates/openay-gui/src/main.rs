@@ -5,9 +5,17 @@
 //!
 //! Window behaviour contract: the window's close button ALWAYS quits the
 //! application cleanly (stop engine, unregister tray). There is no
-//! hide-to-tray. The tray (if a StatusNotifierWatcher exists) offers
+//! hide-to-tray. The tray (if one could be registered) offers
 //! Show/Start/Stop/Quit; `--minimized` only hides the window at startup and
 //! is ignored when no tray could be registered (the app must stay reachable).
+//!
+//! On Windows the release build is a windows-subsystem binary: no console
+//! window appears beside the GUI (debug builds keep it for diagnostics; the
+//! tray and in-app surfaces carry all user-facing state).
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 mod app;
 mod config;
@@ -22,7 +30,9 @@ use std::sync::Arc;
 use iced::window;
 
 use crate::app::{App, Flags};
-use crate::tray::{spawn_tray, TrayBus};
+#[cfg(unix)]
+use crate::tray::spawn_tray;
+use crate::tray::TrayBus;
 
 /// The application's single window: 460x600, min 420x520, "OpenAY Mic".
 fn window_settings(start_minimized: bool) -> window::Settings {
@@ -77,11 +87,14 @@ fn main() -> iced::Result {
         }
     }
 
-    // System tray (best-effort; the app works without one). If registration
-    // fails or the desktop has no StatusNotifierWatcher, warn once and
-    // continue — the app stays fully usable as a plain window, and the
-    // window close button quits it.
+    // System tray (best-effort; the app works without one). Unix registers
+    // the ksni service here; Windows spawns its tray inside `App::new` —
+    // tray-icon's Win32 backend requires the creating thread to run an event
+    // loop, and iced's loop only exists once the runtime starts. Either way,
+    // a missing tray just means window-only mode: the app stays fully usable
+    // and the window close button quits it.
     let tray_bus = Arc::new(TrayBus::default());
+    #[cfg(unix)]
     let tray = match spawn_tray(tray_bus.clone()) {
         Ok(t) => Some(t),
         Err(e) => {
@@ -92,6 +105,8 @@ fn main() -> iced::Result {
             None
         }
     };
+    #[cfg(windows)]
+    let tray = None;
 
     // Only start hidden when there is a tray to restore the window; without
     // one the app would be unreachable.

@@ -9,9 +9,9 @@ Requirements
 ------------
 - Windows 10 or newer (x86_64). No admin rights needed to run the exe.
 - A sound output device. To expose the stream to other apps as a
-  microphone, install a virtual audio cable (e.g. VB-Cable, free from
+  microphone, install a virtual audio cable (e.g. a virtual-audio-cable driver, free from
   vb-audio.com) and select it as the output device — apps then pick
-  "CABLE Output" as their input. To simply monitor the audio, any
+  the cable's recording side ("Output") as their input. To simply monitor the audio, any
   speakers/headset works.
 - The phone app (OpenAY Mic on Android) and this receiver.
 
@@ -48,7 +48,7 @@ USB usage (lower latency, more reliable)
 Audio output options
 --------------------
   openay-server.exe --list-devices          list output devices
-  openay-server.exe --output-device "CABLE Input" --output
+  openay-server.exe --output-device the cable's playback side ("Input") --output
                                             render into the virtual cable
   openay-server.exe --output                default output device
 --output, --output-device and --list-devices all require the audio-output
@@ -65,8 +65,8 @@ config), rendering the phone's audio with WASAPI instead of PipeWire:
 
 It starts stopped (cold); press ON AIR, pick transport/port like on Linux.
 Audio renders on the system DEFAULT output device — to feed other apps,
-install a virtual audio cable, set "CABLE Input" as the default playback
-device in Windows Sound settings, and select "CABLE Output" in the consumer
+install a virtual audio cable, set the cable's playback side ("Input") as the default playback
+device in Windows Sound settings, and select the cable's recording side ("Output") in the consumer
 app (or edit output_device in %APPDATA%\openay-mic\config.toml).
 Differences from Linux, on purpose: no system tray (window close quits —
 same contract), autostart uses the Startup folder, audio routing happens
@@ -79,7 +79,7 @@ automatically (console + a timestamped file under
 %USERPROFILE%\OpenAY-logs\):
 
     .\openay-log.ps1 --transport udp --output
-    .\openay-log.ps1 --transport tcp --output --output-device "CABLE Input"
+    .\openay-log.ps1 --transport tcp --output --output-device the cable's playback side ("Input")
 
 (If script execution is blocked: powershell -ExecutionPolicy Bypass
 -File .\openay-log.ps1 ...) The wrapper also snapshots --list-devices

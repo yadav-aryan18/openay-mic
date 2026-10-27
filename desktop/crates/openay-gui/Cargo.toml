@@ -33,6 +33,12 @@ ksni = "0.2"
 # Windows: local playback via cpal/WASAPI (a system-wide virtual mic needs
 # a kernel driver — out of scope; see README-WINDOWS.txt).
 openay-server = { path = "../openay-server", features = ["audio-output"] }
+# System tray (Shell_NotifyIcon) + context menu; the menu API is re-exported
+# as tray_icon::menu (muda). Version verified against docs.rs 0.26.1.
+tray-icon = "0.26"
+# The tray-event pump sleeps between receiver drains (iced's tokio executor
+# is already in the build; this only unlocks the time helper).
+tokio = { version = "1", default-features = false, features = ["time"] }
 
 [dev-dependencies]
 # Headless layout probing in unit tests (same version as the iced tree).
