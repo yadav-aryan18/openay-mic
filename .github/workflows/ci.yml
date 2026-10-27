@@ -52,6 +52,7 @@ jobs:
       - name: Prebuild static libopus for audiopus_sys
         shell: pwsh
         run: |
+          cargo fetch --target x86_64-pc-windows-msvc
           $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
           $opusSrc = Get-ChildItem "$cargoHome/registry/src/*/audiopus_sys-*/opus" -Directory |
             Sort-Object Name -Descending | Select-Object -First 1

@@ -224,9 +224,13 @@ mod tests {
             .iter()
             .map(|&(_, r)| r)
             .fold(f64::MAX, f64::min);
-        // A correctly aligned window has RMS ~0.5% FS; a misaligned window is
-        // near the signal level itself (~64% FS). The gap is unambiguous.
-        let good_rms = 0.03 * FS; // 3% FS
+        // A correctly aligned window has a small residual; a misaligned
+        // window is near the signal level itself (~64% FS). The bar is an
+        // ALIGNMENT detector, not a quality meter: libopus rate-control
+        // artifacts at 32 kbps vary by library version (measured ~2% FS
+        // residual on libopus 1.6.1, ~3.8% on 1.5.2), so the bar sits at
+        // 6% FS — still an order of magnitude below the misaligned level.
+        let good_rms = 0.06 * FS; // 6% FS
         assert!(
             best_rms < good_rms,
             "codec alignment implausible: best RMS {best_rms:.2} is not 'good' (< {good_rms:.2}); \
