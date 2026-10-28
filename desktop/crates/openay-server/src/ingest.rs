@@ -62,14 +62,24 @@ impl Ingest {
         }
     }
 
-    /// Classify `seq` against the stream expectation and fold the result
-    /// into the counters.
-    fn track_seq(&mut self, seq: u16) {
+    /// Classify `seq` against the stream expectation, fold the result into
+    /// the counters, and return the event (the caller skips the payload for
+    /// [`SeqEvent::Duplicate`] — a re-delivered frame must not play twice).
+    fn track_seq(&mut self, seq: u16) -> openay_transport::SeqEvent {
         match self.seq.update(seq) {
-            openay_transport::SeqEvent::Gap(lost) => self.lost += lost as u64,
-            openay_transport::SeqEvent::Duplicate => self.duplicate += 1,
-            openay_transport::SeqEvent::Reorder => self.out_of_order += 1,
-            openay_transport::SeqEvent::InOrder => {}
+            openay_transport::SeqEvent::Gap(lost) => {
+                self.lost += lost as u64;
+                openay_transport::SeqEvent::Gap(lost)
+            }
+            openay_transport::SeqEvent::Duplicate => {
+                self.duplicate += 1;
+                openay_transport::SeqEvent::Duplicate
+            }
+            openay_transport::SeqEvent::Reorder => {
+                self.out_of_order += 1;
+                openay_transport::SeqEvent::Reorder
+            }
+            openay_transport::SeqEvent::InOrder => openay_transport::SeqEvent::InOrder,
         }
     }
 
@@ -121,7 +131,14 @@ impl Ingest {
         payload: &[u8],
     ) -> Result<(), IngestError> {
         self.received += 1;
-        self.track_seq(seq);
+        let event = self.track_seq(seq);
+
+        // A duplicate (re-delivered frame) is counted but not decoded or
+        // pushed again: playing the same 10 ms twice is an audible echo, and
+        // the original copy is already buffered (or arriving out of order).
+        if event == openay_transport::SeqEvent::Duplicate {
+            return Ok(());
+        }
 
         if let Some(strict) = self.only {
             if kind != strict {
@@ -236,8 +253,24 @@ mod tests {
         // In-order continues.
         feed(&mut i, PayloadType::Pcm, 16, &silence).unwrap();
         assert_eq!(i.received, 14);
-        // 14 audio packets x 48 samples, all pushed (no overrun).
-        assert_eq!(jitter.available(), 14 * 48, "all silence frames ingested");
+        // 13 audio packets x 48 samples pushed: the duplicate of 14 is
+        // counted but not buffered again (dedup — the frame must not play
+        // twice); the late 13 is a first delivery and IS buffered.
+        assert_eq!(jitter.available(), 13 * 48, "audio frames ingested, dup deduped");
+    }
+
+    #[test]
+    fn duplicate_payload_is_not_pushed_twice() {
+        let (mut i, jitter) = ingest();
+        let silence = pcm_bytes(&[0i16; 48]);
+        feed(&mut i, PayloadType::Pcm, 0, &silence).unwrap();
+        assert_eq!(jitter.available(), 48);
+        // Immediate re-delivery of the same seq (proxy dup rule): counted,
+        // but the samples must not land in the buffer a second time.
+        feed(&mut i, PayloadType::Pcm, 0, &silence).unwrap();
+        assert_eq!(i.duplicate, 1);
+        assert_eq!(i.received, 2);
+        assert_eq!(jitter.available(), 48, "duplicate frame deduped");
     }
 
     #[test]

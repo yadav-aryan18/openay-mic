@@ -28,6 +28,13 @@ default = []
 # libpipewire-0.3 and libspa-0.2 (pkg-config), so this feature is opt-in and
 # requires those libraries at build time.
 pipewire = ["dep:pipewire"]
+# Platform audio OUTPUT (no virtual microphone): plays the decoded stream on
+# a real output device via cpal — ALSA on Linux, WASAPI on Windows. On
+# Linux cpal's ALSA host links libasound (pkg-config `alsa`); on Windows the
+# WASAPI host is pure Rust (windows-sys), so this feature cross-compiles to
+# x86_64-pc-windows-msvc with no C toolchain.
+audio-output = ["dep:cpal"]
+
 # Bluetooth SPP receive via BlueZ (bluer). Opt-in like `pipewire`: the crate
 # compiles without it (selecting the `bt` transport then fails cleanly at
 # runtime), and running it needs a system bluetoothd (D-Bus) — no Bluetooth
@@ -36,6 +43,10 @@ bluetooth = ["openay-transport/bluetooth"]
 
 [dependencies.pipewire]
 version = "0.8"
+optional = true
+
+[dependencies.cpal]
+version = "0.15"
 optional = true
 
 [dev-dependencies]

@@ -92,9 +92,15 @@ fn bt_injected_stream_end_to_end() {
         codec: CodecMode::Auto,
         target_ms: 10.0,
         capacity_ms: 100.0,
+        audio_output: false,
+        output_device: None,
     };
     let handle =
-        spawn_engine_with_bt_source(Some(config), DepthParams::default(), Some(inject.clone()));
+        spawn_engine_with_bt_source(
+        Some(config.clone()),
+        DepthParams::default(),
+        Some(inject.clone()),
+    );
 
     // Cold-start contract: no pipeline until Start, standby display reports
     // the configured transport.
@@ -219,8 +225,11 @@ fn bt_device_slot_follows_the_connection_lifecycle() {
         transport: Transport::Bluetooth,
         ..EngineConfig::default()
     };
-    let handle =
-        spawn_engine_with_bt_source(Some(config), DepthParams::default(), Some(inject.clone()));
+    let handle = spawn_engine_with_bt_source(
+        Some(config.clone()),
+        DepthParams::default(),
+        Some(inject.clone()),
+    );
     let rt = rt();
     rt.block_on(async {
         handle

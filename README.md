@@ -1,27 +1,44 @@
 # OpenAY Mic
 
-Ultra-low-latency virtual microphone: an Android phone captures audio and
-streams it to a Linux desktop, where it appears as a native PipeWire source
-(a real microphone for every application). Designed to beat proprietary
-solutions like WO Mic on latency, security, and UX.
+An Android phone becomes a microphone for your desktop: the phone captures
+audio and streams it to a receiver that presents it as a native audio
+device. On Linux that is a PipeWire source — a real microphone for every
+application; on Windows the same receiver renders through the native audio
+stack (WASAPI). End-to-end software-path latency measures p50 ≈ 47 ms with
+the default configuration (measured; see the Status section).
 
 ## Components
 
-| Path              | What it is                                                                 |
-|-------------------|----------------------------------------------------------------------------|
-| `shared/`         | Canonical wire-protocol spec (`protocol.md`) + golden test vectors          |
-| `android/`        | Android client — Kotlin/Compose UI, C++ NDK capture engine (Oboe), transports |
-| `android/native/` | Portable C++ core (protocol + transports); host-buildable for fast testing  |
-| `desktop/`        | Rust server — protocol/transport crates, PipeWire virtual-mic node, native GUI |
-| `scripts/`        | Environment template (`env.sh.example`) and test orchestration               |
+| Path               | What it is                                                                    |
+|--------------------|-------------------------------------------------------------------------------|
+| `shared/`          | Canonical wire-protocol spec (`protocol.md`) + golden test vectors             |
+| `android/`         | Android client — Kotlin/Compose UI, C++ NDK capture engine (Oboe), transports |
+| `android/native/`  | Portable C++ core (protocol + transports); host-buildable for fast testing    |
+| `desktop/`         | Rust server — protocol/transport crates, audio backends, Iced GUI              |
+| `scripts/`         | Environment template (`env.sh.example`), build/test orchestration, session loggers |
+
+## Platform support
+
+| Platform | Receiver | Audio output | Build |
+|----------|----------|--------------|-------|
+| Linux    | `openay-server` / `openay-gui` | PipeWire virtual source (`openay_mic`) — a system-wide microphone | `cargo build --release` |
+| Windows  | `openay-server.exe` / `openay-gui.exe` | WASAPI playback (pair with a virtual-audio-cable driver to expose a microphone) | `scripts/build_windows.sh` |
+
+One source tree serves both: the engine, jitter buffer, and transports are
+shared, and only the audio backend differs (see
+[`docs/testing-checklist.md`](docs/testing-checklist.md) for a complete
+test walkthrough of both platforms, including session-log collection).
 
 ## Transports & codecs
 
-- **USB** (TCP over `adb forward`), **Wi-Fi** (UDP, drop-late-packets policy),
-  **Bluetooth** (RFCOMM/SPP, bypasses the BT audio stack).
+- **USB** (TCP over `adb`), **Wi-Fi** (UDP, drop-late-packets policy).
+- **Bluetooth** (RFCOMM/SPP, bypassing the BT audio stack) is implemented on
+  the `feature/bluetooth` branch: desktop SPP service via BlueZ, phone-side
+  client with a bonded-device picker.
 - **Raw PCM** (16-bit LE mono 48 kHz) and **Opus**
   (`OPUS_APPLICATION_RESTRICTED_LOWDELAY`, 10 ms frames).
-- Wire format: see [`shared/protocol.md`](shared/protocol.md).
+- Wire format: see [`shared/protocol.md`](shared/protocol.md). The protocol
+  is frozen (v1) — every latency feature is receiver-side.
 
 ## Bluetooth quick start (SPP / RFCOMM)
 
@@ -45,7 +62,7 @@ Requirements: a BlueZ stack with a powered adapter on the desktop
 paired devices). Without the `bluetooth` feature the server rejects BT with
 a clear rebuild hint; the rest of the engine is unaffected.
 
-## Building & testing (Phase 6 state)
+## Building & testing
 
 All tooling is user-space; no root required.
 
@@ -71,18 +88,46 @@ ctest --test-dir android/native/build-host --output-on-failure
 # Cross-language interop (C++ <-> Rust over UDP and TCP)
 scripts/run_phase2.sh
 
-# Phase 6 gate: everything above plus adaptive-jitter scenarios through the
+# Full regression gate: everything above plus adaptive-jitter scenarios through the
 # lossy-network proxy, QA-kit self-tests, software latency probe (needs a
 # PipeWire daemon) and CPU budget assertions
 scripts/run_phase6.sh
 
-# Phase 6 tools
+# Analysis tools
 cargo run -p openay-proxy -- --listen 127.0.0.1:41860 --forward 127.0.0.1:41700 \
   --profile burst            # deterministic loss/burst/jitter UDP forwarder
 scripts/latency_probe.sh     # software ingest->present latency (p50/p95)
 scripts/cpu_profile.sh       # idle / PCM / Opus %CPU + RSS, --assert budgets
 scripts/gen_click_track.py   # acoustic click track for the hardware audit
 ```
+
+### Windows
+
+From a checkout of `feature/windows-client` (the branch also carries the
+GUI's Windows build):
+
+```bash
+scripts/build_windows.sh     # -> dist/openay-windows/: openay-gui.exe,
+                             #    openay-server.exe, openay-log.ps1, README
+```
+
+The script cross-compiles with an MSVC target using user-space tooling (no
+admin) and produces self-contained executables — no redistributable install
+is needed on the target machine.
+
+### Test-session logging
+
+Both platforms wrap the app with a session logger so every run is captured
+for debugging:
+
+- Ubuntu: `scripts/devlog.sh [--gui] [--adb]` — app log, environment
+  snapshot, virtual-source state, optional phone logcat, under
+  `~/OpenAY-logs/<timestamp>/`.
+- Windows: `.\openay-log.ps1 <args>` — app log + device snapshot under
+  `%USERPROFILE%\OpenAY-logs\<timestamp>\`.
+
+See [`docs/testing-checklist.md`](docs/testing-checklist.md) for the full
+procedure and known-good baselines.
 
 ## Reproducing the environment
 
@@ -95,11 +140,11 @@ file you copy is the authoritative checklist. In brief:
    and `glib`. The example file shows the one-line `conda create` command.
 3. **Android SDK** — point `ANDROID_HOME` at it; the project's Gradle wrapper
    and NDK usage are pinned in `android/`.
-4. **User-space PipeWire** — build from source into `$PW_PREFIX` at the same
-   version your system daemon runs (`pw-cli --version`); the meson commands
-   are in the example file. `pipewire-rs` compiles against these headers, and
-   `LD_LIBRARY_PATH` makes our binaries load this matching `libpipewire`
-   while talking to the system daemon over the standard socket.
+4. **User-space PipeWire** (Linux) — build from source into `$PW_PREFIX` at
+   the same version your system daemon runs (`pw-cli --version`); the meson
+   commands are in the example file. `pipewire-rs` compiles against these
+   headers, and `LD_LIBRARY_PATH` makes our binaries load this matching
+   `libpipewire` while talking to the system daemon over the standard socket.
 5. **bindgen inputs** — `LIBCLANG_PATH` (any libclang) and
    `BINDGEN_EXTRA_CLANG_ARGS` (GCC headers), with defaults that may need
    adjusting per host; both are marked ADJUST in the example file.
@@ -126,7 +171,7 @@ with instructions instead of failing later in a build.
 ## Status
 
 - [x] Phase 1 — monorepo scaffold, packet protocol defined in C++ + Rust
-- [x] Phase 2 — UDP/TCP/(BT) transports, Opus low-delay integration, interop tests
+- [x] Phase 2 — UDP/TCP transports, Opus low-delay integration, interop tests
   - `scripts/run_phase2.sh`: 14/14 checks pass (builds, ctest, cargo test,
     C++<->Rust interop over UDP+TCP both directions, MTU-boundary payloads,
     loopback benches p99 <= 1.3 ms vs <5 ms target)
@@ -151,9 +196,9 @@ with instructions instead of failing later in a build.
     "The Chain" live signal-path strip on both platforms
   - Android: full Compose redesign (ON AIR toggle, transport/codec/frame
     controls, live level ring, network card) — verified on emulator
-  - Desktop: `openay-gui` (Iced, best-effort tray) with VU ladder, engine
-    settings slide-over, autostart; the window close button quits the app
-    cleanly (no hide-to-tray); `openay-server` refactored to lib+bin
+  - Desktop: `openay-gui` (Iced) with VU ladder, engine settings
+    slide-over, autostart; the window close button quits the app cleanly;
+    `openay-server` refactored to lib+bin
 - [x] Phase 6 — QA, profiling & latency tuning
   - Adaptive jitter buffer: `openay-jitter::DepthController` (+2 ms per
     underrun to a 20 ms ceiling, −1 ms per 60 s underrun-free toward the
@@ -184,3 +229,15 @@ with instructions instead of failing later in a build.
   - `scripts/run_phase6.sh`: 11/11 checks pass (builds, ctest, cargo
     workspace + headless adaptive scenarios, python self-tests, proxy
     delivery-ratio smoke, latency-probe verdict, CPU budget assertions)
+- [x] Windows client (`feature/windows-client`)
+  - Same receiver engine with a cpal/WASAPI audio-output backend;
+    cross-compiled with an MSVC target using user-space tooling into
+    self-contained executables
+  - Iced GUI console with full Linux parity (The Chain, VU ladder, ON AIR,
+    settings slide-over) plus a Win32 system tray with the same
+    Show/Start/Stop/Quit menu and live state icon
+  - Both `openay-gui.exe` and `openay-server.exe` ship with a session
+    logger (`openay-log.ps1`); verified end-to-end on hardware
+- [ ] Bluetooth transport (`feature/bluetooth`) — implemented and tested on
+  the branch (desktop BlueZ SPP service, phone client, host ctest for the
+  fd-bridge); pending merge

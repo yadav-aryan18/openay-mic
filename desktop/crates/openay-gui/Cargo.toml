@@ -10,22 +10,38 @@ name = "openay-gui"
 path = "src/main.rs"
 
 [dependencies]
-# The GUI always ships the PipeWire virtual microphone: a network-only
-# console would render meters against a silent engine (this exact mismatch
-# bit us — see the VU/ring dead-meter fix). It also always ships the
-# Bluetooth SPP receive path (BT chip in the settings transport control):
-# without the feature the engine would only answer a BT selection with a
-# "built without Bluetooth support" error.
-openay-server = { path = "../openay-server", features = ["pipewire", "bluetooth"] }
+# Platform output backend, selected by target: the SAME console ships with
+# the PipeWire virtual microphone + the Bluetooth SPP receive path on Linux,
+# and WASAPI playback (cpal audio-output) on Windows — one GUI source, one
+# engine, per-OS audio arm. Base entry carries no features; the target
+# tables add exactly the platform set.
+openay-server = { path = "../openay-server" }
 # Software renderer only (tiny-skia, NOT wgpu); tokio integration for the
 # async engine commands; canvas for the custom-drawn instruments.
 iced = { version = "0.13", default-features = false, features = ["tiny-skia", "tokio", "canvas"] }
-ksni = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 anyhow = "1"
 dirs = "6"
 if-addrs = "0.15"
+
+[target.'cfg(not(windows))'.dependencies]
+# Linux (and every other Unix): the virtual microphone is the product, and
+# the Bluetooth SPP receive path ships with it (BT chip in the settings
+# transport control).
+openay-server = { path = "../openay-server", features = ["pipewire", "bluetooth"] }
+ksni = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Windows: local playback via cpal/WASAPI. The Bluetooth transport is not
+# ported to Windows yet — selecting it in a future Windows build would fail
+# cleanly until then. The Win32 system tray (tray-icon + its muda menu
+# re-export) is Windows-only by nature; the Unix side uses ksni.
+openay-server = { path = "../openay-server", features = ["audio-output"] }
+tray-icon = "0.26"
+# The tray-event pump sleeps between receiver drains (iced's tokio executor
+# is already in the build; this only unlocks the time helper).
+tokio = { version = "1", default-features = false, features = ["time"] }
 
 [dev-dependencies]
 # Headless layout probing in unit tests (same version as the iced tree).

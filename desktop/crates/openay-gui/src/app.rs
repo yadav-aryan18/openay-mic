@@ -56,6 +56,9 @@ pub struct Flags {
     pub config: Config,
     pub config_path: PathBuf,
     pub tray_bus: Arc<TrayBus>,
+    /// Unix: the ksni handle spawned in main. Windows: `None` — the tray is
+    /// spawned inside `App::new` (tray-icon needs the running event loop).
+    #[cfg_attr(windows, allow(dead_code))]
     pub tray: Option<TrayHandle>,
 }
 
@@ -110,6 +113,10 @@ pub struct App {
     autostart: bool,
     start_minimized: bool,
     reduce_motion: bool,
+    // Windows output-device selection (persisted; None = system default).
+    // No in-app picker yet — routing is configured via Windows Sound
+    // settings / the virtual cable's default-device state.
+    output_device: Option<String>,
     dirty: bool,
     // Display mirrors of engine state (polled in tick())
     /// Bluetooth device currently connected to the engine (its MAC
@@ -151,6 +158,11 @@ pub enum Message {
     CloseRequested(window::Id),
     WindowId(Option<window::Id>),
     CmdSent,
+    /// Windows tray pump woke the GUI (a menu action may be pending).
+    /// Never constructed on Linux (no Win32 tray) — kept unconditional so
+    /// the update arm is platform-agnostic.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    TrayPoll,
     /// Final step of a quit: engine stopped and tray dropped, exit the runtime.
     Exit,
 }
@@ -171,6 +183,7 @@ impl App {
         let autostart = config.autostart;
         let start_minimized = config.start_minimized;
         let reduce_motion = config.reduce_motion;
+        let output_device = config.output_device.clone();
         let bind_options = get_local_ips(&bind_input);
         let initial_status = flags.engine.status();
 
@@ -178,6 +191,23 @@ impl App {
         // right after app init so the pane can be exercised headlessly
         // (screenshots) without input automation. Documented in main.rs.
         let settings_open = env_flag("OPENAY_DEBUG_SETTINGS");
+
+        // Windows: the tray is created HERE (main thread, iced's event loop
+        // already running — tray-icon's Win32 backend requires it) rather
+        // than in main; a failure falls back to window-only mode.
+        #[cfg(windows)]
+        let tray = match crate::tray::spawn_tray(flags.tray_bus.clone()) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!(
+                    "openay-gui: warning: system tray unavailable ({e:#}); \
+                     running window-only (the window close button quits the app)"
+                );
+                None
+            }
+        };
+        #[cfg(not(windows))]
+        let tray = flags.tray;
 
         let app = App {
             engine: flags.engine,
@@ -201,13 +231,14 @@ impl App {
             autostart,
             start_minimized,
             reduce_motion,
+            output_device,
             dirty: false,
             bt_device: None,
             last_error: None,
             config,
             config_path: flags.config_path,
             tray_bus: flags.tray_bus,
-            tray: flags.tray,
+            tray,
             stagger: false,
             stagger_t: 0.0,
             air_pulse: None,
@@ -299,6 +330,9 @@ impl App {
                 Task::none()
             }
             Message::CmdSent => Task::none(),
+            // The tray pump translated events into TrayBus requests already;
+            // the tick consumes them. Nothing else to do on this wake-up.
+            Message::TrayPoll => Task::none(),
             Message::Exit => iced::exit(),
         }
     }
@@ -307,12 +341,40 @@ impl App {
         Subscription::batch(vec![
             iced::time::every(Duration::from_millis(TICK_MS)).map(Message::Tick),
             window::close_requests().map(Message::CloseRequested),
+            #[cfg(windows)]
+            Self::tray_event_poll(self.tray.clone(), self.tray_bus.clone()),
         ])
     }
 
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// Windows tray event pump (background subscription): drains the
+    /// crate-level menu/click receivers into [`TrayBus`] requests and wakes
+    /// the GUI so a tray click is acted on promptly (TrayPoll) instead of
+    /// waiting a full tick.
+    #[cfg(windows)]
+    fn tray_event_poll(
+        tray: Option<crate::tray::TrayHandle>,
+        bus: Arc<crate::tray::TrayBus>,
+    ) -> Subscription<Message> {
+        Subscription::run_with_id(
+            "openay-gui.windows-tray-events",
+            iced::stream::channel(
+                16,
+                move |mut out: iced::futures::channel::mpsc::Sender<Message>| async move {
+                    use iced::futures::SinkExt;
+                    while let Some(tray) = &tray {
+                        crate::tray::poll_events(tray, &bus);
+                        // Wake the GUI promptly; the tick consumes the request.
+                        let _ = out.send(Message::TrayPoll).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                },
+            ),
+        )
+    }
 
     fn tick(&mut self, now: Instant) -> Task<Message> {
         let dt = (now - self.last_tick).as_secs_f32().clamp(0.0, 0.5);
@@ -387,7 +449,7 @@ impl App {
             }
         }
         if self.tray_bus.take_start() {
-            tasks.push(self.engine_cmd(EngineCommand::Start(self.engine_cfg)));
+            tasks.push(self.engine_cmd(EngineCommand::Start(self.engine_cfg.clone())));
         }
         if self.tray_bus.take_stop() {
             tasks.push(self.engine_cmd(EngineCommand::Stop));
@@ -418,7 +480,7 @@ impl App {
                 self.stagger = true;
                 self.stagger_t = 0.0;
             }
-            self.engine_cmd(EngineCommand::Start(self.engine_cfg))
+            self.engine_cmd(EngineCommand::Start(self.engine_cfg.clone()))
         }
     }
 
@@ -461,6 +523,7 @@ impl App {
             autostart: self.autostart,
             start_minimized: self.start_minimized,
             reduce_motion: self.reduce_motion,
+            output_device: self.output_device.clone(),
         };
         let engine_cfg = cfg.to_engine();
 
@@ -475,7 +538,7 @@ impl App {
         let was_running = self.status.running;
 
         self.config = cfg.clone();
-        self.engine_cfg = engine_cfg;
+        self.engine_cfg = engine_cfg.clone();
         self.dirty = false;
 
         // Persist + (if running) restart the engine with the new config.

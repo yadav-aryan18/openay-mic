@@ -51,8 +51,10 @@ fn bt_transport_fails_cleanly_without_feature() {
         codec: CodecMode::Auto,
         target_ms: 10.0,
         capacity_ms: 100.0,
+        audio_output: false,
+        output_device: None,
     };
-    let handle = spawn_engine(Some(config));
+    let handle = spawn_engine(Some(config.clone()));
 
     // Cold-start contract: spawn never runs; no error yet.
     assert!(!handle.status().running);
@@ -65,7 +67,7 @@ fn bt_transport_fails_cleanly_without_feature() {
     rt.block_on(async {
         handle
             .cmd()
-            .send(EngineCommand::Start(config))
+            .send(EngineCommand::Start(config.clone()))
             .await
             .expect("send Start");
     });
@@ -105,7 +107,7 @@ fn bt_transport_fails_cleanly_without_feature() {
     let udp_config = EngineConfig {
         transport: Transport::Udp,
         port: free_udp_port(),
-        ..config
+        ..config.clone()
     };
     rt.block_on(async {
         handle

@@ -39,9 +39,7 @@ use std::time::Duration;
 use openay_jitter::DepthParams;
 use openay_protocol::{encode, Packet, PayloadType};
 use openay_proxy::{Profile, ProxyConfig};
-use openay_server::{
-    spawn_engine_tuned, CodecMode, EngineCommand, EngineConfig, Transport,
-};
+use openay_server::{spawn_engine_tuned, EngineCommand, EngineConfig};
 use tokio::net::UdpSocket;
 
 /// Shrunk controller timings: +2 ms per underrun, one 600 ms clean window
@@ -232,6 +230,86 @@ fn wait_status(
     false
 }
 
+/// A fresh headless engine config for `port` (loopback bind, UDP, auto
+/// codec, configured base target). Every call builds a NEW value: with the
+/// `audio-output` feature `EngineConfig` is not `Copy`, and each scenario
+/// sends the config twice (spawn defaults + Start).
+fn engine_config(port: u16) -> EngineConfig {
+    EngineConfig {
+        bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port,
+        target_ms: BASE_MS,
+        ..EngineConfig::default()
+    }
+}
+
+/// Scenario 0 — **Idle**: after burst loss has raised the target, a sender
+/// that goes QUIET (engine still running, no packets flowing) must not earn
+/// clean-window decay: the depth the network proved necessary is kept for
+/// the resume. The controller ticks on_tick(false) while the ingest receive
+/// counter is stationary (window discarded — the documented stopped-model).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_stream_does_not_decay() {
+    let engine_port = free_port_417xx();
+    let proxy_port = free_port_417xx();
+    let handle = spawn_engine_tuned(Some(engine_config(engine_port)), SHRUNK_PARAMS);
+    handle
+        .cmd()
+        .send(EngineCommand::Start(engine_config(engine_port)))
+        .await
+        .expect("send Start");
+    assert!(
+        wait_status(&handle, Duration::from_secs(5), |s| s.running),
+        "engine must reach the running state"
+    );
+
+    let jitter = handle
+        .jitter_for_test()
+        .expect("jitter buffer must exist while running");
+    let engine_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), engine_port);
+
+    // Burst phase: raise the target above the base (same as scenario 1).
+    let cons_stop = Arc::new(AtomicBool::new(false));
+    let consumer_task = tokio::spawn(consumer(jitter.clone(), cons_stop.clone()));
+    let proxy_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), proxy_port);
+    let (proxy_quit, proxy_task) = start_proxy(proxy_addr, engine_addr, Profile::Burst);
+    tokio::spawn(send_stream(proxy_addr, 350, Arc::new(AtomicBool::new(false)))).await
+        .expect("producer joins");
+    assert!(
+        wait_status(&handle, PHASE_DEADLINE, |s| {
+            s.effective_target_ms > BASE_MS + 0.01
+        }),
+        "burst phase must raise the target, status = {:?}",
+        handle.status()
+    );
+
+    // Quiesce: producer done (awaited), proxy stopped, consumer stopped —
+    // no further pops (=> no underruns) and no further packets (=> the
+    // controller's flowing gate goes false). The engine KEEPS RUNNING.
+    proxy_quit.store(true, Ordering::Relaxed);
+    let _ = proxy_task.await;
+    cons_stop.store(true, Ordering::Relaxed);
+    let _ = consumer_task.await;
+    let baseline = handle.status().effective_target_ms;
+    assert!(baseline > BASE_MS + 0.01, "baseline must be a raised target");
+
+    // 1.3 s > two 600 ms decay windows: an ungated controller would have
+    // stepped down twice by now.
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let after = handle.status().effective_target_ms;
+    assert!(
+        (after - baseline).abs() < 0.001,
+        "no decay while no packets flow: baseline {baseline}, after {after},          status = {:?}",
+        handle.status()
+    );
+
+    handle.cmd().send(EngineCommand::Stop).await.expect("send Stop");
+    assert!(
+        wait_status(&handle, Duration::from_secs(5), |s| !s.running),
+        "engine must stop cleanly"
+    );
+}
+
 /// Scenario 1 — **Rise**: bursty loss (≈9 % mean, runs of ~10 drops) through
 /// the proxy starves the consumer, whose dry pops raise the jitter depth.
 /// Assert the engine's live `effective_target_ms` climbs above the
@@ -243,18 +321,10 @@ async fn adaptive_depth_rises_under_burst_loss() {
     let proxy_port = free_port_417xx();
     assert_ne!(engine_port, proxy_port, "distinct ports per scenario");
 
-    let config = EngineConfig {
-        transport: Transport::Udp,
-        bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        port: engine_port,
-        codec: CodecMode::Auto,
-        target_ms: BASE_MS,
-        capacity_ms: 100.0,
-    };
-    let handle = spawn_engine_tuned(Some(config), SHRUNK_PARAMS);
+    let handle = spawn_engine_tuned(Some(engine_config(engine_port)), SHRUNK_PARAMS);
     handle
         .cmd()
-        .send(EngineCommand::Start(config))
+        .send(EngineCommand::Start(engine_config(engine_port)))
         .await
         .expect("send Start");
     assert!(
@@ -340,18 +410,10 @@ async fn adaptive_depth_decays_stepwise_on_clean_stream() {
     assert_ne!(engine_port, clean_proxy_port);
     assert_ne!(burst_proxy_port, clean_proxy_port);
 
-    let config = EngineConfig {
-        transport: Transport::Udp,
-        bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        port: engine_port,
-        codec: CodecMode::Auto,
-        target_ms: BASE_MS,
-        capacity_ms: 100.0,
-    };
-    let handle = spawn_engine_tuned(Some(config), SHRUNK_PARAMS);
+    let handle = spawn_engine_tuned(Some(engine_config(engine_port)), SHRUNK_PARAMS);
     handle
         .cmd()
-        .send(EngineCommand::Start(config))
+        .send(EngineCommand::Start(engine_config(engine_port)))
         .await
         .expect("send Start");
     assert!(
