@@ -139,6 +139,18 @@ private fun CaptureScreen() {
 
     fun startCapture() {
         if (nativeError != null) return
+        if (codec == "opus" && frameMs == 5) {
+            // Defense for configs persisted before the UI gated this combo:
+            // the native capture pipeline rejects 5 ms Opus (protocol).
+            showSnackbar("Opus streams at 10 ms frames (protocol)")
+            return
+        }
+        if (transport == "bt" && codec == "pcm") {
+            // Non-blocking warning: raw PCM needs ~1.54 Mbps, at or above the
+            // practical Bluetooth SPP ceiling — expect dropouts. Opus
+            // (32 kbps) is the codec the protocol designed for BT-class links.
+            showSnackbar("PCM can exceed Bluetooth throughput — OPUS recommended")
+        }
         if (transport == "bt") {
             if (btDevice.isBlank()) {
                 showSnackbar("Select a Bluetooth device first")
@@ -411,6 +423,12 @@ private fun CaptureScreen() {
                     onSelect = {
                         codec = it
                         prefs.codec = it
+                        if (it == "opus" && frameMs == 5) {
+                            // Auto-correct: Opus requires 10 ms frames.
+                            frameMs = 10
+                            prefs.frameMs = 10
+                            showSnackbar("Opus requires 10 ms frames — frame switched to 10 MS")
+                        }
                     },
                 )
             }
@@ -420,6 +438,13 @@ private fun CaptureScreen() {
                     options = listOf(ChipOption("5 MS", "5"), ChipOption("10 MS", "10")),
                     selected = frameMs.toString(),
                     onSelect = {
+                        if (codec == "opus" && it == "5") {
+                            // Protocol constraint (shared/protocol.md): Opus is
+                            // exactly one packet per 10 ms frame — the native
+                            // capture pipeline rejects 5 ms Opus outright.
+                            showSnackbar("Opus streams at 10 ms frames (protocol)")
+                            return@ChipRow
+                        }
                         frameMs = it.toInt()
                         prefs.frameMs = it.toInt()
                     },
