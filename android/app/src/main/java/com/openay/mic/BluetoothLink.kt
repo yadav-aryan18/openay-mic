@@ -110,7 +110,7 @@ class BluetoothLink {
         }
         // Create the socket BEFORE the try so both catch arms can close it —
         // connect() failing must not leak the (unconnected) socket.
-        val s = device.createRfcommSocketToServiceRecord(SPP_UUID)
+        var s = device.createRfcommSocketToServiceRecord(SPP_UUID)
         try {
             // Blocking connect() to the desktop's SPP service; the caller is
             // on IO, so stalling here is fine (same model as native's TCP
@@ -120,10 +120,26 @@ class BluetoothLink {
             try { s.close() } catch (_: IOException) {}
             throw BluetoothLinkException("Bluetooth permission missing", e)
         } catch (e: IOException) {
+            // Classic Android → BlueZ SPP quirk: the secure RFCOMM channel
+            // can fail service discovery on some phone/PC pairings where the
+            // insecure channel connects fine (encryption is irrelevant here —
+            // the audio is one-way and the link is already paired). Retry
+            // once with the insecure factory before giving up.
             try { s.close() } catch (_: IOException) {}
-            throw BluetoothLinkException(
-                "Connect failed — is the console paired and its SPP service running?", e
-            )
+            var insecure: BluetoothSocket? = null
+            try {
+                insecure = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+                insecure.connect()
+            } catch (retry: Exception) {
+                try { insecure?.close() } catch (_: IOException) {}
+                if (retry is SecurityException) {
+                    throw BluetoothLinkException("Bluetooth permission missing", retry)
+                }
+                throw BluetoothLinkException(
+                    "Connect failed — is the console paired, in BT mode, and ON AIR?", e
+                )
+            }
+            s = insecure
         }
         // The caller may have torn the link down while the blocking connect()
         // ran: self-clean instead of assigning state into a closed link (the

@@ -149,6 +149,10 @@ private fun CaptureScreen() {
             val intent = MicCaptureService.captureIntent(
                 context, "bt", host, 0, codec, frameMs, device = btDevice
             )
+            // Optimistic flip: the service connects asynchronously (an RFCOMM
+            // connect can take seconds); the stats poll self-corrects to
+            // StandBy if the start fails.
+            running = true
             ContextCompat.startForegroundService(context, intent)
             return
         }
@@ -162,6 +166,7 @@ private fun CaptureScreen() {
             return
         }
         val intent = MicCaptureService.captureIntent(context, transport, host, port, codec, frameMs)
+        running = true
         ContextCompat.startForegroundService(context, intent)
     }
 
@@ -190,7 +195,7 @@ private fun CaptureScreen() {
     // silently).
     fun beginCapture() {
         when {
-            running -> return  // stopCapture is the toggle's job, not ours
+            running -> stopCapture()
             nativeError != null -> showSnackbar("Native library unavailable — cannot start")
             needsBtPermission() -> requestBtPermission()
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
