@@ -1102,7 +1102,7 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
     // With audio-output compiled in, only an explicit `--output` run has a
     // consumer; claiming "network+jitter only" there would be misleading.
     #[cfg(all(not(feature = "pipewire"), feature = "audio-output"))]
-    if !config.audio_output {
+    if !config.audio_output && !config.monitor {
         eprintln!("openay-server: no audio output requested — network+jitter only");
     }
 
