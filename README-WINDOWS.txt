@@ -39,8 +39,11 @@ Wi-Fi usage
 USB usage (lower latency, more reliable)
 ----------------------------------------
 1. Enable USB debugging on the phone, connect the cable.
-2. Forward the port with adb (from Android SDK platform-tools):
-       adb.exe forward tcp:41700 tcp:41700
+2. Forward the port with the bundled adb (dist\openay-windows\adb\; an
+   SDK install is not needed — see adb\NOTICE.txt for its license):
+       adb\adb.exe forward tcp:41700 tcp:41700
+   (If the folder is missing, use adb from your own Android SDK
+   platform-tools instead.)
 3. Start the receiver:
        openay-server.exe --transport tcp --output
 4. In the phone app choose TCP transport and connect to 127.0.0.1:41700.
