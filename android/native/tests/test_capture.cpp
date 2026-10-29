@@ -16,6 +16,7 @@
 // tool's 42000-42999 range and the validation gate's fixed ports are safe).
 #include "openay/capture_pipeline.h"
 #include "openay/capture_engine.h"
+#include "openay/control.h"
 #include "openay/test_source.h"
 #include "openay/transport.h"
 
@@ -111,29 +112,42 @@ long ParseLevelPeak(const std::string& json) {
     return std::strtol(json.c_str() + pos + key.size(), nullptr, 10);
 }
 
-// Shared assertions for both variants: seq contiguous from 0, expected type,
-// expected payload size (skipped when 0, e.g. variable-size Opus packets), no
-// overruns/errors on the pipeline.
+// Shared assertions for both variants: the session is bracketed by a hello
+// and a bye control packet (shared seq space), the audio packets are
+// contiguous from seq 1 with the expected type and payload size (skipped
+// when 0, e.g. variable-size Opus packets), and the pipeline is healthy.
 void CheckStream(const std::vector<Packet>& pkts, CapturePipeline* pipe,
                  size_t expected_min, size_t expected_max,
                  PayloadType type, size_t payload_size) {
-    printf("capture: received=%zu\n", pkts.size());
-    CHECK(pkts.size() >= expected_min && pkts.size() <= expected_max);
-    for (size_t i = 0; i < pkts.size(); ++i) {
-        if (pkts[i].seq != static_cast<uint16_t>(i)) {
-            fprintf(stderr, "FAIL: seq %u at index %zu (not contiguous from 0)\n",
-                    pkts[i].seq, i);
+    std::vector<const Packet*> audio;
+    for (const Packet& p : pkts) {
+        if (p.type == PayloadType::Control) continue;
+        audio.push_back(&p);
+    }
+    printf("capture: received=%zu (audio=%zu)\n", pkts.size(), audio.size());
+    CHECK(pkts.size() >= 2);
+    CHECK(pkts.front().type == PayloadType::Control);  // session hello
+    CHECK(pkts.back().type == PayloadType::Control);   // session bye
+    CHECK(pipe->control_sent() == 2);  // hello + bye (receiver sends nothing)
+    CHECK(pipe->control_received() == 0);
+    CHECK(pipe->peer_link() == openay::PeerLink::Unknown);
+    CHECK(audio.size() >= expected_min && audio.size() <= expected_max);
+    for (size_t i = 0; i < audio.size(); ++i) {
+        // The hello took seq 0; audio continues from 1.
+        if (audio[i]->seq != static_cast<uint16_t>(i + 1)) {
+            fprintf(stderr, "FAIL: seq %u at index %zu (not contiguous from 1)\n",
+                    audio[i]->seq, i);
             g_failures.fetch_add(1, std::memory_order_relaxed);
             break;
         }
-        CHECK(pkts[i].type == type);
-        if (payload_size != 0) CHECK(pkts[i].payload.size() == payload_size);
+        CHECK(audio[i]->type == type);
+        if (payload_size != 0) CHECK(audio[i]->payload.size() == payload_size);
     }
     CHECK(pipe->ring_overruns() == 0);
     CHECK(pipe->encode_errors() == 0);
     CHECK(pipe->send_errors() == 0);
     CHECK(pipe->Healthy());
-    CHECK(pipe->packets_sent() == pkts.size());
+    CHECK(pipe->packets_sent() == audio.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +296,7 @@ void TestOpus() {
     size_t warmup_skipped = 0;
     bool all_decoded = true;
     for (const Packet& p : pkts) {
+        if (p.type != PayloadType::Opus) continue;  // hello/bye are control
         if (warmup_skipped < 2) {  // skip the encoder/decoder pre-roll frames
             ++warmup_skipped;
             continue;
@@ -303,6 +318,134 @@ void TestOpus() {
     CHECK(rms > 1000.0);
 }
 #endif  // OPENAY_HAVE_OPUS
+
+// ---------------------------------------------------------------------------
+// Call auto-mute: muted capture streams digital silence, timing continues.
+// ---------------------------------------------------------------------------
+
+void TestMute() {
+    uint16_t port = 0;
+    auto recv = BindReceiver(&port);
+    CHECK(recv != nullptr);
+    if (!recv) return;
+
+    TestSource source;
+    CapturePipeline pipe;
+    CHECK(pipe.Configure(&source, TransportType::Udp, "127.0.0.1", port,
+                         CodecType::Pcm, 10));
+    pipe.SetMuted(true);
+    CHECK(pipe.IsMuted());
+    CHECK(pipe.Start());
+
+    std::atomic<bool> stop{false};
+    std::vector<Packet> pkts;
+    std::thread recv_thread(RunReceiver, std::move(recv), &stop, &pkts);
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    // The level meter stays at zero while muted (each read covers ~300 ms).
+    CHECK(pipe.ExchangeLevelPeak() == 0);
+    pipe.Stop();
+    stop.store(true, std::memory_order_relaxed);
+    recv_thread.join();
+
+    // Control bracket still present and audio packets still flowed.
+    CHECK(pkts.size() >= 2);
+    CHECK(pkts.front().type == PayloadType::Control);
+    CHECK(pkts.back().type == PayloadType::Control);
+    size_t audio = 0;
+    size_t nonzero = 0;
+    for (const Packet& p : pkts) {
+        if (p.type != PayloadType::Pcm) continue;
+        ++audio;
+        for (size_t i = 0; i + 1 < p.payload.size(); i += 2) {
+            if (p.payload[i] != 0 || p.payload[i + 1] != 0) ++nonzero;
+        }
+    }
+    CHECK(audio >= 25);                       // ~400 ms of 10 ms frames
+    CHECK(nonzero == 0);                      // every sample was silence
+    CHECK(pipe.packets_sent() == audio);
+    printf("capture: mute test ok (audio=%zu)\n", audio);
+}
+
+// ---------------------------------------------------------------------------
+// Control plane against a scripted sink: hello on start, pong in answer to a
+// ping, hello-ack liveness flips the peer link from Unknown to Alive.
+// ---------------------------------------------------------------------------
+
+class ScriptedSink : public openay::IPacketSink {
+public:
+    // IPacketSink
+    bool Send(const Packet& p) override {
+        sent_.push_back(p);
+        return true;
+    }
+    bool Valid() const override { return true; }
+    bool Recv(Packet* out, int) override {
+        if (next_rx_ >= scripted_.size()) return false;
+        *out = scripted_[next_rx_++];
+        return true;
+    }
+
+    void Script(Packet p) { scripted_.push_back(std::move(p)); }
+    const std::vector<Packet>& sent() const { return sent_; }
+    size_t consumed() const { return next_rx_; }
+
+private:
+    std::vector<Packet> scripted_;
+    size_t next_rx_ = 0;
+    std::vector<Packet> sent_;
+};
+
+void TestControlPlane() {
+    using openay::ControlKind;
+    PushSource source;  // no audio pushed: this run is control-only
+    CapturePipeline pipe;
+    auto sink = std::make_unique<ScriptedSink>();
+    ScriptedSink* raw = sink.get();
+    CHECK(pipe.Configure(&source, std::move(sink), CodecType::Pcm, 10));
+    CHECK(pipe.peer_link() == openay::PeerLink::Unknown);
+    CHECK(pipe.Start());
+
+    // Script the receiver's traffic: a ping (must be answered with pong)
+    // and a hello-ack (proves liveness).
+    Packet ping;
+    ping.type = PayloadType::Control;
+    ping.seq = 7;
+    ping.payload = openay::EncodeControl(ControlKind::Ping, "", "", 0);
+    raw->Script(ping);
+    Packet ack;
+    ack.type = PayloadType::Control;
+    ack.seq = 8;
+    ack.payload = openay::EncodeControl(ControlKind::HelloAck, "openay-server",
+                                        "pcm,opus", 48000);
+    raw->Script(ack);
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline &&
+           (raw->consumed() < 2 || pipe.peer_link() != openay::PeerLink::Alive)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    bool saw_hello = false;
+    bool saw_pong = false;
+    for (const Packet& p : raw->sent()) {
+        if (p.type != PayloadType::Control) continue;
+        const ControlKind k = openay::ParseControl(p.payload.data(),
+                                                   p.payload.size(), nullptr);
+        if (k == ControlKind::Hello) saw_hello = true;
+        if (k == ControlKind::Pong) saw_pong = true;
+    }
+    CHECK(saw_hello);                                // session opener
+    CHECK(saw_pong);                                 // ping answered
+    CHECK(raw->consumed() == 2);                     // both scripted consumed
+    CHECK(pipe.control_received() == 2);
+    CHECK(pipe.peer_link() == openay::PeerLink::Alive);
+    CHECK(pipe.packets_sent() == 0);                 // no audio this run
+    CHECK(pipe.Healthy());
+    pipe.Stop();
+    printf("capture: control-plane test ok (control_sent=%zu)\n",
+           static_cast<size_t>(pipe.control_sent()));
+}
 
 // ---------------------------------------------------------------------------
 // CaptureEngine facade smoke: configure/start/stop + StatsJson exact shape.
@@ -385,6 +528,8 @@ void TestEngineSmoke() {
 int main() {
     TestPcm();
     TestLevelMeter();
+    TestMute();
+    TestControlPlane();
 #ifdef OPENAY_HAVE_OPUS
     TestOpus();
 #else

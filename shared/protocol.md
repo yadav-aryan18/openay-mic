@@ -32,8 +32,41 @@ Max packet size: 6 + 65535 bytes. Wi-Fi/UDP senders should keep payloads
 |-------|-----------------------|------------------------------------------------------|
 | 0x00  | PCM                   | Raw PCM, signed 16-bit little-endian, mono, 48 kHz   |
 | 0x01  | OPUS                  | One Opus packet, mono, 48 kHz                        |
-| 0x02  | CONTROL               | UTF-8 JSON control message (handshake/stats/bye)     |
+| 0x02  | CONTROL               | UTF-8 JSON control message (see Control messages)    |
 | other | reserved              | Receivers must count as malformed and drop           |
+
+### Control messages (additive v1 extension)
+
+The CONTROL payload carries small JSON objects from the fixed vocabulary
+below. Everything here is **optional in both directions**: a peer that never
+sends control traffic interoperates exactly as before, and unknown payloads
+are ignored (counted as received, never fatal). Control packets share the
+audio sequence space of their direction.
+
+| `t`         | Direction       | Fields                              | Meaning                                             |
+|-------------|-----------------|-------------------------------------|-----------------------------------------------------|
+| `hello`     | sender→receiver | `app`, `proto`, `codecs`?, `rate`?  | First packet of a session; sender capabilities      |
+| `hello-ack` | receiver→sender | `app`, `proto`, `codecs`?, `rate`?  | Receiver capabilities, answer to `hello`            |
+| `ping`      | receiver→sender | —                                   | Liveness probe, emitted every 1 s                   |
+| `pong`      | sender→receiver | —                                   | Answer to `ping`                                    |
+| `bye`       | either          | —                                   | The sender is ending the session                    |
+
+Semantics:
+
+- `proto` is the control-vocabulary version (currently `1`); `codecs` lists
+  payload type names the peer can produce/accept (`"pcm"`, `"opus"`); `rate`
+  is the sample rate in Hz. Fields marked `?` default when omitted; unknown
+  fields are ignored; unknown `t` values make the payload not-a-control-
+  message (still counted as received traffic).
+- The receiver sends `ping` every 1 s to whichever peer last sent it a
+  packet. Any received packet — audio or control — proves the sender is
+  alive; a sender that has sent at least one packet but stays silent for
+  more than 5 s is reported stale by the receiver's status API (the stream
+  itself stays up — a paused sender is legitimate).
+- Reference serialization is `openay_protocol::control` (Rust) and
+  `openay/control.h` (C++); both must stay byte-compatible.
+
+Example: `{"t":"hello","app":"openay-mic","proto":1,"codecs":["pcm","opus"],"rate":48000}`
 
 ### Sequencing
 

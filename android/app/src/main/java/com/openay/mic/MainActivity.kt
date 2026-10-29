@@ -113,6 +113,8 @@ private fun CaptureScreen() {
     var codec by remember { mutableStateOf(prefs.codec) }
     var frameMs by remember { mutableStateOf(prefs.frameMs) }
     var btDevice by remember { mutableStateOf(prefs.btDevice) }
+    var voiceFx by remember { mutableStateOf(prefs.voiceFx) }
+    var muteOnCall by remember { mutableStateOf(prefs.muteOnCall) }
 
     // --- live state ---
     var running by remember { mutableStateOf(false) }
@@ -159,7 +161,8 @@ private fun CaptureScreen() {
             // host/port are meaningless over RFCOMM; the device address rides
             // along and the service performs the connect + pipe handover.
             val intent = MicCaptureService.captureIntent(
-                context, "bt", host, 0, codec, frameMs, device = btDevice
+                context, "bt", host, 0, codec, frameMs, voiceFx, muteOnCall,
+                device = btDevice
             )
             // Optimistic flip: the service connects asynchronously (an RFCOMM
             // connect can take seconds); the stats poll self-corrects to
@@ -177,7 +180,10 @@ private fun CaptureScreen() {
             showSnackbar("Host must not be empty")
             return
         }
-        val intent = MicCaptureService.captureIntent(context, transport, host, port, codec, frameMs)
+        val intent = MicCaptureService.captureIntent(
+            context, transport, host, port, codec, frameMs, voiceFx, muteOnCall,
+            device = btDevice
+        )
         running = true
         ContextCompat.startForegroundService(context, intent)
     }
@@ -383,9 +389,10 @@ private fun CaptureScreen() {
                     reducedMotion = reducedMotion,
                     onClick = ::onTogglePress,
                 )
+                val linkNote = if (running && stats?.peerLink == "lost") " · LINK LOST" else ""
                 Text(
                     "${transportLabel(transport)} · $target · " +
-                        "${codecLabel(codec)} ${frameMs}MS",
+                        "${codecLabel(codec)} ${frameMs}MS$linkNote",
                     style = OpenAyDataStyles.micro,
                     color = Dim.copy(alpha = 0.85f),
                     maxLines = 1,
@@ -451,6 +458,28 @@ private fun CaptureScreen() {
                 )
             }
 
+            SettingsRow(label = "VOICE FX") {
+                ChipRow(
+                    options = listOf(ChipOption("ON", "on"), ChipOption("OFF", "off")),
+                    selected = if (voiceFx) "on" else "off",
+                    onSelect = {
+                        voiceFx = it == "on"
+                        prefs.voiceFx = voiceFx
+                    },
+                )
+            }
+
+            SettingsRow(label = "MUTE ON CALL") {
+                ChipRow(
+                    options = listOf(ChipOption("ON", "on"), ChipOption("OFF", "off")),
+                    selected = if (muteOnCall) "on" else "off",
+                    onSelect = {
+                        muteOnCall = it == "on"
+                        prefs.muteOnCall = muteOnCall
+                    },
+                )
+            }
+
             NetworkCard(
                 host = host,
                 onHostChange = {
@@ -491,6 +520,7 @@ private data class MicStats(
     val sendErrors: Long = 0L,
     val lastError: String = "",
     val levelPeak: Int = 0,
+    val peerLink: String = "unknown",
 )
 
 private fun parseMicStats(json: String): MicStats? = try {
@@ -500,6 +530,7 @@ private fun parseMicStats(json: String): MicStats? = try {
         sendErrors = o.optLong("send_errors"),
         lastError = o.optString("last_error"),
         levelPeak = o.optInt("level_peak"),
+        peerLink = o.optString("peer_link", "unknown"),
     )
 } catch (_: Exception) {
     null
@@ -539,6 +570,14 @@ private class AppPrefs(context: Context) {
         get() = sp.getString(KEY_BT_DEVICE, DEFAULT_BT_DEVICE) ?: DEFAULT_BT_DEVICE
         set(value) = sp.edit().putString(KEY_BT_DEVICE, value).apply()
 
+    var voiceFx: Boolean
+        get() = sp.getBoolean(KEY_VOICE_FX, DEFAULT_VOICE_FX)
+        set(value) = sp.edit().putBoolean(KEY_VOICE_FX, value).apply()
+
+    var muteOnCall: Boolean
+        get() = sp.getBoolean(KEY_MUTE_ON_CALL, DEFAULT_MUTE_ON_CALL)
+        set(value) = sp.edit().putBoolean(KEY_MUTE_ON_CALL, value).apply()
+
     private companion object {
         const val PREFS_NAME = "openay_mic_settings"
         const val KEY_TRANSPORT = "transport"
@@ -547,12 +586,16 @@ private class AppPrefs(context: Context) {
         const val KEY_CODEC = "codec"
         const val KEY_FRAME_MS = "frame_ms"
         const val KEY_BT_DEVICE = "bt_device"
+        const val KEY_VOICE_FX = "voice_fx"
+        const val KEY_MUTE_ON_CALL = "mute_on_call"
         const val DEFAULT_TRANSPORT = "udp"
         const val DEFAULT_HOST = "10.0.2.2"
         const val DEFAULT_PORT = "41700"
         const val DEFAULT_CODEC = "pcm"
         const val DEFAULT_FRAME_MS = 10
         const val DEFAULT_BT_DEVICE = ""
+        const val DEFAULT_VOICE_FX = true
+        const val DEFAULT_MUTE_ON_CALL = true
     }
 }
 

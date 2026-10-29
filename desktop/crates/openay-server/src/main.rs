@@ -62,6 +62,10 @@ struct Args {
     /// Jitter buffer capacity in ms of audio.
     #[arg(long, default_value_t = 100.0)]
     capacity_ms: f32,
+    /// Output gain applied to decoded samples before the jitter buffer
+    /// (1.0 = unity; clamped to 0..=4).
+    #[arg(long, default_value_t = 1.0)]
+    gain: f32,
     /// Play received audio on a local output device (ALSA on Linux, WASAPI
     /// on Windows) instead of the PipeWire virtual microphone. Requires the
     /// `audio-output` build feature.
@@ -128,6 +132,7 @@ async fn main() -> Result<()> {
         },
         target_ms,
         capacity_ms: args.capacity_ms,
+        gain: args.gain,
     }
     .validated()
     .map_err(|e: ConfigError| anyhow::anyhow!(e))?;

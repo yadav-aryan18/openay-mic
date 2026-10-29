@@ -31,9 +31,13 @@ public:
 
     // Re-configures the engine (stopping a running stream first). Returns
     // false on any error; the reason is recorded and surfaces in StatsJson's
-    // "last_error".
+    // "last_error". `session_for_effects` asks the platform capture stream
+    // to allocate an audio session id (Android API 28+) so the app can
+    // attach echo-cancellation/noise-suppression effects to it; harmless on
+    // hosts (the test source ignores it).
     bool Configure(TransportType transport, const std::string& host,
-                   uint16_t port, CodecType codec, int frame_ms);
+                   uint16_t port, CodecType codec, int frame_ms,
+                   bool session_for_effects = true);
 
     // Bluetooth (RFCOMM/SPP via the Kotlin bridge) variant of Configure: `fd`
     // is the write end of the Kotlin pipe handed over by NativeBridge's
@@ -44,17 +48,25 @@ public:
     // close it. `device_address` is display-only (StatsJson "host"; "port"
     // is 0).
     bool ConfigureBt(int fd, const std::string& device_address,
-                     CodecType codec, int frame_ms);
+                     CodecType codec, int frame_ms,
+                     bool session_for_effects = true);
     bool Start();
     void Stop();
     bool IsRunning() const;
+
+    // Mutes the captured stream (digital silence keeps flowing so timing
+    // and the control channel stay live). Safe from any thread, any time.
+    void SetMuted(bool muted);
+
+    // Platform audio session id of the live capture stream (0 = none/unsupported).
+    int AudioSessionId();
 
     // Exact hand-serialized JSON object (fixed vocabulary, nothing escaped):
     // {"running":true,"transport":"udp","host":"10.0.2.2","port":41700,
     //  "codec":"opus","frame_ms":10,"sharing":"exclusive","sample_rate":48000,
     //  "sent":1234,"bytes":1186560,"ring_overruns":0,"encode_errors":0,
     //  "send_errors":0,"xruns":0,"callback_us_p50":0,"last_error":"",
-    //  "level_peak":40}
+    //  "level_peak":40,"peer_link":"alive","muted":false,"audio_session":0}
     // For BT runs "transport" is "bt", "host" is the device address and
     // "port" is 0.
     std::string StatsJson() const;

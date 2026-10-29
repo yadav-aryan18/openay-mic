@@ -24,10 +24,13 @@ const char* CodecName(CodecType c) {
     return c == CodecType::Pcm ? "pcm" : "opus";
 }
 
-std::unique_ptr<IAudioSource> MakeSource() {
+std::unique_ptr<IAudioSource> MakeSource(bool session_for_effects) {
 #ifdef __ANDROID__
-    return std::make_unique<OboeSource>();
+    auto src = std::make_unique<OboeSource>();
+    src->set_allocate_session(session_for_effects);
+    return src;
 #else
+    (void)session_for_effects;
     return std::make_unique<TestSource>();  // 440 Hz host simulator
 #endif
 }
@@ -43,7 +46,8 @@ uint32_t LevelPercent(uint32_t peak) {
 CaptureEngine::~CaptureEngine() { Stop(); }
 
 bool CaptureEngine::Configure(TransportType transport, const std::string& host,
-                              uint16_t port, CodecType codec, int frame_ms) {
+                              uint16_t port, CodecType codec, int frame_ms,
+                              bool session_for_effects) {
     std::lock_guard<std::mutex> lk(mu_);
     if (running_) StopLocked();
 
@@ -56,7 +60,7 @@ bool CaptureEngine::Configure(TransportType transport, const std::string& host,
     frame_ms_ = frame_ms;
     sharing_ = "exclusive";
 
-    auto src = MakeSource();
+    auto src = MakeSource(session_for_effects);
     auto pipe = std::make_unique<CapturePipeline>();
     if (!pipe->Configure(src.get(), transport, host, port, codec, frame_ms)) {
         // Keep the failed pipeline around so StatsJson reports the reason.
@@ -70,7 +74,8 @@ bool CaptureEngine::Configure(TransportType transport, const std::string& host,
 }
 
 bool CaptureEngine::ConfigureBt(int fd, const std::string& device_address,
-                                CodecType codec, int frame_ms) {
+                                CodecType codec, int frame_ms,
+                                bool session_for_effects) {
     std::lock_guard<std::mutex> lk(mu_);
     if (running_) StopLocked();
 
@@ -86,7 +91,7 @@ bool CaptureEngine::ConfigureBt(int fd, const std::string& device_address,
     frame_ms_ = frame_ms;
     sharing_ = "exclusive";
 
-    auto src = MakeSource();
+    auto src = MakeSource(session_for_effects);
     auto pipe = std::make_unique<CapturePipeline>();
     if (!pipe->ConfigureBt(src.get(), fd, codec, frame_ms)) {
         // Keep the failed pipeline around so StatsJson reports the reason.
@@ -124,6 +129,17 @@ void CaptureEngine::StopLocked() {
 bool CaptureEngine::IsRunning() const {
     std::lock_guard<std::mutex> lk(mu_);
     return running_;
+}
+
+void CaptureEngine::SetMuted(bool muted) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (pipeline_) pipeline_->SetMuted(muted);
+}
+
+int CaptureEngine::AudioSessionId() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!source_) return 0;
+    return source_->audio_session_id();
 }
 
 uint16_t CaptureEngine::ExchangeLevelPeak() {
@@ -193,6 +209,12 @@ std::string CaptureEngine::StatsJson() const {
     json += last_error;
     json += "\",\"level_peak\":";
     json += std::to_string(LevelPercent(level_peak));
+    json += ",\"peer_link\":\"";
+    json += pipeline_ ? PeerLinkName(pipeline_->peer_link()) : "unknown";
+    json += "\",\"muted\":";
+    json += pipeline_ && pipeline_->IsMuted() ? "true" : "false";
+    json += ",\"audio_session\":";
+    json += std::to_string(source_ ? source_->audio_session_id() : 0);
     json += "}";
     return json;
 }

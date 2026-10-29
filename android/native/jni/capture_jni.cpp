@@ -1,9 +1,12 @@
 // OpenAY Mic — JNI bridge (Android only; excluded from host builds).
 //
 // Exposes the capture engine to Kotlin's com.openay.mic.NativeBridge:
-//   nativeStart(String transport, String host, int port, String codec, int frameMs)
-//   nativeStartBt(int fd, String deviceAddress, String codec, int frameMs)
+//   nativeStart(String transport, String host, int port, String codec,
+//               int frameMs, boolean sessionForEffects)
+//   nativeStartBt(int fd, String deviceAddress, String codec, int frameMs,
+//                 boolean sessionForEffects)
 //   nativeStop() / nativeIsRunning() / nativeGetStats()
+//   nativeSetMuted(boolean) / nativeGetAudioSessionId()
 //
 // The engine is a process-wide singleton guarded by one std::mutex. All calls
 // arrive from the app's service thread (never from the audio RT thread), so
@@ -47,7 +50,8 @@ JNIEXPORT jboolean JNICALL
 Java_com_openay_mic_NativeBridge_nativeStart(JNIEnv* env, jobject,
                                              jstring jtransport, jstring jhost,
                                              jint port, jstring jcodec,
-                                             jint frame_ms) {
+                                             jint frame_ms,
+                                             jboolean session_for_effects) {
     std::lock_guard<std::mutex> lk(g_engine_mu);
     if (!g_engine) g_engine = new openay::CaptureEngine();
 
@@ -81,7 +85,8 @@ Java_com_openay_mic_NativeBridge_nativeStart(JNIEnv* env, jobject,
     if (g_engine->IsRunning()) g_engine->Stop();
 
     if (!g_engine->Configure(tt, host, static_cast<uint16_t>(port), ct,
-                             static_cast<int>(frame_ms))) {
+                             static_cast<int>(frame_ms),
+                             session_for_effects == JNI_TRUE)) {
         // Reason is recorded in the engine; the app reads it via StatsJson.
         __android_log_print(ANDROID_LOG_ERROR, kTag,
                             "nativeStart: configure failed (%s:%d, %s, %d ms)",
@@ -102,7 +107,8 @@ Java_com_openay_mic_NativeBridge_nativeStart(JNIEnv* env, jobject,
 JNIEXPORT jboolean JNICALL
 Java_com_openay_mic_NativeBridge_nativeStartBt(JNIEnv* env, jobject, jint fd,
                                                jstring jdevice,
-                                               jstring jcodec, jint frame_ms) {
+                                               jstring jcodec, jint frame_ms,
+                                               jboolean session_for_effects) {
     std::lock_guard<std::mutex> lk(g_engine_mu);
     if (!g_engine) g_engine = new openay::CaptureEngine();
 
@@ -126,7 +132,8 @@ Java_com_openay_mic_NativeBridge_nativeStartBt(JNIEnv* env, jobject, jint fd,
     // A running stream is replaced: Start() is an explicit new configuration.
     if (g_engine->IsRunning()) g_engine->Stop();
 
-    if (!g_engine->ConfigureBt(fd, device, ct, static_cast<int>(frame_ms))) {
+    if (!g_engine->ConfigureBt(fd, device, ct, static_cast<int>(frame_ms),
+                               session_for_effects == JNI_TRUE)) {
         // Reason is recorded in the engine; the app reads it via StatsJson.
         // The fd was consumed (closed) by ConfigureBt either way.
         __android_log_print(ANDROID_LOG_ERROR, kTag,
@@ -154,6 +161,20 @@ JNIEXPORT jboolean JNICALL
 Java_com_openay_mic_NativeBridge_nativeIsRunning(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lk(g_engine_mu);
     return g_engine && g_engine->IsRunning() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_openay_mic_NativeBridge_nativeSetMuted(JNIEnv*, jobject,
+                                                jboolean muted) {
+    std::lock_guard<std::mutex> lk(g_engine_mu);
+    if (g_engine) g_engine->SetMuted(muted == JNI_TRUE);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_openay_mic_NativeBridge_nativeGetAudioSessionId(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lk(g_engine_mu);
+    if (!g_engine) return 0;
+    return g_engine->AudioSessionId();
 }
 
 JNIEXPORT jstring JNICALL

@@ -110,6 +110,8 @@ pub struct App {
     transport: Transport,
     codec: CodecMode,
     target_ms: f32,
+    /// Output gain applied to decoded samples (engine clamps 0..=4).
+    gain: f32,
     autostart: bool,
     start_minimized: bool,
     reduce_motion: bool,
@@ -151,6 +153,7 @@ pub enum Message {
     TransportSelected(Transport),
     CodecSelected(CodecMode),
     TargetChanged(f32),
+    GainChanged(f32),
     AutostartToggled(bool),
     MinimizedToggled(bool),
     MotionToggled(bool),
@@ -180,6 +183,7 @@ impl App {
         let transport = config.transport_mode();
         let codec = config.codec_mode();
         let target_ms = config.target_ms;
+        let gain = config.gain;
         let autostart = config.autostart;
         let start_minimized = config.start_minimized;
         let reduce_motion = config.reduce_motion;
@@ -228,6 +232,7 @@ impl App {
             transport,
             codec,
             target_ms,
+            gain,
             autostart,
             start_minimized,
             reduce_motion,
@@ -298,6 +303,11 @@ impl App {
             }
             Message::TargetChanged(v) => {
                 self.target_ms = v;
+                self.dirty = true;
+                Task::none()
+            }
+            Message::GainChanged(v) => {
+                self.gain = v;
                 self.dirty = true;
                 Task::none()
             }
@@ -520,6 +530,7 @@ impl App {
                 openay_server::MIN_PREBUFFER_MS,
                 openay_server::MAX_PREBUFFER_MS,
             ),
+            gain: self.gain,
             autostart: self.autostart,
             start_minimized: self.start_minimized,
             reduce_motion: self.reduce_motion,
@@ -1125,6 +1136,20 @@ impl App {
                     };
                 hint
             },
+            Space::new(4.0, 4.0),
+            row![
+                text("OUTPUT GAIN")
+                    .font(theme::FONT_LABEL)
+                    .size(10)
+                    .color(theme::DIM),
+                Space::with_width(Length::Fill),
+                text(format!("{:.1}x", self.gain))
+                    .font(theme::FONT_MONO_MEDIUM)
+                    .size(12)
+                    .color(theme::CREAM),
+            ]
+            .align_y(alignment::Vertical::Center),
+            slider(0.0..=4.0, self.gain, Message::GainChanged).step(0.1_f32),
             Space::new(4.0, 4.0),
             toggler(self.autostart)
                 .label("AUTOSTART")
