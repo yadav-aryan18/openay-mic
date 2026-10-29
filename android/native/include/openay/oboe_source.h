@@ -52,6 +52,15 @@ public:
     uint64_t xruns() const override;
     // Last onErrorAfterClose text ("" when no stream error occurred).
     std::string error_string() const override;
+    // Platform audio session id of the live stream (0 when closed or
+    // unsupported). The app attaches echo-cancellation/noise-suppression
+    // effects to this session Kotlin-side.
+    int audio_session_id() const override;
+
+    // Ask the builder to allocate an audio session id for the stream
+    // (default true; the id is only available on API 28+ and the open still
+    // succeeds without one on older devices). Call before Start().
+    void set_allocate_session(bool allocate) { allocate_session_ = allocate; }
 
     // oboe::AudioStreamDataCallback — runs on the audio RT thread.
     // Push-only: forward samples and continue.
@@ -73,6 +82,11 @@ private:
     std::atomic<bool> stream_error_{false};
     std::string error_text_;
     std::string sharing_mode_;
+    // Session-id policy + last observed id (0 = none). session_id_ is set
+    // after a successful open and cleared on close/error; read only from
+    // the stats path.
+    bool allocate_session_ = true;
+    int session_id_ = 0;
 };
 
 }  // namespace openay

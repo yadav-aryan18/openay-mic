@@ -452,12 +452,81 @@ void TestTcpResync() {
 
 }  // namespace
 
+// Regression: a TCP packet split across a Recv poll-timeout boundary must
+// not lose its already-consumed bytes — the next Recv resumes mid-packet.
+// (The phone answers pings on its TCP audio socket with timeout 0, so
+// segment splits are expected in the field.)
+void TestTcpSplitRead() {
+    const uint16_t port = PickPort() + 20;
+
+    std::mutex mu;
+    std::condition_variable cv;
+    std::atomic<bool> ready{false};
+    std::unique_ptr<TcpConn> conn;
+
+    std::thread th([&]() {
+        TcpServer server(port);
+        if (!server.Listen()) {
+            ready = true;
+            cv.notify_all();
+            return;
+        }
+        ready = true;
+        cv.notify_all();
+        conn = server.Accept(5000);
+    });
+    {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&]() { return ready.load(); });
+    }
+
+    // Raw sender: byte-level control over the wire stream.
+    int sfd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(sfd >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    CHECK(connect(sfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    th.join();
+    CHECK(conn != nullptr);
+    if (!conn) {
+        close(sfd);
+        return;
+    }
+
+    Packet pkt;
+    pkt.type = PayloadType::Pcm;
+    pkt.seq = 42;
+    pkt.payload = {0x11, 0x22, 0x33, 0x44};
+    const auto wire = EncodePacket(pkt);
+    CHECK(wire.size() == 10);
+
+    // Deliver only the first 3 header bytes, then let the read time out.
+    CHECK(send(sfd, wire.data(), 3, 0) == 3);
+    Packet out;
+    CHECK(!conn->Recv(&out, 50));  // timeout mid-header is expected
+
+    // The remaining bytes complete the SAME packet (nothing was lost).
+    CHECK(send(sfd, wire.data() + 3, wire.size() - 3, 0) ==
+          static_cast<ssize_t>(wire.size() - 3));
+    CHECK(conn->Recv(&out, 2000));
+    CHECK(out.type == PayloadType::Pcm);
+    CHECK(out.seq == 42);
+    CHECK(out.payload == pkt.payload);
+    CHECK(!conn->Eof());
+
+    close(sfd);
+    conn.reset();
+}
+
 int main() {
     TestSeqTracker();
     TestUdpLoopback();
     TestTcpLoopback();
     TestMalformedUdp();
     TestTcpResync();
+    TestTcpSplitRead();
     if (g_failures == 0) {
         printf("test_transport: all checks passed\n");
         return 0;

@@ -31,6 +31,8 @@ pub const DEFAULT_PORT: u16 = 41_700;
 pub const DEFAULT_BIND: &str = "0.0.0.0";
 /// Default jitter target in ms (design.md chain: `10.0 ms`).
 pub const DEFAULT_TARGET_MS: f32 = 10.0;
+/// Default output gain (unity). Applied receiver-side, after decode.
+pub const DEFAULT_GAIN: f32 = 1.0;
 
 /// The persisted user settings. Serialized as TOML; every field has a
 /// default so a missing or partial file loads fine.
@@ -41,6 +43,9 @@ pub struct Config {
     pub bind: String,
     pub codec: String,
     pub target_ms: f32,
+    /// Output gain applied to decoded samples (1.0 = unity, clamped
+    /// 0..=4 by the engine).
+    pub gain: f32,
     pub autostart: bool,
     pub start_minimized: bool,
     /// Drop cable pulses and the power-on stagger (accessibility).
@@ -57,6 +62,7 @@ impl Default for Config {
             bind: DEFAULT_BIND.to_string(),
             codec: "auto".to_string(),
             target_ms: DEFAULT_TARGET_MS,
+            gain: DEFAULT_GAIN,
             autostart: false,
             start_minimized: false,
             reduce_motion: false,
@@ -97,6 +103,7 @@ impl Config {
             capacity_ms: 100.0,
             audio_output: cfg!(windows),
             output_device: self.output_device.clone(),
+            gain: self.gain,
         }
     }
 }
@@ -332,6 +339,7 @@ mod tests {
             bind: "127.0.0.1".to_string(),
             codec: "opus".to_string(),
             target_ms: 15.0,
+            gain: 1.5,
             autostart: true,
             start_minimized: true,
             reduce_motion: true,
@@ -351,6 +359,7 @@ mod tests {
             bind: "0.0.0.0".to_string(),
             codec: "pcm".to_string(),
             target_ms: 5.0,
+            gain: 1.0,
             autostart: false,
             start_minimized: true,
             reduce_motion: false,

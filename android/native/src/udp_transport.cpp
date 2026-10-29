@@ -72,6 +72,20 @@ bool UdpSender::Send(const Packet& packet) {
     return true;
 }
 
+bool UdpSender::Recv(Packet* out, int timeout_ms) {
+    if (fd_ < 0) return false;
+    pollfd pfd{fd_, POLLIN, 0};
+    const int prc = poll(&pfd, 1, timeout_ms);
+    if (prc <= 0) return false;  // timeout or poll error: nothing to read
+
+    // Max IPv4 UDP payload is 65507; 65541 leaves room for the header.
+    uint8_t buf[65541];
+    const ssize_t n = recv(fd_, buf, sizeof(buf), 0);
+    if (n <= 0) return false;  // error or clean nothing; not fatal here
+    DecodeError err = DecodeError::Truncated;
+    return DecodePacket(buf, static_cast<size_t>(n), out, &err);
+}
+
 // ---------------------------------------------------------------------------
 // UdpReceiver
 // ---------------------------------------------------------------------------

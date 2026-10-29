@@ -1,0 +1,92 @@
+# Continuous integration for OpenAY Mic.
+#
+# Linux job: full Rust workspace (unit, golden-vector, codec, GUI) plus the
+# C++ host suite — the same gates as scripts/run_phase6.sh, minus the
+# hardware-dependent probes (no PipeWire daemon or audio device on runners).
+# Windows job: the headless receiver suite and a release build of both
+# executables, exercising the cpal/WASAPI audio-output path's compilation.
+
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install audio and toolchain dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libopus-dev libpipewire-0.3-dev libdbus-1-dev \
+            clang libclang-dev \
+            cmake ninja-build g++ pkg-config \
+            pipewire pipewire-bin wireplumber
+      # Every crate's suite EXCEPT openay-server runs here (its PipeWire-arm
+      # integration tests need a live desktop session — a runner has none;
+      # those run via scripts/run_phase6.sh on a real desktop). openay-server
+      # runs separately in headless mode below, which covers the full
+      # daemon-independent engine surface.
+      - name: Rust tests (all crates)
+        working-directory: desktop
+        run: cargo test --workspace --exclude openay-server
+      - name: Rust tests (openay-server headless)
+        working-directory: desktop
+        run: cargo test -p openay-server
+      - name: Rust clippy
+        working-directory: desktop
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: C++ host tests
+        run: |
+          cmake -S android/native -B android/native/build-host -DCMAKE_BUILD_TYPE=Release
+          cmake --build android/native/build-host -j
+          ctest --test-dir android/native/build-host --output-on-failure
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      # audiopus_sys's own CMake build of libopus fails on Windows runners;
+      # prebuild a static /MT libopus with intrinsics disabled and hand it to
+      # the build script via its LIBOPUS_LIB_DIR escape hatch (same recipe as
+      # scripts/build_windows.sh).
+      - name: Prebuild static libopus for audiopus_sys
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          cargo fetch --target x86_64-pc-windows-msvc
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+          $opusSrc = Get-ChildItem "$cargoHome/registry/src/*/audiopus_sys-*/opus" -Directory |
+            Sort-Object Name -Descending | Select-Object -First 1
+          $prefix = "$PWD/target/xwin-libopus"
+          cmake -S $opusSrc.FullName -B $prefix/build `
+            "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW" "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" "-DCMAKE_BUILD_TYPE=Release" `
+            "-DCMAKE_INSTALL_PREFIX=$prefix" "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" `
+            "-DOPUS_DISABLE_INTRINSICS=ON" "-DOPUS_BUILD_SHARED_LIBRARY=OFF" `
+            "-DOPUS_BUILD_PROGRAMS=OFF" "-DOPUS_BUILD_TESTING=OFF"
+          cmake --build $prefix/build --config Release --target install
+          "LIBOPUS_LIB_DIR=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Headless receiver tests
+        working-directory: desktop
+        run: cargo test -p openay-server
+      - name: Build both executables (WASAPI output)
+        working-directory: desktop
+        run: cargo build --release -p openay-gui -p openay-server --features openay-server/audio-output
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/openay-windows | Out-Null
+          Copy-Item desktop/target/release/openay-gui.exe  dist/openay-windows/
+          Copy-Item desktop/target/release/openay-server.exe dist/openay-windows/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openay-windows-ci
+          path: dist/openay-windows/

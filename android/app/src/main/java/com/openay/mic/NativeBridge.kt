@@ -2,10 +2,31 @@ package com.openay.mic
 
 object NativeBridge {
     init { System.loadLibrary("openaymic") }
-    /** transport: "udp"|"tcp"; codec: "pcm"|"opus"; frameMs: 5|10 */
-    external fun nativeStart(transport: String, host: String, port: Int, codec: String, frameMs: Int): Boolean
+
+    /**
+     * Starts the capture engine.
+     *
+     * @param transport "udp"|"tcp"
+     * @param codec     "pcm"|"opus"
+     * @param frameMs   5|10
+     * @param sessionForEffects allocate an audio session id for the capture
+     *   stream (API 28+) so [nativeGetAudioSessionId] can return it and the
+     *   app can attach echo-cancellation/noise-suppression effects.
+     */
+    external fun nativeStart(
+        transport: String,
+        host: String,
+        port: Int,
+        codec: String,
+        frameMs: Int,
+        sessionForEffects: Boolean
+    ): Boolean
     external fun nativeStop(): Boolean
     external fun nativeIsRunning(): Boolean
-    /** JSON: {"running":bool,"transport":str,"codec":str,"frame_ms":int,"sharing":str,"sample_rate":int,"sent":int,"bytes":int,"ring_overruns":int,"encode_errors":int,"send_errors":int,"xruns":int,"last_error":str} */
+    /** Mutes the capture: digital silence keeps streaming (timing + control live). */
+    external fun nativeSetMuted(muted: Boolean)
+    /** Audio session id of the live capture stream (0 = none/unsupported). */
+    external fun nativeGetAudioSessionId(): Int
+    /** JSON: {"running":bool,"transport":str,"codec":str,"frame_ms":int,"sharing":str,"sample_rate":int,"sent":int,"bytes":int,"ring_overruns":int,"encode_errors":int,"send_errors":int,"xruns":int,"last_error":str,"level_peak":int,"peer_link":"unknown|alive|lost","muted":bool,"audio_session":int} */
     external fun nativeGetStats(): String
 }

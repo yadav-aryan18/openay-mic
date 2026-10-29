@@ -48,13 +48,15 @@ pub use audio::list_output_devices;
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use openay_jitter::{DepthController, DepthParams, JitterBuffer, RealClock};
-use openay_protocol::PayloadType;
+use openay_protocol::control::{control_payload, parse_control, ControlMsg};
+use openay_protocol::{encode, Packet, PayloadType};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::ingest::Ingest;
@@ -77,6 +79,16 @@ const DEFAULT_CAPACITY_MS: f32 = 100.0;
 /// The RT callback folds max |sample| into this quantum; `level_peak` is
 /// this raw value divided by `PEAK_SCALE` (so 1.0 == full scale).
 const PEAK_SCALE: u32 = 65_535;
+/// Cadence of the receiver's liveness `ping` to the sender. Any received
+/// packet (audio or control) proves the sender is alive; the ping covers the
+/// reverse direction so the sender can detect a dead receiver.
+const PEER_PING_INTERVAL: Duration = Duration::from_secs(1);
+/// A sender that has sent at least one packet but has been silent for this
+/// long is reported stale in [`EngineStatus::peer_stale`] (the engine keeps
+/// running — a paused sender is legitimate — but the state is visible).
+const PEER_STALE_AFTER: Duration = Duration::from_secs(5);
+/// App identifier announced in `hello-ack` control messages.
+const RECEIVER_APP: &str = "openay-server";
 
 pub use openay_jitter::{MAX_PREBUFFER_MS, MIN_PREBUFFER_MS};
 
@@ -165,6 +177,10 @@ pub struct EngineConfig {
     /// Case-insensitive substring selecting the output device (`None` = the
     /// host default). Only consulted while `audio_output` is set.
     pub output_device: Option<String>,
+    /// Output gain applied to decoded samples before the jitter buffer
+    /// (1.0 = unity; clamped to `0.0..=4.0` at validation). Applied
+    /// receiver-side so the sender's capture/encode chain stays untouched.
+    pub gain: f32,
 }
 
 impl Default for EngineConfig {
@@ -178,6 +194,7 @@ impl Default for EngineConfig {
             capacity_ms: DEFAULT_CAPACITY_MS,
             audio_output: false,
             output_device: None,
+            gain: 1.0,
         }
     }
 }
@@ -191,6 +208,8 @@ pub enum ConfigError {
     /// file or `--target-ms nan`): `f32::clamp` passes NaN through and the
     /// sample conversion would saturate the prebuffer latch to 0 samples.
     InvalidTargetMs(f32),
+    /// A non-finite `gain` (same reasoning: it would poison every sample).
+    InvalidGain(f32),
 }
 
 impl fmt::Display for ConfigError {
@@ -201,6 +220,9 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::InvalidTargetMs(v) => {
                 write!(f, "invalid target_ms {v}: must be a finite number of milliseconds")
+            }
+            ConfigError::InvalidGain(v) => {
+                write!(f, "invalid gain {v}: must be a finite number")
             }
         }
     }
@@ -214,7 +236,9 @@ impl EngineConfig {
     /// - `port` must be `1..=65535` (otherwise `Err(InvalidPort)`);
     /// - `target_ms` must be finite (otherwise `Err(InvalidTargetMs)` — a
     ///   NaN would survive the clamp below and zero the prebuffer latch);
-    /// - `target_ms` is clamped into `[MIN_PREBUFFER_MS, MAX_PREBUFFER_MS]`.
+    /// - `target_ms` is clamped into `[MIN_PREBUFFER_MS, MAX_PREBUFFER_MS]`;
+    /// - `gain` must be finite (otherwise `Err(InvalidGain)`) and is clamped
+    ///   into `0.0..=4.0`.
     pub fn validated(self) -> Result<EngineConfig, ConfigError> {
         if self.port == 0 {
             return Err(ConfigError::InvalidPort(self.port));
@@ -222,8 +246,12 @@ impl EngineConfig {
         if !self.target_ms.is_finite() {
             return Err(ConfigError::InvalidTargetMs(self.target_ms));
         }
+        if !self.gain.is_finite() {
+            return Err(ConfigError::InvalidGain(self.gain));
+        }
         Ok(EngineConfig {
             target_ms: self.target_ms.clamp(MIN_PREBUFFER_MS, MAX_PREBUFFER_MS),
+            gain: self.gain.clamp(0.0, crate::ingest::MAX_GAIN),
             ..self
         })
     }
@@ -275,6 +303,16 @@ pub struct EngineStatus {
     /// stopped, the depth controller's readjusted value while running
     /// (see the struct docs for the rise/decay law).
     pub effective_target_ms: f32,
+    /// True while running after the sender has gone quiet: at least one
+    /// packet arrived this run, but nothing has been received for
+    /// [`PEER_STALE_AFTER`] (5 s). The engine keeps running — a paused
+    /// sender is legitimate — this only makes the gap visible to the UI.
+    pub peer_stale: bool,
+    /// UDP only: datagrams from a source other than the latched peer,
+    /// rejected by the peer latch (see the `udp_loop` docs). A nonzero value
+    /// usually means a second sender on the network — or the phone roaming
+    /// to a new address, which takes over once the old peer goes quiet.
+    pub foreign_packets: u64,
 }
 
 /// Commands sent to the engine (`Clone`, never `Copy` — `Start` carries
@@ -342,6 +380,8 @@ impl EngineHandle {
             level_peak: if running { level_peak } else { 0.0 },
             uptime_secs: 0,
             effective_target_ms: cfg.target_ms,
+            peer_stale: running && self.state.peer_stale.load(Ordering::Relaxed),
+            foreign_packets: 0,
         };
 
         if running {
@@ -383,6 +423,7 @@ impl EngineHandle {
             {
                 s.uptime_secs = t0.elapsed().as_secs();
             }
+            s.foreign_packets = self.state.foreign.load(Ordering::Relaxed);
         }
         s
     }
@@ -473,6 +514,12 @@ struct EngineState {
     /// Timing knobs for the per-pipeline depth controller (set by
     /// [`spawn_engine_tuned`], default [`DepthParams`] otherwise).
     depth_params: DepthParams,
+    /// Set by the depth controller task while the pipeline is running and
+    /// the sender has gone quiet for [`PEER_STALE_AFTER`] (see
+    /// [`EngineStatus::peer_stale`]). Reset on every `Start`.
+    peer_stale: Arc<AtomicBool>,
+    /// UDP datagrams rejected by the peer latch (see [`EngineStatus::foreign_packets`]).
+    foreign: Arc<AtomicU64>,
 }
 
 impl Default for EngineState {
@@ -488,6 +535,8 @@ impl Default for EngineState {
             peak: Arc::new(AtomicU32::new(0)),
             effective_target: Arc::new(AtomicU32::new(0)),
             depth_params: DepthParams::default(),
+            peer_stale: Arc::new(AtomicBool::new(false)),
+            foreign: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -695,7 +744,13 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
     let capacity_samples = (config.capacity_ms * SAMPLE_RATE as f32 / 1000.0) as usize;
     let jitter = Arc::new(JitterBuffer::new(capacity_samples));
     let quit = Arc::new(AtomicBool::new(false));
-    let ingest = Arc::new(Mutex::new(Ingest::new(jitter.clone(), config.codec.only())));
+    let ingest = Arc::new(Mutex::new(Ingest::new(
+        jitter.clone(),
+        config.codec.only(),
+        config.gain,
+    )));
+    state.peer_stale.store(false, Ordering::Relaxed);
+    state.foreign.store(0, Ordering::Relaxed);
 
     // Seed the adaptive depth with the configured target and share it with
     // the RT latch (pipewire), the depth controller task, and `status()`.
@@ -789,12 +844,14 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
         ingest.clone(),
         jitter.clone(),
         state.effective_target.clone(),
+        state.foreign.clone(),
         quit.clone(),
     ));
     let retarget = spawn_depth_controller(
         jitter.clone(),
         ingest.clone(),
         state.effective_target.clone(),
+        state.peer_stale.clone(),
         base_target_ms,
         state.depth_params,
         quit.clone(),
@@ -836,6 +893,7 @@ fn spawn_depth_controller(
     jitter: Arc<JitterBuffer>,
     ingest: Arc<Mutex<Ingest>>,
     effective_target: Arc<AtomicU32>,
+    peer_stale: Arc<AtomicBool>,
     base_ms: f32,
     params: DepthParams,
     quit: Arc<AtomicBool>,
@@ -848,9 +906,16 @@ fn spawn_depth_controller(
         // Decay accrues only while audio is actually FLOWING: a paused
         // sender (engine still running) must not earn clean-window decay —
         // on_tick(false) discards the window so the network-proven depth is
-        // kept for the resume. "Flowing" = the ingest received counter
-        // advanced since the last tick.
-        let mut last_received = 0u64;
+        // kept for the resume. "Flowing" = the AUDIO counter advanced since
+        // the last tick — keepalive pongs do not count (a paused sender
+        // stays alive via control traffic but must not shrink the buffer).
+        let mut last_audio_received = 0u64;
+        // Peer-liveness watch: once any packet arrived, a silence longer
+        // than PEER_STALE_AFTER raises the shared peer_stale flag (cleared
+        // by the next packet). Edge transitions log once each.
+        let mut last_progress: Option<Instant> = None;
+        let mut last_seen_received = 0u64;
+        let mut stale_logged = false;
         let mut tick = tokio::time::interval(DEPTH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await; // discard the immediate first tick
@@ -866,8 +931,30 @@ fn spawn_depth_controller(
                         .lock()
                         .expect("ingest mutex poisoned")
                         .received;
-                    let flowing = received > last_received;
-                    last_received = received;
+                    let audio_received = ingest
+                        .lock()
+                        .expect("ingest mutex poisoned")
+                        .audio_received;
+                    let flowing = audio_received > last_audio_received;
+                    last_audio_received = audio_received;
+                    if received > last_seen_received {
+                        last_seen_received = received;
+                        last_progress = Some(Instant::now());
+                        if stale_logged {
+                            stale_logged = false;
+                            eprintln!("openay-server: peer traffic resumed");
+                        }
+                    }
+                    let stale = last_progress
+                        .is_some_and(|t| t.elapsed() >= PEER_STALE_AFTER);
+                    if stale && !stale_logged {
+                        stale_logged = true;
+                        eprintln!(
+                            "openay-server: peer quiet for >{}s — no packets received",
+                            PEER_STALE_AFTER.as_secs()
+                        );
+                    }
+                    peer_stale.store(stale, Ordering::Relaxed);
                     let target_ms = depth.on_tick(flowing);
                     effective_target.store(
                         (target_ms * SAMPLE_RATE as f32 / 1000.0).ceil() as u32,
@@ -1007,21 +1094,40 @@ async fn run_network(
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
     effective_target: Arc<AtomicU32>,
+    foreign: Arc<AtomicU64>,
     quit: Arc<AtomicBool>,
 ) -> Result<String> {
     match config.transport {
-        Transport::Udp => udp_loop(&config, ingest, jitter, effective_target, quit).await,
+        Transport::Udp => {
+            udp_loop(&config, ingest, jitter, effective_target, foreign, quit).await
+        }
+        // TCP is connection-scoped: every accepted connection is its own
+        // peer, so the UDP source latch has no TCP equivalent.
         Transport::Tcp => tcp_loop(&config, ingest, jitter, effective_target, quit).await,
     }
 }
 
 /// UDP receive loop: one datagram == one packet (protocol spec). Malformed
 /// datagrams are dropped and counted, never fatal.
+///
+/// Control plane: the first well-formed datagram pins the sender's address;
+/// liveness `ping` frames go back to it every [`PEER_PING_INTERVAL`], and
+/// `hello`/`ping` control payloads are answered in place. Unknown control
+/// payloads are ignored (counted as received, never fatal).
+///
+/// Peer latch: after the first accepted datagram, only the pinned source is
+/// ingested or replied to — a single listener is a single-phone receiver,
+/// and unlatched ingest would let any LAN host blend audio into the
+/// microphone (or forge control replies). A different source may take over
+/// only once the pinned peer has been silent for [`PEER_STALE_AFTER`] (the
+/// phone roaming to a new address). Foreign datagrams are counted in
+/// [`EngineStatus::foreign_packets`] and rate-limit-logged, never fatal.
 async fn udp_loop(
     config: &EngineConfig,
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
     effective_target: Arc<AtomicU32>,
+    foreign: Arc<AtomicU64>,
     quit: Arc<AtomicBool>,
 ) -> Result<String> {
     let addr = SocketAddr::new(config.bind, config.port);
@@ -1034,27 +1140,104 @@ async fn udp_loop(
     let mut last_stats = Instant::now();
     let mut last_underruns = jitter.underruns();
     let mut last_underrun_log: Option<Instant> = None;
+    // Control-plane state: the latched sender's address, the desktop→sender
+    // sequence counter (shared by pings and replies), and the time of the
+    // last ping (None until the peer is known).
+    let mut peer: Option<SocketAddr> = None;
+    let mut peer_last_rx: Option<Instant> = None;
+    let mut ctl_seq: u16 = 0;
+    let mut last_ping: Option<Instant> = None;
+    let mut bye_logged = false;
+    let mut foreign_seen: u64 = 0;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             r = socket.recv_from(&mut buf) => {
-                let (n, _src) = r.context("UDP recv error")?;
-                match openay_protocol::decode(&buf[..n]) {
-                    Ok(pkt) => {
-                        let mut g = ingest.lock().expect("ingest mutex poisoned");
-                        if g.ingest_packet(pkt.kind, pkt.seq, &pkt.payload).is_err() {
-                            // Malformed/undecodable payloads are counted
-                            // inside ingest_packet; nothing to do here.
-                        }
-                    }
+                let (n, src) = r.context("UDP recv error")?;
+                let pkt = match openay_protocol::decode(&buf[..n]) {
+                    Ok(pkt) => pkt,
                     Err(_) => {
                         ingest.lock().expect("ingest mutex poisoned").malformed += 1;
+                        continue;
+                    }
+                };
+                // Peer latch: pin, continue, or reject.
+                let mut accept = true;
+                match peer {
+                    Some(pinned) if pinned != src => {
+                        let takeover = peer_last_rx
+                            .map_or(true, |t| t.elapsed() >= PEER_STALE_AFTER);
+                        if takeover {
+                            eprintln!(
+                                "openay-server: peer latch moved {pinned} -> {src}                                  (previous peer quiet >{}s)",
+                                PEER_STALE_AFTER.as_secs()
+                            );
+                            peer = Some(src);
+                            peer_last_rx = Some(Instant::now());
+                            last_ping = Some(Instant::now());
+                        } else {
+                            accept = false;
+                            foreign.fetch_add(1, Ordering::Relaxed);
+                            foreign_seen += 1;
+                            if foreign_seen == 1 || foreign_seen % 1000 == 0 {
+                                eprintln!(
+                                    "openay-server: dropping datagrams from foreign                                      sender {src} (total {foreign_seen})"
+                                );
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        peer_last_rx = Some(Instant::now());
+                    }
+                    None => {
+                        peer = Some(src);
+                        peer_last_rx = Some(Instant::now());
+                        last_ping = Some(Instant::now());
+                        eprintln!("openay-server: peer latched: {src}");
+                    }
+                }
+                if accept {
+                    if pkt.kind == PayloadType::Control {
+                        if let Some(msg) = parse_control(&pkt.payload) {
+                            if let Some(reply) =
+                                control_reply(&msg, config.codec, &mut bye_logged)
+                            {
+                                let wire = encode(&Packet {
+                                    kind: PayloadType::Control,
+                                    seq: ctl_seq,
+                                    payload: control_payload(&reply),
+                                });
+                                ctl_seq = ctl_seq.wrapping_add(1);
+                                let _ = socket.send_to(&wire, src).await;
+                            }
+                        }
+                    }
+                    let mut g = ingest.lock().expect("ingest mutex poisoned");
+                    if g.ingest_packet(pkt.kind, pkt.seq, &pkt.payload).is_err() {
+                        // Malformed/undecodable payloads are counted
+                        // inside ingest_packet; nothing to do here.
                     }
                 }
             }
         }
         if quit.load(Ordering::Relaxed) {
             break;
+        }
+        // Liveness ping toward the sender (covers the desktop→sender
+        // direction; the sender's audio covers the other one).
+        if let Some(dst) = peer {
+            let due = last_ping
+                .is_none_or(|t| t.elapsed() >= PEER_PING_INTERVAL);
+            if due {
+                let wire = encode(&Packet {
+                    kind: PayloadType::Control,
+                    seq: ctl_seq,
+                    payload: control_payload(&ControlMsg::Ping),
+                });
+                ctl_seq = ctl_seq.wrapping_add(1);
+                let _ = socket.send_to(&wire, dst).await;
+                last_ping = Some(Instant::now());
+            }
         }
         if let Some(line) =
             underrun_episode_line(&jitter, &effective_target, &mut last_underruns, &mut last_underrun_log)
@@ -1072,6 +1255,11 @@ async fn udp_loop(
 /// TCP receive loop: back-to-back framed packets via `TcpPacketStream`; each
 /// accepted connection is handled by its own task, so one stalled client
 /// cannot block ingestion from others.
+///
+/// Control plane: each connection gets a writer task owning the write half.
+/// It emits a liveness `ping` every [`PEER_PING_INTERVAL`] and any reply the
+/// read task enqueues (`hello-ack` / `pong`), over one per-direction
+/// sequence counter.
 async fn tcp_loop(
     config: &EngineConfig,
     ingest: Arc<Mutex<Ingest>>,
@@ -1102,14 +1290,73 @@ async fn tcp_loop(
                 eprintln!("openay-server: TCP connection from {peer}");
                 let conn_ingest = ingest.clone();
                 let conn_quit = quit.clone();
+                let codec_mode = config.codec;
+                let (rd, mut wr) = stream.into_split();
+                // Writer task: pings + control replies, one shared seq.
+                let (reply_tx, mut reply_rx) = mpsc::channel::<ControlMsg>(8);
+                let writer_quit = quit.clone();
                 conns.spawn(async move {
-                    let mut framed = openay_transport::tcp::TcpPacketStream::new(stream);
+                    let mut seq: u16 = 0;
+                    let mut tick = tokio::time::interval(PEER_PING_INTERVAL);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    tick.tick().await; // the immediate first tick is not a ping
+                    loop {
+                        tokio::select! {
+                            _ = tick.tick() => {
+                                if writer_quit.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                let wire = encode(&Packet {
+                                    kind: PayloadType::Control,
+                                    seq,
+                                    payload: control_payload(&ControlMsg::Ping),
+                                });
+                                seq = seq.wrapping_add(1);
+                                if wr.write_all(&wire).await.is_err() {
+                                    break;
+                                }
+                            }
+                            reply = reply_rx.recv() => {
+                                match reply {
+                                    Some(msg) => {
+                                        let wire = encode(&Packet {
+                                            kind: PayloadType::Control,
+                                            seq,
+                                            payload: control_payload(&msg),
+                                        });
+                                        seq = seq.wrapping_add(1);
+                                        if wr.write_all(&wire).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    // The read task ended: connection closed.
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                });
+                // Read task: ingest audio, answer control messages.
+                conns.spawn(async move {
+                    let mut framed = openay_transport::tcp::TcpPacketStream::new(rd);
+                    let mut bye_logged = false;
                     loop {
                         if conn_quit.load(Ordering::Relaxed) {
                             break;
                         }
                         match framed.next_packet().await {
                             Ok(pkt) => {
+                                if pkt.kind == PayloadType::Control {
+                                    if let Some(msg) = parse_control(&pkt.payload) {
+                                        if let Some(reply) =
+                                            control_reply(&msg, codec_mode, &mut bye_logged)
+                                        {
+                                            // A full reply channel means the
+                                            // writer is wedged; drop the reply.
+                                            let _ = reply_tx.try_send(reply);
+                                        }
+                                    }
+                                }
                                 let mut g = conn_ingest.lock().expect("ingest mutex poisoned");
                                 if g.ingest_packet(pkt.kind, pkt.seq, &pkt.payload).is_err() {
                                     // Counted inside ingest_packet.
@@ -1121,6 +1368,7 @@ async fn tcp_loop(
                             }
                         }
                     }
+                    // Dropping reply_tx ends the writer task for this conn.
                 });
             }
             // Reap finished connection tasks (frees their Arcs promptly).
@@ -1151,6 +1399,39 @@ async fn tcp_loop(
     conns.abort_all();
     while conns.join_next().await.is_some() {}
     Ok(stats_line(Transport::Tcp, &ingest, &jitter))
+}
+
+/// The receiver's answer to a sender control message (`None` = nothing to
+/// send). `codec` shapes the codec list announced in `hello-ack`.
+/// `bye_logged` throttles the bye log to once per connection/run (a hostile
+/// peer could otherwise spam it).
+fn control_reply(
+    msg: &ControlMsg,
+    codec: CodecMode,
+    bye_logged: &mut bool,
+) -> Option<ControlMsg> {
+    match msg {
+        ControlMsg::Hello { .. } => Some(ControlMsg::HelloAck {
+            app: RECEIVER_APP.to_string(),
+            proto: openay_protocol::control::CONTROL_PROTO,
+            codecs: match codec {
+                CodecMode::Auto => vec!["pcm".to_string(), "opus".to_string()],
+                CodecMode::Pcm => vec!["pcm".to_string()],
+                CodecMode::Opus => vec!["opus".to_string()],
+            },
+            rate: SAMPLE_RATE as u32,
+        }),
+        ControlMsg::Ping { .. } => Some(ControlMsg::Pong),
+        // HelloAck/Pong prove the receiver is alive; Bye ends the session.
+        ControlMsg::HelloAck { .. } | ControlMsg::Pong { .. } => None,
+        ControlMsg::Bye { .. } => {
+            if !*bye_logged {
+                *bye_logged = true;
+                eprintln!("openay-server: peer ended the session (bye)");
+            }
+            None
+        }
+    }
 }
 
 /// Watch the underrun counter on every 200 ms wake; when it increased,
@@ -1288,6 +1569,7 @@ mod tests {
             capacity_ms: 200.0,
             audio_output: false,
             output_device: Some("cable".to_string()),
+            gain: 2.0,
         };
         let v = cfg.validated().unwrap();
         assert_eq!(v.transport, Transport::Tcp);
@@ -1296,6 +1578,7 @@ mod tests {
         assert_eq!(v.codec, CodecMode::Pcm);
         assert_eq!(v.target_ms, 17.0);
         assert_eq!(v.capacity_ms, 200.0);
+        assert_eq!(v.gain, 2.0, "gain passes through validation");
         #[cfg(feature = "audio-output")]
         {
             assert!(!v.audio_output, "validation never enables audio output");

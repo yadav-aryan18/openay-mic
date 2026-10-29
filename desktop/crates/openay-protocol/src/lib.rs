@@ -13,6 +13,8 @@
 //! Golden vectors live in `shared/test-vectors.json` and are exercised in
 //! the `tests` module of this crate.
 
+pub mod control;
+
 /// First header byte of every packet. Receivers drop datagrams that do not
 /// start with this byte.
 pub const MAGIC: u8 = 0xA7;
