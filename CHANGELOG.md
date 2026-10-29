@@ -5,7 +5,7 @@ All notable changes to OpenAY Mic are documented here. The format follows
 semantic (major.minor.patch — the wire protocol is frozen at v1, so minors
 carry features).
 
-## [Unreleased]
+## [0.3.0] - 2026-10-30
 
 ### Added
 - **LISTEN (mic test) toggle**: play your own received mic audio on a local
