@@ -65,6 +65,28 @@ bool CapturePipeline::Configure(IAudioSource* source, TransportType transport,
                                 CodecType codec, int frame_ms,
                                 size_t ring_capacity_bytes) {
     Stop();  // any prior run
+    // Validate BEFORE dialing: an invalid frame/codec config must not open a
+    // socket (a TCP config would otherwise perform a blocking connect() to
+    // an arbitrary host before being rejected).
+    if (frame_ms != 5 && frame_ms != 10) {
+        last_error_.store(static_cast<int>(PipelineError::InvalidConfig),
+                          std::memory_order_relaxed);
+        return false;
+    }
+#ifdef OPENAY_HAVE_OPUS
+    if (codec == CodecType::Opus && frame_ms != 10) {
+        // shared/protocol.md: Opus is exactly one packet per 10 ms frame.
+        last_error_.store(static_cast<int>(PipelineError::InvalidConfig),
+                          std::memory_order_relaxed);
+        return false;
+    }
+#else
+    if (codec == CodecType::Opus) {
+        last_error_.store(static_cast<int>(PipelineError::UnsupportedCodec),
+                          std::memory_order_relaxed);
+        return false;
+    }
+#endif
     if (host.empty() || port == 0) {
         last_error_.store(static_cast<int>(PipelineError::InvalidConfig),
                           std::memory_order_relaxed);

@@ -1283,10 +1283,18 @@ async fn tcp_loop(
     // checked between packets), and the Arc clones held per connection die
     // with the tasks instead of outliving the pipeline.
     let mut conns = tokio::task::JoinSet::new();
-    // Single-phone product: while one connection is being served, further
-    // accepts are refused (two senders would blend audio into one Ingest
-    // and corrupt loss accounting — same reasoning as the UDP peer latch).
+    // Single-phone product (UDP-latch equivalent): two concurrent senders
+    // would blend audio into one Ingest and corrupt loss accounting. The
+    // NEWEST connection always wins: a current connection is evicted before
+    // the new one is served (a reconnecting phone must not be refused just
+    // because the old serve task has not observed EOF yet), and eviction
+    // lands at an await point, so the two senders can never interleave.
     let busy = Arc::new(AtomicBool::new(false));
+    // AbortHandle of the currently served connection (guarded-clear: a task
+    // clears `busy` only while it is still the active one). tokio >=1.53:
+    // JoinSet::spawn returns an AbortHandle (abort/is_finished).
+    let active: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     let mut last_stats = Instant::now();
     let mut last_underruns = jitter.underruns();
@@ -1296,14 +1304,19 @@ async fn tcp_loop(
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             r = listener.accept() => {
                 let (stream, peer) = r.context("accept error")?;
-                if busy.swap(true, Ordering::Relaxed) {
+                if busy.load(Ordering::Relaxed) {
+                    if let Some(h) = active.lock().expect("active conn mutex poisoned").take() {
+                        h.abort();
+                    }
+                    busy.store(false, Ordering::Relaxed);
                     eprintln!(
-                        "openay-server: refusing TCP connection from {peer} —                          already serving one"
+                        "openay-server: TCP connection from {peer} — evicting the previous one"
                     );
-                    continue;
                 }
+                busy.store(true, Ordering::Relaxed);
                 eprintln!("openay-server: TCP connection from {peer}");
                 let conn_busy = busy.clone();
+                let conn_active = active.clone();
                 let conn_ingest = ingest.clone();
                 let conn_quit = quit.clone();
                 let codec_mode = config.codec;
@@ -1311,7 +1324,7 @@ async fn tcp_loop(
                 // Writer task: pings + control replies, one shared seq.
                 let (reply_tx, mut reply_rx) = mpsc::channel::<ControlMsg>(8);
                 let writer_quit = quit.clone();
-                conns.spawn(async move {
+                let serve = conns.spawn(async move {
                     let mut seq: u16 = 0;
                     let mut tick = tokio::time::interval(PEER_PING_INTERVAL);
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1352,6 +1365,7 @@ async fn tcp_loop(
                         }
                     }
                 });
+                *active.lock().expect("active conn mutex poisoned") = Some(serve);
                 // Read task: ingest audio, answer control messages.
                 conns.spawn(async move {
                     let mut framed = openay_transport::tcp::TcpPacketStream::new(rd);
@@ -1384,9 +1398,16 @@ async fn tcp_loop(
                             }
                         }
                     }
-                    // Slot free for the next connection (the writer task ends
-                    // on its own once this task drops reply_tx).
-                    conn_busy.store(false, Ordering::Relaxed);
+                    // Slot free for the next connection — but only while
+                    // THIS task is still the active one (an evicted task must
+                    // not clear a newer session). The writer task ends on its
+                    // own once this task drops reply_tx.
+                    if let Ok(mut g) = conn_active.lock() {
+                        if g.as_ref().is_some_and(|h| h.is_finished()) {
+                            *g = None;
+                            conn_busy.store(false, Ordering::Relaxed);
+                        }
+                    }
                     // Dropping reply_tx ends the writer task for this conn.
                 });
             }
