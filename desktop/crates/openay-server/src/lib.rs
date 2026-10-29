@@ -1026,7 +1026,6 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
     }
 
     // Publish the run's config before `config` moves into the network task
-    // Publish the run's config before `config` moves into the network task
     // (EngineConfig is never Copy — it carries the output-device String).
     let config_for_state = config.clone();
     *state.config.lock().expect("engine config mutex poisoned") = Some(config_for_state);
@@ -1125,14 +1124,10 @@ fn spawn_depth_controller(
                         depth.on_underrun();
                         last_underruns = underruns;
                     }
-                    let received = ingest
-                        .lock()
-                        .expect("ingest mutex poisoned")
-                        .received;
-                    let audio_received = ingest
-                        .lock()
-                        .expect("ingest mutex poisoned")
-                        .audio_received;
+                    let (received, audio_received) = {
+                        let g = ingest.lock().expect("ingest mutex poisoned");
+                        (g.received, g.audio_received)
+                    };
                     let flowing = audio_received > last_audio_received;
                     last_audio_received = audio_received;
                     if received > last_seen_received {
@@ -1534,12 +1529,38 @@ async fn stream_accept_loop(
     // checked between packets), and the Arc clones held per connection die
     // with the tasks instead of outliving the pipeline.
     let mut conns = tokio::task::JoinSet::new();
+    // Single-phone product (UDP-latch equivalent): two concurrent senders
+    // would blend audio into one Ingest and corrupt loss accounting. The
+    // NEWEST connection always wins: a current connection is evicted before
+    // the new one is served (a reconnecting phone must not be refused just
+    // because the old serve task has not observed EOF yet), and eviction
+    // lands at an await point, so the two senders can never interleave.
+    let busy = Arc::new(AtomicBool::new(false));
+    // AbortHandle of the currently served connection (guarded-clear: a task
+    // clears `busy` only while it is still the active one).
+    // tokio >=1.53: JoinSet::spawn returns an AbortHandle (abort/is_finished).
+    let active: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>> =
+        Arc::new(std::sync::Mutex::new(None));
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             r = source.accept() => {
                 match r {
                     Ok(Some((stream, peer))) => {
+                        if busy.load(Ordering::Relaxed) {
+                            if let Some(h) =
+                                active.lock().expect("active conn mutex poisoned").take()
+                            {
+                                h.abort();
+                            }
+                            busy.store(false, Ordering::Relaxed);
+                            eprintln!(
+                                "openay-server: {} connection from {peer} — \
+                                 evicting the previous one",
+                                transport.as_str()
+                            );
+                        }
+                        busy.store(true, Ordering::Relaxed);
                         eprintln!(
                             "openay-server: {} connection from {peer}",
                             transport.as_str()
@@ -1551,15 +1572,26 @@ async fn stream_accept_loop(
                         let conn_ingest = ingest.clone();
                         let conn_quit = quit.clone();
                         let conn_codec = codec;
+                        let conn_busy = busy.clone();
+                        let conn_active = active.clone();
                         let conn_slot = device_slot.clone();
                         // Label for the clear below: `peer` itself is moved
                         // into the serve call.
                         let peer_label = peer.clone();
-                        conns.spawn(async move {
+                        let serve = conns.spawn(async move {
                             serve_packet_stream(
                                 stream, peer, conn_codec, conn_ingest, conn_quit,
                             )
                             .await;
+                            // Slot free for the next connection — but only
+                            // while THIS task is still the active one (an
+                            // evicted task must not clear a newer session).
+                            if let Ok(mut g) = conn_active.lock() {
+                                if g.as_ref().is_some_and(|h| h.is_finished()) {
+                                    *g = None;
+                                    conn_busy.store(false, Ordering::Relaxed);
+                                }
+                            }
                             // Connection over: clear the device slot only if
                             // it still names THIS connection — an overlapping
                             // later connection must not be un-shown by an
@@ -1572,6 +1604,8 @@ async fn stream_accept_loop(
                                 }
                             }
                         });
+                        *active.lock().expect("active conn mutex poisoned") =
+                            Some(serve);
                     }
                     Ok(None) => break,
                     Err(e) => return Err(e).context("accept error"),
@@ -1749,27 +1783,40 @@ async fn udp_loop(
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             r = socket.recv_from(&mut buf) => {
                 let (n, src) = r.context("UDP recv error")?;
+                // A malformed datagram is counted and NOT ingested, but the
+                // loop must still observe `quit` below: falling through (not
+                // `continue`-ing) keeps Stop responsive under a garbage
+                // datagram flood.
                 let pkt = match openay_protocol::decode(&buf[..n]) {
-                    Ok(pkt) => pkt,
+                    Ok(pkt) => Some(pkt),
                     Err(_) => {
                         ingest.lock().expect("ingest mutex poisoned").malformed += 1;
-                        continue;
+                        None
                     }
                 };
-                // Peer latch: pin, continue, or reject.
-                let mut accept = true;
+                // Peer latch: pin, continue, or reject (undecoded datagrams
+                // never touch the latch, the counters, or the replies).
+                let mut accept = pkt.is_some();
                 match peer {
+                    _ if !accept => {}
                     Some(pinned) if pinned != src => {
                         let takeover = peer_last_rx
                             .map_or(true, |t| t.elapsed() >= PEER_STALE_AFTER);
                         if takeover {
                             eprintln!(
-                                "openay-server: peer latch moved {pinned} -> {src}                                  (previous peer quiet >{}s)",
+                                "openay-server: peer latch moved {pinned} -> {src} (previous peer quiet >{}s)",
                                 PEER_STALE_AFTER.as_secs()
                             );
                             peer = Some(src);
                             peer_last_rx = Some(Instant::now());
                             last_ping = Some(Instant::now());
+                            // The new sender starts its sequence from
+                            // scratch: classify against a fresh expectation
+                            // instead of logging a phantom gap/reorder.
+                            ingest
+                                .lock()
+                                .expect("ingest mutex poisoned")
+                                .reset_seq();
                         } else {
                             accept = false;
                             foreign.fetch_add(1, Ordering::Relaxed);
@@ -1792,6 +1839,7 @@ async fn udp_loop(
                     }
                 }
                 if accept {
+                    let pkt = pkt.expect("decoded above when accepted");
                     if pkt.kind == PayloadType::Control {
                         if let Some(msg) = parse_control(&pkt.payload) {
                             if let Some(reply) =

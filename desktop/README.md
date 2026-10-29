@@ -88,10 +88,14 @@ openay-server [--transport udp|tcp] [--port N] [--bind ADDR]
 - The UDP receiver latches the first sender: other sources are rejected
   (counted in `EngineStatus.foreign_packets`) until the latched peer has
   been quiet for the 5 s stale window, so a second LAN host cannot blend
-  audio into the virtual microphone mid-session.
-  (5–20 ms); the virtual mic starts emitting real samples once the jitter
-  buffer holds `ceil(target-ms * 48)` samples, and re-prebuffers after every
-  underrun.
+  audio into the virtual microphone mid-session. This raises the bar for
+  unspoofed UDP sources only — the protocol carries no authentication (a
+  host that spoofs the latched address, or arrives first, is accepted;
+  TCP/BT connections are trusted per connection).
+- `--target-ms` clamping in practice: the prebuffer reaches
+  5–20 ms before the virtual mic starts emitting real samples once the
+  jitter buffer holds `ceil(target-ms * 48)` samples, and re-prebuffers
+  after every underrun.
 - `--capacity-ms` default `100.0` — jitter buffer capacity in ms of audio.
 
 The receive loop runs standalone; without the `pipewire` feature it prints
