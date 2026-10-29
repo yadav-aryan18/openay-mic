@@ -94,6 +94,10 @@ bool TcpConn::ReadExact(uint8_t* dst, size_t n, int timeout_ms) {
         if (r < 0) {
             if (errno == EINTR) continue;
             detail::LogErrno("recv");
+            // A permanent receive error (ECONNRESET/EPIPE) is the link being
+            // dead, same as EOF: make it sticky so the ~1 ms control drain
+            // stops hammering a broken fd with poll+read+log.
+            if (errno == ECONNRESET || errno == EPIPE) eof_ = true;
             RetainPartial(dst, off);
             return false;
         }

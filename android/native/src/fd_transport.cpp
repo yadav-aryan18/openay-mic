@@ -28,6 +28,20 @@ constexpr size_t kMaxResyncScan = 65536;
 constexpr int kMaxBadHeaders = 4;
 }  // namespace
 
+FdBytePipe::FdBytePipe(int fd) : fd_(fd) {
+    // A stalled RFCOMM link (RF degradation, desktop paused) must become a
+    // reportable send error instead of a blocked network thread: cap each
+    // write at ~2 s. The socketpair peer sees the same timeout on its reads.
+    if (fd_ >= 0) {
+        timeval tv{};
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+        if (setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
+            detail::LogErrno("setsockopt(SO_SNDTIMEO)");
+        }
+    }
+}
+
 FdBytePipe::~FdBytePipe() {
     if (fd_ >= 0) close(fd_);  // exactly once: the fd is owned (see transport.h)
 }
@@ -111,6 +125,10 @@ bool FdBytePipe::ReadExact(uint8_t* dst, size_t n, int timeout_ms) {
         if (r < 0) {
             if (errno == EINTR) continue;
             detail::LogErrno("read");
+            // A permanent receive error (ECONNRESET/EPIPE) is the link being
+            // dead, same as EOF: make it sticky so the ~1 ms control drain
+            // stops hammering a broken fd with poll+read+log.
+            if (errno == ECONNRESET || errno == EPIPE) eof_ = true;
             RetainPartial(dst, off);
             return false;
         }

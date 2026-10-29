@@ -175,6 +175,15 @@ class BluetoothLink {
             socket = null
             throw BluetoothLinkException("link already closed")
         }
+        if (closed) {
+            // Last-instant re-check: close() landing between the guard above
+            // and here would otherwise hand native a fd nobody will drain.
+            try { s.close() } catch (_: IOException) {}
+            try { pair[0].close() } catch (_: IOException) {}
+            try { pair[1].close() } catch (_: IOException) {}
+            socket = null
+            throw BluetoothLinkException("link already closed")
+        }
         pumpEnd = pair[0]
         // Detach: the fd belongs to native from the moment we return it.
         return pair[1].detachFd()
@@ -187,6 +196,10 @@ class BluetoothLink {
      * NOT on the clean EOF that follows a native stop. The handler runs on
      * Dispatchers.IO.
      */
+    /** True once [close] has run: connect() callers re-check after blocking calls. */
+    val isClosed: Boolean
+        get() = closed
+
     fun startPump(scope: CoroutineScope, onDown: (String) -> Unit) {
         val local = pumpEnd ?: return
         val s = socket ?: return
@@ -206,8 +219,11 @@ class BluetoothLink {
             // phone -> desktop: native audio out.
             launch {
                 try {
-                    FileInputStream(local.fileDescriptor).use { nativeInput ->
-                        s.outputStream.use { output ->
+                    // NOTE: the native-end fd is owned by closePumpEnd() and
+                    // must not be closed here — these streams are plain
+                    // wrappers (no .use) over the same descriptor.
+                    FileInputStream(local.fileDescriptor).let { nativeInput ->
+                        s.outputStream.let { output ->
                             val buf = ByteArray(PUMP_BUFFER_BYTES)
                             while (true) {
                                 // < 0 = the native end closed (a clean stop in
@@ -231,7 +247,8 @@ class BluetoothLink {
             launch {
                 try {
                     s.inputStream.use { input ->
-                        FileOutputStream(local.fileDescriptor).use { nativeOutput ->
+                        // Same ownership rule: never close the shared fd here.
+                    FileOutputStream(local.fileDescriptor).let { nativeOutput ->
                             val buf = ByteArray(PUMP_BUFFER_BYTES)
                             while (true) {
                                 val n = input.read(buf)

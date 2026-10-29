@@ -98,9 +98,20 @@ bool CapturePipeline::Configure(IAudioSource* source, TransportType transport,
     send_errors_.store(0, std::memory_order_relaxed);
     callback_idx_.store(0, std::memory_order_relaxed);
     level_peak_.store(0, std::memory_order_relaxed);  // no stale level from a prior run
+    control_sent_.store(0, std::memory_order_relaxed);
+    control_received_.store(0, std::memory_order_relaxed);
+    last_peer_rx_ms_.store(-1, std::memory_order_relaxed);
+    muted_.store(false, std::memory_order_relaxed);
 
     // --- validate ----------------------------------------------------------
+    // Frame/codec and host/port are validated BEFORE the sink dials (the BT
+    // branch's ValidateFrameAndCodec covers the same rules for ConfigureBt).
     if (!source) {
+        last_error_.store(static_cast<int>(PipelineError::InvalidConfig),
+                          std::memory_order_relaxed);
+        return false;
+    }
+    if (host.empty() || port == 0) {
         last_error_.store(static_cast<int>(PipelineError::InvalidConfig),
                           std::memory_order_relaxed);
         return false;

@@ -240,6 +240,14 @@ class MicCaptureService : Service() {
                 }
                 return@launch
             }
+            if (started && (btLink !== link || link.isClosed)) {
+                // The user pressed Stop while the blocking connect/start was
+                // in flight: native is running with a pump end that will
+                // never be drained. Stop it here — nothing else will.
+                Log.w(TAG, "BT session superseded during start — stopping native")
+                nativeStop()
+                return@launch
+            }
             if (!started) {
                 // Native consumed (closed) the fd even on failure; the
                 // reason is readable via StatsJson. The link's socket and
@@ -267,6 +275,12 @@ class MicCaptureService : Service() {
                     stopBtSession("BT link down: $reason")
                 }
             }
+
+            // Session-scoped features, identical to the wired transports:
+            // the capture session exists (Oboe allocated it) and the toggles
+            // were passed in, so BT users get the same behavior.
+            if (voiceFx) attachVoiceEffects()
+            if (muteOnCall) startModeWatcher()
 
             statsJob = serviceScope.launch {
                 while (isActive) {
@@ -313,6 +327,8 @@ class MicCaptureService : Service() {
         statsJob?.cancel()
         statsJob = null
         lastXruns = 0
+        stopModeWatcher()
+        releaseVoiceEffects()
         // Native first: the engine closes the native fd, which ends the
         // pump (EOF) before the socket is torn down.
         if (nativeRunning()) nativeStop()

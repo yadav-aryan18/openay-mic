@@ -227,7 +227,9 @@ private:
 // ---------------------------------------------------------------------------
 class FdBytePipe : public BytePipe {
 public:
-    explicit FdBytePipe(int fd) : fd_(fd) {}  // takes ownership of fd
+    // Takes ownership of fd. Out-of-line: sets a send timeout so a stalled
+    // link becomes a reportable error instead of a blocked network thread.
+    explicit FdBytePipe(int fd);
     ~FdBytePipe() override;
 
     FdBytePipe(const FdBytePipe&) = delete;

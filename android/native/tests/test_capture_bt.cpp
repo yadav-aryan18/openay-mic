@@ -477,9 +477,23 @@ void TestBtControlPlane() {
         CHECK(kind == ControlKind::Hello);
         CHECK(app == "openay-mic");
     }
-    // 2) Audio starts immediately after the hello on the same counter.
-    CHECK(pkts[1].type == PayloadType::Pcm);
-    CHECK(pkts[1].seq == 1);
+    // 2) Audio starts at seq 1 on the same counter. The pong may legally
+    // precede the first audio packet (the network thread answers a ping
+    // before its first ProcessFrame), so key on the first AUDIO packet
+    // rather than a fixed wire position.
+    {
+        const auto* first_audio = static_cast<const Packet*>(nullptr);
+        for (const Packet& p : pkts) {
+            if (p.type == PayloadType::Pcm) {
+                first_audio = &p;
+                break;
+            }
+        }
+        CHECK(first_audio != nullptr);
+        if (first_audio) {
+            CHECK(first_audio->seq == 1);
+        }
+    }
     // 3) The desktop's pings were answered with pongs.
     size_t pongs = 0;
     for (const Packet& p : pkts) {
