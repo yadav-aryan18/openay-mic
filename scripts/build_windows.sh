@@ -318,7 +318,7 @@ fi
 # their own adb install).
 ADB_DIR="$DIST/adb"
 ADB_FILES="adb.exe AdbWinApi.dll AdbWinUsbApi.dll"
-ADB_OK=1
+ADB_OK=0  # rc-style like the rest of the script: 0 = bundled, 1 = missing
 
 stage_adb_from() { # <source dir>
   local src="$1" f
@@ -335,13 +335,14 @@ stage_adb_from() { # <source dir>
 
 if [ "$EXE_OK" -ne 0 ]; then
   echo "skip: adb bundle (no openay-server.exe staged)"
-elif stage_adb_from "$ANDROID_HOME/platform-tools"; then
+elif stage_adb_from "${ANDROID_HOME:-}/platform-tools"; then
   echo "adb: staged from the local SDK ($ANDROID_HOME/platform-tools)"
 elif stage_adb_from "$HOME/Android/Sdk/platform-tools"; then
   echo "adb: staged from the local SDK (~/Android/Sdk/platform-tools)"
 else
   echo "adb: not in the local SDK — downloading platform-tools (windows)..."
-  ADB_ZIP="$(mktemp -d)/platform-tools.zip"
+  ADB_TMP="$(mktemp -d)"
+  ADB_ZIP="$ADB_TMP/platform-tools.zip"
   if curl -fsSL -o "$ADB_ZIP" "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" \
      && python3 - "$ADB_ZIP" "$ADB_DIR" <<'PYZIP'
 import sys, zipfile, os
@@ -360,9 +361,10 @@ PYZIP
   then
     echo "adb: downloaded and staged"
   else
-    ADB_OK=0
+    ADB_OK=1
     echo "warning: could not bundle adb (offline?) — USB users need their own platform-tools" >&2
   fi
+  rm -rf "$ADB_TMP"
 fi
 
 if [ "$ADB_OK" -eq 0 ] && [ -f "$ADB_DIR/adb.exe" ]; then
@@ -387,7 +389,9 @@ KIND.
 NOTICE_EOF
   check "bundle adb + attribution -> dist/openay-windows/adb/" 0
 elif [ "$EXE_OK" -eq 0 ]; then
-  check "bundle adb + attribution -> dist/openay-windows/adb/" "$ADB_OK"
+  # A missing bundle is a warning, not a build failure (the header comment
+  # promises exactly that) — never route it through check()'s exit gate.
+  echo "warning: adb bundle missing from dist/openay-windows/adb/" >&2
 fi
 
 if [ "$XWIN_OK" -ne 0 ]; then

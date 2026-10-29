@@ -71,9 +71,10 @@ Audio renders on the system DEFAULT output device — to feed other apps,
 install a virtual audio cable, set the cable's playback side ("Input") as the default playback
 device in Windows Sound settings, and select the cable's recording side ("Output") in the consumer
 app (or edit output_device in %APPDATA%\openay-mic\config.toml).
-Differences from Linux, on purpose: no system tray (window close quits —
-same contract), autostart uses the Startup folder, audio routing happens
-in Windows Sound settings instead of WirePlumber.
+Windows extras: a Win32 system tray icon (Show Console / Start / Stop /
+Quit — window close still quits, same contract as Linux), and autostart
+uses the Startup folder. Audio routing happens in Windows Sound settings
+instead of WirePlumber.
 
 Collecting logs for bug reports
 -------------------------------
@@ -101,6 +102,7 @@ Common flags
   --codec auto|pcm|opus   which payloads to accept (default auto)
   --target-ms 10          prebuffer target, 5..20 ms
   --capacity-ms 100       jitter buffer capacity
+  --gain 1.0              output gain, 0..4 (1 = unity), applied after decode
 
 Rebuilding from source
 ----------------------
