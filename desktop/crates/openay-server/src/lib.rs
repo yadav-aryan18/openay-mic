@@ -1181,7 +1181,7 @@ async fn udp_loop(
                             foreign_seen += 1;
                             if foreign_seen == 1 || foreign_seen % 1000 == 0 {
                                 eprintln!(
-                                    "openay-server: dropping datagrams from foreign                                      sender {src} (total {foreign_seen})"
+                                    "openay-server: dropping datagrams from foreign sender {src} (total {foreign_seen})"
                                 );
                             }
                         }
