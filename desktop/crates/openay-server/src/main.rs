@@ -105,6 +105,14 @@ async fn main() -> Result<()> {
         );
     }
 
+    let gain = args.gain.clamp(0.0, 4.0);
+    if (args.gain - gain).abs() > f32::EPSILON {
+        eprintln!(
+            "openay-server: --gain {} clamped to [0, 4] => {gain}",
+            args.gain
+        );
+    }
+
     #[cfg(not(feature = "pipewire"))]
     eprintln!("openay-server: built without PipeWire support — network+jitter only");
 
@@ -125,7 +133,7 @@ async fn main() -> Result<()> {
         },
         target_ms,
         capacity_ms: args.capacity_ms,
-        gain: args.gain,
+        gain,
     }
     .validated()
     .map_err(|e: ConfigError| anyhow::anyhow!(e))?;

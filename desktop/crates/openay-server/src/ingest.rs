@@ -135,6 +135,12 @@ impl Ingest {
         }
     }
 
+    /// Restart sequence classification from scratch (peer-latch takeover:
+    /// the new sender starts its counter at an arbitrary point).
+    pub fn reset_seq(&mut self) {
+        self.seq = SeqTracker::new();
+    }
+
     /// Ingest one decoded packet: classify its sequence number, decode the
     /// payload, and push the samples into the jitter buffer.
     ///
@@ -161,7 +167,9 @@ impl Ingest {
         }
 
         if let Some(strict) = self.only {
-            if kind != strict {
+            // Control packets are protocol-level (keepalive/handshake), not
+            // audio: strict codec modes must not count them as malformed.
+            if kind != PayloadType::Control && kind != strict {
                 self.malformed += 1;
                 return Err(IngestError::UnexpectedType);
             }
@@ -324,6 +332,43 @@ mod tests {
         ));
         assert_eq!(i.malformed, 1);
         assert_eq!(jitter.available(), 0);
+    }
+
+    /// Strict codec modes must not pollute `malformed` with protocol-level
+    /// control traffic (keepalive pongs arrive ~1/s and are not audio).
+    #[test]
+    fn strict_codec_mode_accepts_control_packets() {
+        let (mut i, jitter) = ingest_with_strict(PayloadType::Pcm);
+        feed(&mut i, PayloadType::Control, 0, b"{\"t\":\"pong\"}").unwrap();
+        assert_eq!(i.received, 1);
+        assert_eq!(i.malformed, 0, "control must not count as malformed");
+        assert_eq!(jitter.available(), 0, "control carries no audio");
+        // The seq space advanced: the next audio frame is in-order.
+        feed(&mut i, PayloadType::Pcm, 1, &pcm_bytes(&[0i16; 48])).unwrap();
+        assert_eq!(i.lost, 0);
+    }
+
+    /// Latch takeover: after `reset_seq`, the new sender's arbitrary start
+    /// sequence must not log a phantom gap or reorder (the counters are
+    /// cumulative, so assert on deltas around the reset).
+    #[test]
+    fn reset_seq_clears_gap_accounting() {
+        let (mut i, _jitter) = ingest();
+        feed(&mut i, PayloadType::Pcm, 5000, &pcm_bytes(&[0i16; 48])).unwrap();
+        assert_eq!(i.received, 1);
+        let (lost_before, ooo_before) = (i.lost, i.out_of_order);
+        i.reset_seq();
+        feed(&mut i, PayloadType::Pcm, 0, &pcm_bytes(&[0i16; 48])).unwrap();
+        assert_eq!(i.lost, lost_before, "fresh tracker: no phantom gap");
+        assert_eq!(i.out_of_order, ooo_before, "fresh tracker: no phantom reorder");
+        // Classification continues cleanly from the new expectation.
+        feed(&mut i, PayloadType::Pcm, 1, &pcm_bytes(&[0i16; 48])).unwrap();
+        assert_eq!(i.lost, lost_before, "next frame in-order");
+    }
+
+    fn ingest_with_strict(strict: PayloadType) -> (Ingest, Arc<JitterBuffer>) {
+        let jitter = Arc::new(JitterBuffer::new(8192));
+        (Ingest::new(jitter.clone(), Some(strict), 1.0), jitter)
     }
 
     /// Receiver-side gain: 2.0 doubles sample amplitude; 0.0 fully silences

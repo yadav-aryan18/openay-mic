@@ -145,10 +145,6 @@ impl CodecMode {
 /// Configuration for the receive pipeline. See [`EngineConfig::validated`]
 /// for the normalization rules (port range, target clamp).
 ///
-/// The two audio-output fields exist only in builds with the `audio-output`
-/// feature: they are cfg-gated (like the fields they drive) so the headless
-/// and PipeWire-only builds keep byte-identical semantics — an `EngineConfig`
-/// without the feature simply cannot express an audio-output request, and the
 /// The two output fields exist in EVERY build (platform parity): on Linux
 /// the GUI leaves them unset (the PipeWire virtual mic is the output), on
 /// Windows it sets `audio_output` (WASAPI playback). Requesting playback in
@@ -834,7 +830,6 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
     }
 
     // Publish the run's config before `config` moves into the network task
-    // Publish the run's config before `config` moves into the network task
     // (EngineConfig is never Copy — it carries the output-device String).
     let config_for_state = config.clone();
     *state.config.lock().expect("engine config mutex poisoned") = Some(config_for_state);
@@ -927,14 +922,10 @@ fn spawn_depth_controller(
                         depth.on_underrun();
                         last_underruns = underruns;
                     }
-                    let received = ingest
-                        .lock()
-                        .expect("ingest mutex poisoned")
-                        .received;
-                    let audio_received = ingest
-                        .lock()
-                        .expect("ingest mutex poisoned")
-                        .audio_received;
+                    let (received, audio_received) = {
+                        let g = ingest.lock().expect("ingest mutex poisoned");
+                        (g.received, g.audio_received)
+                    };
                     let flowing = audio_received > last_audio_received;
                     last_audio_received = audio_received;
                     if received > last_seen_received {
@@ -1154,27 +1145,40 @@ async fn udp_loop(
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             r = socket.recv_from(&mut buf) => {
                 let (n, src) = r.context("UDP recv error")?;
+                // A malformed datagram is counted and NOT ingested, but the
+                // loop must still observe `quit` below: falling through (not
+                // `continue`-ing) keeps Stop responsive under a garbage
+                // datagram flood.
                 let pkt = match openay_protocol::decode(&buf[..n]) {
-                    Ok(pkt) => pkt,
+                    Ok(pkt) => Some(pkt),
                     Err(_) => {
                         ingest.lock().expect("ingest mutex poisoned").malformed += 1;
-                        continue;
+                        None
                     }
                 };
-                // Peer latch: pin, continue, or reject.
-                let mut accept = true;
+                // Peer latch: pin, continue, or reject (undecoded datagrams
+                // never touch the latch, the counters, or the replies).
+                let mut accept = pkt.is_some();
                 match peer {
+                    _ if !accept => {}
                     Some(pinned) if pinned != src => {
                         let takeover = peer_last_rx
                             .map_or(true, |t| t.elapsed() >= PEER_STALE_AFTER);
                         if takeover {
                             eprintln!(
-                                "openay-server: peer latch moved {pinned} -> {src}                                  (previous peer quiet >{}s)",
+                                "openay-server: peer latch moved {pinned} -> {src} (previous peer quiet >{}s)",
                                 PEER_STALE_AFTER.as_secs()
                             );
                             peer = Some(src);
                             peer_last_rx = Some(Instant::now());
                             last_ping = Some(Instant::now());
+                            // The new sender starts its sequence from
+                            // scratch: classify against a fresh expectation
+                            // instead of logging a phantom gap/reorder.
+                            ingest
+                                .lock()
+                                .expect("ingest mutex poisoned")
+                                .reset_seq();
                         } else {
                             accept = false;
                             foreign.fetch_add(1, Ordering::Relaxed);
@@ -1197,6 +1201,7 @@ async fn udp_loop(
                     }
                 }
                 if accept {
+                    let pkt = pkt.expect("decoded above when accepted");
                     if pkt.kind == PayloadType::Control {
                         if let Some(msg) = parse_control(&pkt.payload) {
                             if let Some(reply) =
@@ -1278,6 +1283,10 @@ async fn tcp_loop(
     // checked between packets), and the Arc clones held per connection die
     // with the tasks instead of outliving the pipeline.
     let mut conns = tokio::task::JoinSet::new();
+    // Single-phone product: while one connection is being served, further
+    // accepts are refused (two senders would blend audio into one Ingest
+    // and corrupt loss accounting — same reasoning as the UDP peer latch).
+    let busy = Arc::new(AtomicBool::new(false));
 
     let mut last_stats = Instant::now();
     let mut last_underruns = jitter.underruns();
@@ -1287,7 +1296,14 @@ async fn tcp_loop(
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             r = listener.accept() => {
                 let (stream, peer) = r.context("accept error")?;
+                if busy.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "openay-server: refusing TCP connection from {peer} —                          already serving one"
+                    );
+                    continue;
+                }
                 eprintln!("openay-server: TCP connection from {peer}");
+                let conn_busy = busy.clone();
                 let conn_ingest = ingest.clone();
                 let conn_quit = quit.clone();
                 let codec_mode = config.codec;
@@ -1368,6 +1384,9 @@ async fn tcp_loop(
                             }
                         }
                     }
+                    // Slot free for the next connection (the writer task ends
+                    // on its own once this task drops reply_tx).
+                    conn_busy.store(false, Ordering::Relaxed);
                     // Dropping reply_tx ends the writer task for this conn.
                 });
             }

@@ -286,7 +286,9 @@ impl App {
                 Task::none()
             }
             Message::GainChanged(v) => {
-                self.gain = v;
+                // Round to the slider's 0.1 step so f32 noise (0.30000004)
+                // never persists into config.toml.
+                self.gain = (v * 10.0).round() / 10.0;
                 self.dirty = true;
                 Task::none()
             }
