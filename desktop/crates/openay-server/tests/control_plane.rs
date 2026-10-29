@@ -323,6 +323,47 @@ async fn udp_foreign_source_is_rejected_until_stale() {
     handle.cmd().send(EngineCommand::Stop).await.unwrap();
 }
 
+/// Regression: a flood of malformed datagrams must not wedge the engine —
+/// Stop has to complete while garbage arrives at line rate (the malformed
+/// path used to `continue` past the quit check).
+#[tokio::test]
+async fn malformed_flood_does_not_hang_stop() {
+    let port = UDP_PORT + 6;
+    let handle = spawn_engine(Some(udp_config(port)));
+    handle
+        .cmd()
+        .send(EngineCommand::Start(udp_config(port)))
+        .await
+        .expect("send Start");
+    assert!(wait_running(&handle), "engine must start");
+
+    let flooder = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let flood_port = port;
+    let flood = tokio::spawn(async move {
+        let mut buf = [0u8; 1];
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            // 1-byte datagrams: always decode-Err, cheap to send at line rate.
+            let _ = flooder.send_to(&buf, ("127.0.0.1", flood_port)).await;
+            // Yield so the engine task gets scheduled between bursts.
+            tokio::task::yield_now().await;
+        }
+    });
+
+    // Let the flood build up, then Stop must complete promptly.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    handle.cmd().send(EngineCommand::Stop).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && handle.status().running {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !handle.status().running,
+        "Stop must complete under a malformed-datagram flood"
+    );
+    flood.abort();
+}
+
 /// Gain validation: non-finite values are rejected before reaching the
 /// engine (a NaN would poison every decoded sample).
 #[tokio::test]

@@ -57,7 +57,10 @@ Semantics:
   payload type names the peer can produce/accept (`"pcm"`, `"opus"`); `rate`
   is the sample rate in Hz. Fields marked `?` default when omitted; unknown
   fields are ignored; unknown `t` values make the payload not-a-control-
-  message (still counted as received traffic).
+  message (still counted as received traffic). `hello`/`hello-ack` must
+  carry `app` and `proto`: a receiver that cannot parse the typed fields
+  treats the whole message as not-a-control-message (the reference C++
+  parser is more lenient on `app` and logs it verbatim).
 - The receiver sends `ping` every 1 s to whichever peer last sent it a
   packet. Any received packet — audio or control — proves the sender is
   alive; a sender that has sent at least one packet but stays silent for
