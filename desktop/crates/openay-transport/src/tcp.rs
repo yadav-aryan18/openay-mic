@@ -50,19 +50,17 @@ impl<T> TcpPacketStream<T> {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> TcpPacketStream<T> {
-    /// Encode `packet` and write it as a single framed packet to the stream.
-    pub async fn send_packet(&mut self, packet: &Packet) -> io::Result<()> {
-        let wire = encode(packet);
-        self.stream.write_all(&wire).await
-    }
-
+impl<T: AsyncRead + Unpin> TcpPacketStream<T> {
     /// Read the next complete packet from the stream.
     ///
     /// If the magic byte is wrong, the stream is scanned forward up to
     /// [`MAX_RESYNC_SCAN`] bytes for the next `0xA7`; if found, parsing
     /// resumes from that byte. If none is found, a hard `io::Error` is
     /// returned.
+    ///
+    /// The read path deliberately requires only [`AsyncRead`]: with a split
+    /// TCP socket (`TcpStream::into_split`) the read half can be framed while
+    /// the write half is owned by a separate writer task.
     pub async fn next_packet(&mut self) -> io::Result<Packet> {
         loop {
             // Ensure we have at least HEADER_LEN bytes.
@@ -169,6 +167,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> TcpPacketStream<T> {
             }
             self.pending.extend_from_slice(&chunk[..n]);
         }
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin> TcpPacketStream<T> {
+    /// Encode `packet` and write it as a single framed packet to the stream.
+    pub async fn send_packet(&mut self, packet: &Packet) -> io::Result<()> {
+        let wire = encode(packet);
+        self.stream.write_all(&wire).await
     }
 }
 

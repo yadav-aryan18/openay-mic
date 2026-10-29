@@ -71,13 +71,24 @@ audio as a PipeWire virtual microphone source node named `openay_mic`
 ```
 openay-server [--transport udp|tcp] [--port N] [--bind ADDR]
               [--codec pcm|opus|auto] [--target-ms F] [--capacity-ms F]
+              [--gain F]
+
 ```
 
 - `--transport` default `udp`, `--port` default `41700`, `--bind` default
   `0.0.0.0`.
 - `--codec` default `auto` (accept either PCM or Opus per packet); `pcm` /
   `opus` reject the other type as malformed.
-- `--target-ms` default `10.0`, clamped to `[MIN_PREBUFFER_MS, MAX_PREBUFFER_MS]`
+- `--target-ms` default `10.0`, clamped to `[MIN_PREBUFFER_MS, MAX_PREBUFFER_MS]`.
+- `--gain` default `1.0` (unity), clamped to `0..=4` — receiver-side output
+  gain applied after decode (the phone's capture/encode chain is untouched).
+- While running, the engine sends a liveness `ping` to the last sender every
+  second (CONTROL JSON; see `shared/protocol.md` "Control messages") and
+  reports `peer_stale` after 5 s of sender silence.
+- The UDP receiver latches the first sender: other sources are rejected
+  (counted in `EngineStatus.foreign_packets`) until the latched peer has
+  been quiet for the 5 s stale window, so a second LAN host cannot blend
+  audio into the virtual microphone mid-session.
   (5–20 ms); the virtual mic starts emitting real samples once the jitter
   buffer holds `ceil(target-ms * 48)` samples, and re-prebuffers after every
   underrun.

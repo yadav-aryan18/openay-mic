@@ -11,6 +11,10 @@ use openay_jitter::JitterBuffer;
 use openay_protocol::PayloadType;
 use openay_transport::SeqTracker;
 
+/// Upper bound for the output gain (4.0 ≈ +12 dB). Values outside
+/// `0.0..=MAX_GAIN` are clamped; non-finite values fall back to unity.
+pub const MAX_GAIN: f32 = 4.0;
+
 /// Errors produced by [`Ingest::ingest_packet`]. Malformed and undecodable
 /// packets are counted, never fatal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,10 +37,19 @@ pub struct Ingest {
     decoder: Option<OpusCodec>,
     /// `--codec` mode: `None` = auto (accept both), `Some` = strict.
     only: Option<PayloadType>,
+    /// Output gain applied to decoded samples before the jitter buffer
+    /// (1.0 = unity). Applied receiver-side so the phone's capture → encode
+    /// chain is untouched by volume changes.
+    gain: f32,
     /// Overrun log throttle: log at most every N overruns.
     overrun_log_gate: u64,
 
     pub received: u64,
+    /// Packets that carried audio (PCM/Opus). The depth controller's
+    /// "flowing" signal uses this, not `received`: control traffic
+    /// (keepalive pongs) must not earn clean-window prebuffer decay while
+    /// the sender is paused.
+    pub audio_received: u64,
     pub lost: u64,
     pub duplicate: u64,
     pub out_of_order: u64,
@@ -45,16 +58,20 @@ pub struct Ingest {
 
 impl Ingest {
     /// Create an ingest pipeline over `jitter`. `only` restricts accepted
-    /// payload types (`None` accepts both PCM and Opus).
-    pub fn new(jitter: Arc<JitterBuffer>, only: Option<PayloadType>) -> Self {
+    /// payload types (`None` accepts both PCM and Opus); `gain` scales the
+    /// decoded samples (clamped to `0.0..=4.0` here so a bad value can never
+    /// amplify into clipping beyond the documented range).
+    pub fn new(jitter: Arc<JitterBuffer>, only: Option<PayloadType>, gain: f32) -> Self {
         let decoder = OpusCodec::new().ok();
         Ingest {
             jitter,
             seq: SeqTracker::new(),
             decoder,
             only,
+            gain: if gain.is_finite() { gain.clamp(0.0, MAX_GAIN) } else { 1.0 },
             overrun_log_gate: 0,
             received: 0,
+            audio_received: 0,
             lost: 0,
             duplicate: 0,
             out_of_order: 0,
@@ -131,6 +148,9 @@ impl Ingest {
         payload: &[u8],
     ) -> Result<(), IngestError> {
         self.received += 1;
+        if kind != PayloadType::Control {
+            self.audio_received += 1;
+        }
         let event = self.track_seq(seq);
 
         // A duplicate (re-delivered frame) is counted but not decoded or
@@ -147,7 +167,7 @@ impl Ingest {
             }
         }
 
-        let samples = match self.decode(kind, payload) {
+        let mut samples = match self.decode(kind, payload) {
             Ok(s) => s,
             Err(e) => {
                 self.malformed += 1;
@@ -156,6 +176,13 @@ impl Ingest {
         };
         if samples.is_empty() {
             return Ok(()); // control packet
+        }
+        // Receiver-side gain, applied after decode and before the jitter
+        // buffer (clamped to full scale so boosted samples cannot wrap).
+        if self.gain != 1.0 {
+            for s in &mut samples {
+                *s = (*s * self.gain).clamp(-1.0, 1.0);
+            }
         }
 
         let pushed = self.jitter.push(&samples);
@@ -183,7 +210,7 @@ mod tests {
 
     fn ingest() -> (Ingest, Arc<JitterBuffer>) {
         let jitter = Arc::new(JitterBuffer::new(8192));
-        (Ingest::new(jitter.clone(), None), jitter)
+        (Ingest::new(jitter.clone(), None, 1.0), jitter)
     }
 
     /// `ingest_packet` on the raw payload bytes (as received from the wire).
@@ -289,7 +316,7 @@ mod tests {
     #[test]
     fn strict_codec_mode_rejects_other_type() {
         let jitter = Arc::new(JitterBuffer::new(8192));
-        let mut i = Ingest::new(jitter.clone(), Some(PayloadType::Opus));
+        let mut i = Ingest::new(jitter.clone(), Some(PayloadType::Opus), 1.0);
         let pcm = pcm_bytes(&[0i16; 48]);
         assert!(matches!(
             feed(&mut i, PayloadType::Pcm, 0, &pcm),
@@ -297,6 +324,50 @@ mod tests {
         ));
         assert_eq!(i.malformed, 1);
         assert_eq!(jitter.available(), 0);
+    }
+
+    /// Receiver-side gain: 2.0 doubles sample amplitude; 0.0 fully silences
+    /// while keeping the timing (frames still flow through the buffer); an
+    /// out-of-range value is clamped so boosted samples cannot exceed ±1.0.
+    #[test]
+    fn gain_scales_decoded_samples() {
+        let (mut i, jitter) = ingest_with_gain(2.0);
+        feed(&mut i, PayloadType::Pcm, 0, &pcm_bytes(&[8192, -8192])).unwrap();
+        let mut out = vec![0.0f32; 2];
+        jitter.pop(&mut out);
+        assert!((out[0] - 16384.0 / 32768.0).abs() < 1e-6, "got {}", out[0]);
+        assert!((out[1] - (-16384.0 / 32768.0)).abs() < 1e-6, "got {}", out[1]);
+
+        // Gain 0 mutes but preserves the stream (samples pushed as zeros).
+        let (mut i, jitter) = ingest_with_gain(0.0);
+        feed(&mut i, PayloadType::Pcm, 0, &pcm_bytes(&[12345, -12345])).unwrap();
+        let mut out = vec![1.0f32; 2];
+        jitter.pop(&mut out);
+        assert_eq!(out, [0.0, 0.0]);
+
+        // Clamping: an 8x request acts as 4x, and full-scale input saturates.
+        let (mut i, jitter) = ingest_with_gain(8.0);
+        feed(&mut i, PayloadType::Pcm, 0, &pcm_bytes(&[32767, 1000])).unwrap();
+        let mut out = vec![0.0f32; 2];
+        jitter.pop(&mut out);
+        assert_eq!(out[0], 1.0, "boosted full-scale clamps to 1.0");
+        assert!(
+            (out[1] - 4000.0 / 32768.0).abs() < 1e-6,
+            "1000 samples * clamped gain 4 = 4000/32768, got {}",
+            out[1]
+        );
+
+        // Non-finite gain falls back to unity instead of poisoning samples.
+        let (mut i, jitter) = ingest_with_gain(f32::NAN);
+        feed(&mut i, PayloadType::Pcm, 0, &pcm_bytes(&[16384])).unwrap();
+        let mut out = vec![0.0f32; 1];
+        jitter.pop(&mut out);
+        assert!((out[0] - 0.5).abs() < 1e-6, "NaN gain must not apply, got {}", out[0]);
+    }
+
+    fn ingest_with_gain(gain: f32) -> (Ingest, Arc<JitterBuffer>) {
+        let jitter = Arc::new(JitterBuffer::new(8192));
+        (Ingest::new(jitter.clone(), None, gain), jitter)
     }
 
     /// Opus roundtrip through the ingest pipeline: encode one 480-sample
@@ -350,7 +421,7 @@ mod tests {
     #[test]
     fn overrun_increments_counter_and_is_not_fatal() {
         let jitter = Arc::new(JitterBuffer::new(1024));
-        let mut i = Ingest::new(jitter.clone(), None);
+        let mut i = Ingest::new(jitter.clone(), None, 1.0);
         // Fill the buffer exactly.
         let big = pcm_bytes(&[1000i16; 1024]);
         feed(&mut i, PayloadType::Pcm, 0, &big).unwrap();
