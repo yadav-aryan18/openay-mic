@@ -82,6 +82,11 @@ openay-server [--transport udp|tcp] [--port N] [--bind ADDR]
 - `--target-ms` default `10.0`, clamped to `[MIN_PREBUFFER_MS, MAX_PREBUFFER_MS]`.
 - `--gain` default `1.0` (unity), clamped to `0..=4` — receiver-side output
   gain applied after decode (the phone's capture/encode chain is untouched).
+- `--monitor` (needs `--features audio-output`) — LISTEN: play the received
+  audio on a local output device for mic tests, additively: on Linux the
+  PipeWire virtual microphone keeps running alongside it, so the monitor can
+  be toggled freely (uses `--output-device` when set; a device failure only
+  stops the monitor, never the run).
 - While running, the engine sends a liveness `ping` to the last sender every
   second (CONTROL JSON; see `shared/protocol.md` "Control messages") and
   reports `peer_stale` after 5 s of sender silence.

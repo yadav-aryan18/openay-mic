@@ -90,6 +90,17 @@ const PEER_STALE_AFTER: Duration = Duration::from_secs(5);
 /// App identifier announced in `hello-ack` control messages.
 const RECEIVER_APP: &str = "openay-server";
 
+/// Whether the LISTEN monitor should be reported for `cfg` (feature-gated:
+/// the field exists in every build, the capability only with audio-output).
+#[cfg(feature = "audio-output")]
+fn cfg_monitor_running(cfg: &EngineConfig) -> bool {
+    cfg.monitor
+}
+#[cfg(not(feature = "audio-output"))]
+fn cfg_monitor_running(_cfg: &EngineConfig) -> bool {
+    false
+}
+
 pub use openay_jitter::{MAX_PREBUFFER_MS, MIN_PREBUFFER_MS};
 
 /// Transport protocol the engine listens on.
@@ -177,6 +188,13 @@ pub struct EngineConfig {
     /// (1.0 = unity; clamped to `0.0..=4.0` at validation). Applied
     /// receiver-side so the sender's capture/encode chain stays untouched.
     pub gain: f32,
+    /// LISTEN: play the received audio on a local output device (mic
+    /// testing) IN ADDITION to the normal path — on Linux the PipeWire
+    /// virtual microphone keeps running alongside it, so the monitor can be
+    /// toggled freely. Uses `output_device` when set, the host default
+    /// otherwise. Requires the `audio-output` build feature; without it,
+    /// Start fails with the same clean capability error as `audio_output`.
+    pub monitor: bool,
 }
 
 impl Default for EngineConfig {
@@ -191,6 +209,7 @@ impl Default for EngineConfig {
             audio_output: false,
             output_device: None,
             gain: 1.0,
+            monitor: false,
         }
     }
 }
@@ -304,6 +323,9 @@ pub struct EngineStatus {
     /// [`PEER_STALE_AFTER`] (5 s). The engine keeps running — a paused
     /// sender is legitimate — this only makes the gap visible to the UI.
     pub peer_stale: bool,
+    /// True while running with LISTEN active (a local output stream is
+    /// rendering the received audio for mic testing).
+    pub monitor: bool,
     /// UDP only: datagrams from a source other than the latched peer,
     /// rejected by the peer latch (see the `udp_loop` docs). A nonzero value
     /// usually means a second sender on the network — or the phone roaming
@@ -377,6 +399,7 @@ impl EngineHandle {
             uptime_secs: 0,
             effective_target_ms: cfg.target_ms,
             peer_stale: running && self.state.peer_stale.load(Ordering::Relaxed),
+            monitor: running && cfg_monitor_running(&cfg),
             foreign_packets: 0,
         };
 
@@ -692,6 +715,8 @@ struct Pipeline {
     pw_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
     #[cfg(feature = "audio-output")]
     audio_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    #[cfg(feature = "audio-output")]
+    monitor_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Pipeline {
@@ -714,7 +739,14 @@ impl Pipeline {
             .is_none_or(std::thread::JoinHandle::is_finished);
         #[cfg(not(feature = "audio-output"))]
         let audio_done = true;
-        self.quit.load(Ordering::Relaxed) && net_done && pw_done && audio_done
+        #[cfg(feature = "audio-output")]
+        let monitor_done = self
+            .monitor_thread
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished);
+        #[cfg(not(feature = "audio-output"))]
+        let monitor_done = true;
+        self.quit.load(Ordering::Relaxed) && net_done && pw_done && audio_done && monitor_done
             || net_done && !self.quit.load(Ordering::Relaxed)
     }
 }
@@ -728,7 +760,7 @@ impl Pipeline {
 async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Result<Pipeline> {
     let config = config.validated().map_err(|e| anyhow::anyhow!(e))?;
     #[cfg(not(feature = "audio-output"))]
-    if config.audio_output {
+    if config.audio_output || config.monitor {
         return Err(anyhow::anyhow!(
             "built without audio output support (rebuild with --features audio-output)"
         ));
@@ -787,6 +819,55 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
     } else {
         None
     };
+
+    // LISTEN monitor (feature `audio-output`): an additive local output
+    // stream fed from a small post-gain tap ring — the mic path (virtual mic
+    // / audio output) is untouched, so listening can be toggled freely for
+    // mic tests. Best-effort by design: a device failure logs and stops the
+    // MONITOR only, never the run.
+    #[cfg(feature = "audio-output")]
+    let monitor_thread = if config.monitor {
+        let ring = Arc::new(JitterBuffer::new(SAMPLE_RATE / 20)); // ~50 ms tap
+        ingest.lock().expect("ingest mutex poisoned").set_monitor(ring.clone());
+        let shared = audio::AudioShared {
+            jitter: ring,
+            streaming: Arc::new(AtomicBool::new(false)),
+            quit: quit.clone(),
+            // 20 ms tap prebuffer: snappier than the mic path's latch.
+            target_samples: Arc::new(AtomicU32::new((SAMPLE_RATE / 50) as u32)),
+            // Discarded: the main level meter already reports the stream.
+            peak_level: Arc::new(AtomicU32::new(0)),
+            stream_error: Arc::new(Mutex::new(None)),
+        };
+        let device = config.output_device.clone();
+        let (setup_tx, setup_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("openay-monitor".into())
+            .spawn(move || {
+                if let Err(e) = audio::run_audio_output(shared, device, setup_tx) {
+                    eprintln!("openay-server: local monitor stopped: {e:#}");
+                }
+            })
+            .context("spawning monitor output thread")?;
+        // A setup failure (no output device, bad substring) logs and ends the
+        // MONITOR thread only — deliberately NOT spawn_setup_monitor, which
+        // would tear down the whole run for a best-effort listener.
+        let state = state.clone();
+        tokio::spawn(async move {
+            let recv = tokio::task::spawn_blocking(move || setup_rx.recv()).await;
+            let msg = match recv {
+                Ok(Ok(Err(e))) => format!("local monitor unavailable: {e}"),
+                _ => return, // running, or the thread ended without a message
+            };
+            eprintln!("openay-server: {msg}");
+            let _ = state; // kept for symmetry with spawn_setup_monitor
+        });
+        Some(thread)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "audio-output"))]
+    let monitor_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>> = None;
 
     #[cfg(feature = "pipewire")]
     let pw_thread = {
@@ -870,6 +951,8 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
         pw_thread,
         #[cfg(feature = "audio-output")]
         audio_thread,
+        #[cfg(feature = "audio-output")]
+        monitor_thread,
     })
 }
 
@@ -1058,6 +1141,12 @@ async fn stop_pipeline(p: Pipeline, state: &Arc<EngineState>) {
     #[cfg(feature = "audio-output")]
     if let Some(thread) = p.audio_thread {
         reap_output_thread(thread, "audio output", state).await;
+    }
+    // The monitor is best-effort: its errors are logged, never surfaced as
+    // run errors (a vanished output device must not look like a mic failure).
+    #[cfg(feature = "audio-output")]
+    if let Some(thread) = p.monitor_thread {
+        let _ = thread.join();
     }
 
     // The canonical stats line survives the stop; the snapshot counters do
@@ -1599,12 +1688,23 @@ mod tests {
     }
 
     #[test]
+    fn validated_passes_monitor_through() {
+        let cfg = EngineConfig {
+            monitor: true,
+            ..EngineConfig::default()
+        };
+        assert!(cfg.validated().unwrap().monitor);
+        assert!(!EngineConfig::default().monitor, "LISTEN is opt-in");
+    }
+
+    #[test]
     fn validated_preserves_other_fields() {
         let cfg = EngineConfig {
             transport: Transport::Tcp,
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 4321,
             codec: CodecMode::Pcm,
+            monitor: false,
             target_ms: 17.0,
             capacity_ms: 200.0,
             audio_output: false,

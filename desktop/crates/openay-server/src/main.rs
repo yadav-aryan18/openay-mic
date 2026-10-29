@@ -65,6 +65,11 @@ struct Args {
     /// `audio-output` build feature.
     #[arg(long)]
     output: bool,
+    /// LISTEN: also play the received audio on a local output device (mic
+    /// testing) while the normal path keeps running. Uses --output-device
+    /// when set. Requires the `audio-output` build feature.
+    #[arg(long)]
+    monitor: bool,
     /// With --output: case-insensitive substring of the output device name
     /// to select (omit for the host default). Requires the `audio-output`
     /// build feature.
@@ -84,7 +89,7 @@ async fn main() -> Result<()> {
     // before anything else runs (same pattern as a `bt` request without the
     // `bluetooth` feature).
     #[cfg(not(feature = "audio-output"))]
-    if args.output || args.output_device.is_some() || args.list_devices {
+    if args.output || args.monitor || args.output_device.is_some() || args.list_devices {
         anyhow::bail!("built without audio output support (rebuild with --features audio-output)");
     }
 
@@ -134,6 +139,7 @@ async fn main() -> Result<()> {
         target_ms,
         capacity_ms: args.capacity_ms,
         gain,
+        monitor: args.monitor,
     }
     .validated()
     .map_err(|e: ConfigError| anyhow::anyhow!(e))?;

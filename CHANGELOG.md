@@ -8,6 +8,13 @@ carry features).
 ## [Unreleased]
 
 ### Added
+- **LISTEN (mic test) toggle**: play your own received mic audio on a local
+  output device. Desktop CLI `--monitor` and a GUI settings toggle; additive
+  by design — on Linux the PipeWire virtual microphone keeps running
+  alongside the monitor, so listening can be toggled freely without
+  interrupting the mic. Best-effort: a monitor device failure only stops the
+  monitor. (GUI: `listen` in config.toml; on Windows the toggle gates the
+  WASAPI rendering that is otherwise always on.)
 - **Control-plane vocabulary** on the CONTROL payload type (additive, fully
   backward compatible): `hello`/`hello-ack` capability handshake and a
   receiver-side liveness `ping` (1 s cadence) answered with `pong`. The
