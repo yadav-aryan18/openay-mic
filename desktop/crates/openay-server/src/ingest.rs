@@ -41,6 +41,11 @@ pub struct Ingest {
     /// (1.0 = unity). Applied receiver-side so the phone's capture → encode
     /// chain is untouched by volume changes.
     gain: f32,
+    /// Optional LISTEN tap: post-gain samples are pushed into this small
+    /// ring for a local output stream (mic testing). Drop-when-full by the
+    /// jitter buffer's overrun policy — a listener may miss audio, the mic
+    /// path never waits. `None` = monitor off.
+    monitor: Option<Arc<JitterBuffer>>,
     /// Overrun log throttle: log at most every N overruns.
     overrun_log_gate: u64,
 
@@ -70,6 +75,7 @@ impl Ingest {
             only,
             gain: if gain.is_finite() { gain.clamp(0.0, MAX_GAIN) } else { 1.0 },
             overrun_log_gate: 0,
+            monitor: None,
             received: 0,
             audio_received: 0,
             lost: 0,
@@ -135,6 +141,13 @@ impl Ingest {
         }
     }
 
+    /// Wire the LISTEN tap (see the `monitor` field). Call before the
+    /// network task starts; the tap receives post-gain audio only (control
+    /// packets carry no samples).
+    pub fn set_monitor(&mut self, ring: Arc<JitterBuffer>) {
+        self.monitor = Some(ring);
+    }
+
     /// Restart sequence classification from scratch (peer-latch takeover:
     /// the new sender starts its counter at an arbitrary point).
     pub fn reset_seq(&mut self) {
@@ -191,6 +204,11 @@ impl Ingest {
             for s in &mut samples {
                 *s = (*s * self.gain).clamp(-1.0, 1.0);
             }
+        }
+        // LISTEN tap: same samples the mic path gets, into an independent
+        // ring (one producer = this task, one consumer = the monitor thread).
+        if let Some(m) = &self.monitor {
+            let _ = m.push(&samples);
         }
 
         let pushed = self.jitter.push(&samples);
@@ -369,6 +387,38 @@ mod tests {
     fn ingest_with_strict(strict: PayloadType) -> (Ingest, Arc<JitterBuffer>) {
         let jitter = Arc::new(JitterBuffer::new(8192));
         (Ingest::new(jitter.clone(), Some(strict), 1.0), jitter)
+    }
+
+    /// LISTEN tap: post-gain samples land in the monitor ring (a 2x gain is
+    /// audible there too), control packets push nothing, and the mic path is
+    /// unaffected by the tap.
+    #[test]
+    fn monitor_tap_receives_post_gain_audio() {
+        let monitor_ring = Arc::new(JitterBuffer::new(8192));
+        let (mut i, jitter) = ingest_with_gain(2.0);
+        i.set_monitor(monitor_ring.clone());
+        feed(&mut i, PayloadType::Pcm, 0, &pcm_bytes(&[8192, -8192])).unwrap();
+        feed(&mut i, PayloadType::Control, 1, b"{\"t\":\"pong\"}").unwrap();
+        feed(&mut i, PayloadType::Pcm, 2, &pcm_bytes(&[0i16; 48])).unwrap();
+
+        let mut out = vec![0.0f32; 50];
+        assert_eq!(monitor_ring.pop(&mut out), 50, "tap got both audio frames");
+        assert!((out[0] - 16384.0 / 32768.0).abs() < 1e-6, "tap is POST-gain");
+        // The mic path is unchanged by the tap.
+        assert_eq!(jitter.available(), 50);
+
+        // Dropping whole blocks when the tap ring is full: the mic path must
+        // keep working (a slow listener never blocks the stream).
+        // JitterBuffer enforces a 1024-sample capacity floor, so the tap
+        // only starts dropping after ~21 frames: feed well past that.
+        let tiny = Arc::new(JitterBuffer::new(64));
+        let (mut i, _jitter) = ingest();
+        i.set_monitor(tiny.clone());
+        for seq in 0..40u16 {
+            feed(&mut i, PayloadType::Pcm, seq, &pcm_bytes(&[0i16; 48])).unwrap();
+        }
+        assert!(tiny.overruns() >= 1, "full tap drops, counted");
+        assert_eq!(tiny.available(), tiny.capacity(), "tap stays full");
     }
 
     /// Receiver-side gain: 2.0 doubles sample amplitude; 0.0 fully silences
