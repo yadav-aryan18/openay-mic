@@ -16,9 +16,15 @@ bool OboeSource::Start() {
     builder.setSharingMode(oboe::SharingMode::Exclusive);
     builder.setDataCallback(this);
     builder.setErrorCallback(this);
+    // Allocate an audio session id so the app can attach platform voice
+    // effects (echo cancellation / noise suppression) to this stream. On
+    // API < 28 the request is ignored and the stream still opens.
+    builder.setSessionId(allocate_session_ ? oboe::SessionId::Allocate
+                                           : oboe::SessionId::None);
 
     stream_error_.store(false, std::memory_order_relaxed);
     error_text_.clear();
+    session_id_ = 0;
 
     oboe::Result rc = builder.openStream(&stream_);
     if (rc != oboe::Result::OK) {
@@ -36,12 +42,18 @@ bool OboeSource::Start() {
         sharing_mode_ = "exclusive";
     }
 
+    // getSessionId() returns the raw SessionId: a positive number once the
+    // framework allocated one, or None/-1. Only a real id is reported.
+    const int sid = static_cast<int>(stream_->getSessionId());
+    session_id_ = sid > 0 ? sid : 0;
+
     rc = stream_->requestStart();
     if (rc != oboe::Result::OK) {
         error_text_ =
             std::string("requestStart failed: ") + oboe::convertToText(rc);
         stream_->close();
         stream_ = nullptr;
+        session_id_ = 0;
         return false;
     }
     return true;
@@ -53,6 +65,7 @@ void OboeSource::Stop() {
     oboe::AudioStream* s = stream_;
     stream_ = nullptr;  // close() below may run its own teardown
     s->close();         // also stops the stream
+    session_id_ = 0;
 }
 
 std::string OboeSource::sharing_mode() const {
@@ -75,6 +88,11 @@ std::string OboeSource::error_string() const {
     return error_text_;
 }
 
+int OboeSource::audio_session_id() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return session_id_;
+}
+
 oboe::DataCallbackResult OboeSource::onAudioReady(oboe::AudioStream* stream,
                                                   void* audio_data,
                                                   int32_t num_frames) {
@@ -92,6 +110,7 @@ void OboeSource::onErrorAfterClose(oboe::AudioStream* stream,
     stream_error_.store(true, std::memory_order_relaxed);
     error_text_ = std::string("stream error: ") + oboe::convertToText(error);
     stream_ = nullptr;  // Oboe has already closed it
+    session_id_ = 0;
 }
 
 }  // namespace openay

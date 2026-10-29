@@ -49,6 +49,9 @@ public:
     virtual std::string sharing_mode() const { return "exclusive"; }
     virtual uint64_t xruns() const { return 0; }
     virtual std::string error_string() const { return ""; }
+    // Platform audio session id of the live stream (Android: lets the app
+    // attach echo-cancellation/noise-suppression effects). 0 = none.
+    virtual int audio_session_id() const { return 0; }
 
 protected:
     // Implementation hook: call from the audio/RT thread for every captured

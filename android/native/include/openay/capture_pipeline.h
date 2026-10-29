@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "openay/audio_source.h"
+#include "openay/control.h"
 #include "openay/protocol.h"
 #include "openay/ring_buffer.h"
 
@@ -78,11 +79,35 @@ inline const char* PipelineErrorName(PipelineError e) {
 // Thin transport seam implemented by adapters around the existing
 // UdpSender/TcpClient (see capture_pipeline.cpp). Send() must not block
 // indefinitely; UDP never does, TCP sends on the network thread only.
+// Recv() polls the reverse direction (the receiver's control traffic);
+// the default is "not supported" so a send-only sink stays valid.
 struct IPacketSink {
     virtual ~IPacketSink() = default;
     virtual bool Send(const Packet& packet) = 0;
     virtual bool Valid() const = 0;
+    // Waits up to timeout_ms (0 = pure poll) for one well-formed packet from
+    // the peer. Returns false on timeout, malformed input, or unsupported.
+    virtual bool Recv(Packet* out, int timeout_ms) {
+        (void)out;
+        (void)timeout_ms;
+        return false;
+    }
 };
+
+// Liveness of the receiver as observed by the sender: Unknown until any
+// control traffic arrived this run, Alive while it is recent, Lost once it
+// went quiet for longer than the stale window (5 s). Absent control traffic
+// never escalates past Unknown, so older receivers keep reporting Unknown.
+enum class PeerLink { Unknown, Alive, Lost };
+
+inline const char* PeerLinkName(PeerLink p) {
+    switch (p) {
+        case PeerLink::Alive: return "alive";
+        case PeerLink::Lost: return "lost";
+        case PeerLink::Unknown: break;
+    }
+    return "unknown";
+}
 
 class CapturePipeline {
 public:
@@ -101,6 +126,12 @@ public:
     bool Configure(IAudioSource* source, TransportType transport,
                    const std::string& host, uint16_t port, CodecType codec,
                    int frame_ms, size_t ring_capacity_bytes = 16384);
+
+    // Same contract with a caller-built sink (test seam: scripted in-process
+    // sinks without sockets). Takes ownership of `sink`.
+    bool Configure(IAudioSource* source, std::unique_ptr<IPacketSink> sink,
+                   CodecType codec, int frame_ms,
+                   size_t ring_capacity_bytes = 16384);
 
     bool Start();  // false + last_error() on source failure
     void Stop();   // idempotent; drains <= 50 ms, joins, closes the sink
@@ -132,8 +163,25 @@ public:
     uint64_t send_errors() const {
         return send_errors_.load(std::memory_order_relaxed);
     }
+    // Control-plane counters (hello/ping/pong traffic, both directions).
+    uint64_t control_sent() const {
+        return control_sent_.load(std::memory_order_relaxed);
+    }
+    uint64_t control_received() const {
+        return control_received_.load(std::memory_order_relaxed);
+    }
+    // Receiver liveness as observed from the sender side (see PeerLink).
+    PeerLink peer_link() const;
     // Median RT-callback duration in microseconds; 0 until >= 2 samples.
     uint64_t callback_us_p50() const;
+
+    // Mute the captured stream: the pipeline keeps running and streaming
+    // (timing, sequencing and control traffic are unaffected) but pushes
+    // digital silence instead of the microphone input.
+    void SetMuted(bool muted) {
+        muted_.store(muted, std::memory_order_relaxed);
+    }
+    bool IsMuted() const { return muted_.load(std::memory_order_relaxed); }
 
     // Input level peak since the last call (max absolute sample, 0..32767);
     // atomically consumed AND reset, so each call covers exactly its own
@@ -149,6 +197,16 @@ private:
     // Pops one frame, encodes, sends; true on full success. On failure the
     // error counters + last_error are set (frame is dropped, stream lives).
     bool ProcessFrame(uint16_t* seq, Packet* pkt);
+    // Sends one control packet on the shared per-direction sequence counter.
+    bool SendControl(uint16_t* seq, ControlKind kind);
+    // Polls the reverse direction for receiver control traffic and answers
+    // pings (pong) / records liveness. Bounded per call; never fatal.
+    void DrainReceiver(uint16_t* seq);
+    // Shared tail of both Configure overloads (validation below the sink
+    // setup, codec state, member assignment, callback wiring).
+    bool ConfigureTail(IAudioSource* source, std::unique_ptr<IPacketSink> sink,
+                       CodecType codec, int frame_ms,
+                       size_t ring_capacity_bytes);
 
     IAudioSource* source_ = nullptr;
     std::unique_ptr<SpscRingBuffer> ring_;
@@ -181,6 +239,16 @@ private:
     std::atomic<uint64_t> encode_errors_{0};
     std::atomic<uint64_t> send_errors_{0};
     std::atomic<int> last_error_{0};
+
+    // Control plane (network thread writes, any thread reads).
+    std::atomic<uint64_t> control_sent_{0};
+    std::atomic<uint64_t> control_received_{0};
+    // steady_clock milliseconds of the last packet from the receiver
+    // (-1 = none this run). Written by the network thread.
+    std::atomic<int64_t> last_peer_rx_ms_{-1};
+    // Digital-silence switch (call auto-mute): set from the control thread,
+    // read on the RT thread. Muted capture still streams, keeping timing.
+    std::atomic<bool> muted_{false};
 
     // Input level meter: max |sample| seen since the last ExchangeLevelPeak(),
     // 0..32767 (INT16_MIN clamps to 32767). Written on the RT thread with a

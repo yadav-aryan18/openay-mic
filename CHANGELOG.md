@@ -5,6 +5,56 @@ All notable changes to OpenAY Mic are documented here. The format follows
 semantic (major.minor.patch — the wire protocol is frozen at v1, so minors
 carry features).
 
+## [Unreleased]
+
+### Added
+- **Control-plane vocabulary** on the CONTROL payload type (additive, fully
+  backward compatible): `hello`/`hello-ack` capability handshake and a
+  receiver-side liveness `ping` (1 s cadence) answered with `pong`. The
+  desktop engine pings the last known sender and answers `hello`; any
+  received packet refreshes peer liveness. Specified in
+  `shared/protocol.md` ("Control messages"); reference implementations in
+  `openay_protocol::control` (Rust) and `openay/control.h` (C++).
+- **Peer-stale visibility**: after at least one packet, 5 s of silence
+  raises `EngineStatus.peer_stale` (GUI/CLI can surface it; logged on state
+  transitions). The stream itself stays up — a paused sender is legitimate.
+- **Receiver-side output gain**: `EngineConfig.gain` (0–4, clamped),
+  `openay-server --gain`, a GUI OUTPUT GAIN slider, and `gain` in the GUI
+  config file — applied after decode, before the jitter buffer, so the
+  phone's capture/encode chain stays untouched by volume changes.
+- **Capture voice processing (Android)**: opt-in acoustic echo cancellation
+  and noise suppression via the platform audio session (Oboe stream session
+  id allocation on API 28+; effects are attached Kotlin-side per toggle).
+- **Call auto-mute (Android)**: capture is muted while the device is in a
+  call/communication audio mode (no extra permission); silence is streamed
+  so timing and liveness continue.
+- **Wi-Fi lock (Android)**: a high-performance/low-latency multicast Wi-Fi
+  lock is held for the duration of UDP capture (WAKE_LOCK permission).
+- Windows dist bundling of adb (`scripts/build_windows.sh`) with Apache-2.0
+  attribution, so USB forwarding needs no separate SDK install.
+- **UDP peer latch** (desktop receiver): after the first accepted datagram,
+  only the latched source is ingested or replied to; a different source is
+  counted (`EngineStatus.foreign_packets`) and rate-limit-logged until the
+  latched peer has been quiet for the 5 s stale window, then it may take
+  over (phone roaming to a new address). This keeps other LAN hosts from
+  blending audio into the virtual microphone or forging control replies.
+
+### Fixed
+- Jitter prebuffer decay no longer treats keepalive control traffic as
+  audio flow: a paused sender that stays alive via pings keeps its
+  network-proven prebuffer depth instead of decaying toward underruns
+  (`Ingest.audio_received` drives the depth controller's flowing signal).
+- TCP receive path (phone side) no longer drops bytes of a packet split
+  across a poll-timeout boundary: partially read bytes are retained and the
+  next `Recv` resumes mid-packet (regression-tested; the phone answers
+  receiver pings on its TCP audio socket with a zero timeout).
+- A failed session-bye control send is no longer recorded as a stream
+  error (the receiver closing first is a normal disconnect), and the
+  receiver's bye log is throttled to once per connection.
+- Android: restarting capture with different settings now fully releases
+  the previous session's Wi-Fi lock, voice effects, and call-mute watcher
+  before the new session starts (previously inherited/stale).
+
 ## [0.2.0] - 2026-10-28
 
 ### Added

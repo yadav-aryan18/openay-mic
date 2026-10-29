@@ -74,6 +74,7 @@ message(STATUS "openay_native: OPENAY_HAVE_OPUS=${OPENAY_HAVE_OPUS}")
 # capture_engine (portable facade; TestSource on host, OboeSource on Android).
 set(OPENAY_CORE_SOURCES
   src/protocol.cpp
+  src/control.cpp
   src/udp_transport.cpp
   src/tcp_transport.cpp
   src/ring_buffer.cpp
@@ -145,6 +146,10 @@ if(OPENAY_BUILD_TESTS)
     target_compile_definitions(test_capture PRIVATE OPENAY_HAVE_OPUS=1)
   endif()
   add_test(NAME capture COMMAND test_capture)
+
+  add_executable(test_control tests/test_control.cpp)
+  target_link_libraries(test_control PRIVATE openay_core)
+  add_test(NAME control COMMAND test_control)
 endif()
 
 # --- Android (NDK) library: JNI bridge + Oboe source -----------------------

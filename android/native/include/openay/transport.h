@@ -62,6 +62,12 @@ public:
     bool Valid() const { return fd_ >= 0; }
     bool Send(const Packet& packet);  // one datagram per packet
 
+    // Receives one datagram from the connected peer, waiting up to
+    // timeout_ms (0 = pure poll). Returns true only for a well-formed
+    // packet; false on timeout, malformed datagram, or error. This is how
+    // the sender side hears the receiver's control traffic (pings, acks).
+    bool Recv(Packet* out, int timeout_ms);
+
 private:
     int fd_ = -1;
 };
@@ -133,6 +139,18 @@ private:
     explicit TcpConn(int fd);  // takes ownership of fd
 
     bool ReadExact(uint8_t* dst, size_t n, int timeout_ms);
+    // Keeps bytes consumed from the stream by an aborted ReadExact so the
+    // next call resumes mid-packet instead of losing them (TCP is a byte
+    // stream: a poll timeout can land inside a packet header).
+    void RetainPartial(const uint8_t* data, size_t n);
+
+    int fd_ = -1;
+    bool eof_ = false;
+    // Bytes consumed from the socket but not yet consumed by a complete
+    // ReadExact (bounded by one maximum packet: header + payload).
+    std::vector<uint8_t> pend_;
+    PacketStats stats_;
+    SeqTracker seq_;
     // Scan forward (up to 64 KiB) for the next 0xA7 and rebuild the header
     // buffer: hdr_out[0] is the magic byte; any header bytes that were
     // already buffered in `already` follow it. *have_out receives how many
@@ -140,11 +158,6 @@ private:
     // remainder.
     bool Resync(uint8_t* hdr_out, size_t* have_out, const uint8_t* already,
                 size_t already_n, int timeout_ms);
-
-    int fd_ = -1;
-    bool eof_ = false;
-    PacketStats stats_;
-    SeqTracker seq_;
 };
 
 class TcpServer {

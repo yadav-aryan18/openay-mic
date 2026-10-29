@@ -10,7 +10,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include "internal_log.h"
@@ -66,28 +68,46 @@ bool TcpConn::Send(const Packet& packet) {
 
 bool TcpConn::ReadExact(uint8_t* dst, size_t n, int timeout_ms) {
     size_t off = 0;
+    // Serve bytes retained by an aborted previous read first (a stream may
+    // split a packet across the poll-timeout boundary).
+    if (!pend_.empty()) {
+        const size_t take = std::min(n, pend_.size());
+        std::memcpy(dst, pend_.data(), take);
+        pend_.erase(pend_.begin(), pend_.begin() + static_cast<std::ptrdiff_t>(take));
+        off = take;
+        if (off == n) return true;
+    }
     while (off < n) {
         pollfd pfd{fd_, POLLIN, 0};
         const int prc = poll(&pfd, 1, timeout_ms);
         if (prc < 0) {
             if (errno == EINTR) continue;
             detail::LogErrno("poll");
+            RetainPartial(dst, off);
             return false;
         }
-        if (prc == 0) return false;  // timeout
+        if (prc == 0) {  // timeout
+            RetainPartial(dst, off);
+            return false;
+        }
         const ssize_t r = recv(fd_, dst + off, n - off, 0);
         if (r < 0) {
             if (errno == EINTR) continue;
             detail::LogErrno("recv");
+            RetainPartial(dst, off);
             return false;
         }
         if (r == 0) {
-            eof_ = true;  // clean EOF: peer closed
+            eof_ = true;  // clean EOF: peer closed; nothing to retain
             return false;
         }
         off += static_cast<size_t>(r);
     }
     return true;
+}
+
+void TcpConn::RetainPartial(const uint8_t* data, size_t n) {
+    if (n > 0) pend_.insert(pend_.end(), data, data + n);
 }
 
 bool TcpConn::Resync(uint8_t* hdr_out, size_t* have_out, const uint8_t* already,
