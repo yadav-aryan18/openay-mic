@@ -96,6 +96,7 @@ fn bt_injected_stream_end_to_end() {
         output_device: None,
         // Unity gain: this test predates the receiver-gain config field.
         gain: 1.0,
+        monitor: false,
     };
     let handle =
         spawn_engine_with_bt_source(

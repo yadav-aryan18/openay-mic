@@ -55,6 +55,11 @@ pub struct Config {
     pub start_minimized: bool,
     /// Drop cable pulses and the power-on stagger (accessibility).
     pub reduce_motion: bool,
+    /// LISTEN: play the received audio on a local output device (mic
+    /// testing). On Linux this adds a monitor output alongside the PipeWire
+    /// virtual microphone; on Windows it gates the WASAPI rendering that is
+    /// otherwise always on.
+    pub listen: bool,
     /// Windows: case-insensitive substring of the output device to render
     /// into (`None` = system default). Unused on Linux (PipeWire routing).
     pub output_device: Option<String>,
@@ -72,6 +77,7 @@ impl Default for Config {
             autostart: false,
             start_minimized: false,
             reduce_motion: false,
+            listen: cfg!(windows),
             output_device: None,
         }
     }
@@ -121,9 +127,10 @@ impl Config {
             codec: self.codec_mode(),
             target_ms: self.target_ms,
             capacity_ms: 100.0,
-            audio_output: cfg!(windows),
+            audio_output: cfg!(windows) && self.listen,
             output_device: self.output_device.clone(),
             gain: self.gain,
+            monitor: !cfg!(windows) && self.listen,
         }
     }
 }
@@ -365,6 +372,7 @@ mod tests {
             codec: "opus".to_string(),
             target_ms: 15.0,
             gain: 1.5,
+            listen: true,
             autostart: true,
             start_minimized: true,
             reduce_motion: true,
@@ -386,6 +394,7 @@ mod tests {
             codec: "pcm".to_string(),
             target_ms: 5.0,
             gain: 1.0,
+            listen: false,
             autostart: false,
             start_minimized: true,
             reduce_motion: false,

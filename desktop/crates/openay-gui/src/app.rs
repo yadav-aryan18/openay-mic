@@ -112,6 +112,8 @@ pub struct App {
     target_ms: f32,
     /// Output gain applied to decoded samples (engine clamps 0..=4).
     gain: f32,
+    /// LISTEN: local playback of the received audio (mic testing).
+    listen: bool,
     autostart: bool,
     start_minimized: bool,
     reduce_motion: bool,
@@ -154,6 +156,7 @@ pub enum Message {
     CodecSelected(CodecMode),
     TargetChanged(f32),
     GainChanged(f32),
+    ListenToggled(bool),
     AutostartToggled(bool),
     MinimizedToggled(bool),
     MotionToggled(bool),
@@ -184,6 +187,7 @@ impl App {
         let codec = config.codec_mode();
         let target_ms = config.target_ms;
         let gain = config.gain;
+        let listen = config.listen;
         let autostart = config.autostart;
         let start_minimized = config.start_minimized;
         let reduce_motion = config.reduce_motion;
@@ -233,6 +237,7 @@ impl App {
             codec,
             target_ms,
             gain,
+            listen,
             autostart,
             start_minimized,
             reduce_motion,
@@ -310,6 +315,11 @@ impl App {
                 // Round to the slider's 0.1 step so f32 noise (0.30000004)
                 // never persists into config.toml.
                 self.gain = (v * 10.0).round() / 10.0;
+                self.dirty = true;
+                Task::none()
+            }
+            Message::ListenToggled(b) => {
+                self.listen = b;
                 self.dirty = true;
                 Task::none()
             }
@@ -533,6 +543,7 @@ impl App {
                 openay_server::MAX_PREBUFFER_MS,
             ),
             gain: self.gain,
+            listen: self.listen,
             autostart: self.autostart,
             start_minimized: self.start_minimized,
             reduce_motion: self.reduce_motion,
@@ -1152,6 +1163,12 @@ impl App {
             ]
             .align_y(alignment::Vertical::Center),
             slider(0.0..=4.0, self.gain, Message::GainChanged).step(0.1_f32),
+            Space::new(4.0, 4.0),
+            toggler(self.listen)
+                .label("LISTEN (MIC TEST)")
+                .on_toggle(Message::ListenToggled)
+                .font(theme::FONT_LABEL)
+                .text_size(12),
             Space::new(4.0, 4.0),
             toggler(self.autostart)
                 .label("AUTOSTART")

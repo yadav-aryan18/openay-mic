@@ -29,7 +29,7 @@ if-addrs = "0.15"
 # Linux (and every other Unix): the virtual microphone is the product, and
 # the Bluetooth SPP receive path ships with it (BT chip in the settings
 # transport control).
-openay-server = { path = "../openay-server", features = ["pipewire", "bluetooth"] }
+openay-server = { path = "../openay-server", features = ["pipewire", "audio-output", "bluetooth"] }
 ksni = "0.2"
 
 [target.'cfg(windows)'.dependencies]
