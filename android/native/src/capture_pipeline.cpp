@@ -17,9 +17,12 @@ constexpr int64_t kPeerStaleMs = 5000;
 
 // Bluetooth (RFCOMM/SPP via the Kotlin pump): the sink writes the exact TCP
 // wire framing (EncodePacket: 6-byte header + payload, written in full) into
-// the pipe fd Kotlin handed over, so the desktop's stream decoder works
-// unchanged. The fd is OWNED by the FdBytePipe — closed exactly once when
-// this sink is destroyed (Stop / re-configure / engine teardown).
+// the socket-pair end Kotlin handed over, so the desktop's stream decoder
+// works unchanged, and reads the desktop's control traffic back from the
+// SAME fd with the same 6-byte header rules (FdBytePipe::Recv) — the pump
+// forwards the link in both directions. The fd is OWNED by the FdBytePipe —
+// closed exactly once when this sink is destroyed (Stop / re-configure /
+// engine teardown).
 class FdPacketSink : public IPacketSink {
 public:
     explicit FdPacketSink(int fd) : pipe_(std::make_unique<FdBytePipe>(fd)) {}
@@ -28,6 +31,9 @@ public:
         return pipe_->Push(wire.data(), wire.size());
     }
     bool Valid() const override { return pipe_->Valid(); }
+    bool Recv(Packet* out, int timeout_ms) override {
+        return pipe_->Recv(out, timeout_ms);
+    }
 
 private:
     std::unique_ptr<FdBytePipe> pipe_;

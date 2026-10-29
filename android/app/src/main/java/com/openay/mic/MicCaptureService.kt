@@ -42,7 +42,8 @@ import org.json.JSONObject
  *
  * Transport "bt" routes through [BluetoothLink]: the RFCOMM socket lives in
  * Kotlin (the NDK has no BT socket APIs), the service connects + pumps, and
- * native only sees the pipe's write fd via nativeStartBt.
+ * native only sees one end of a full-duplex local socket pair via
+ * nativeStartBt (audio out, desktop control traffic in).
  *
  * Session-scoped extras: [EXTRA_VOICE_FX] attaches platform echo
  * cancellation / noise suppression to the capture session; [EXTRA_MUTE_ON_CALL]
@@ -156,7 +157,7 @@ class MicCaptureService : Service() {
 
         // Switching BT -> wired: the previous BT link (socket + pump) must be
         // torn down explicitly. The nativeStop() above already closed the
-        // pipe's write fd, so the pump has EOF-exited and this is quiet —
+        // native fd, so the pump has EOF-exited and this is quiet —
         // without it the idle RFCOMM socket would survive, leaking a fd and
         // leaving the desktop console showing a stale BT device.
         if (transport != TRANSPORT_BT) stopBtLink()
@@ -191,8 +192,9 @@ class MicCaptureService : Service() {
     }
 
     /**
-     * BT transport: connect the RFCOMM socket, create the pipe, start native
-     * with the write fd, then pump pipe -> socket. Runs on Dispatchers.IO —
+     * BT transport: connect the RFCOMM socket, create the full-duplex local
+     * pair, start native with the native end's fd, then pump both directions
+     * (audio out, desktop control traffic in). Runs on Dispatchers.IO —
      * a cold RFCOMM connect can take seconds and must not block the main
      * thread (the wired transports connect inside nativeStart instead).
      */
@@ -230,8 +232,8 @@ class MicCaptureService : Service() {
                 Log.e(TAG, "Native library unavailable", e)
                 ParcelFileDescriptor.adoptFd(fd).close()
                 if (btLink === link) {
-                    // Native never took the fd; the link's socket + pipe read
-                    // end still need closing (write fd handled above).
+                    // Native never took the fd; the link's socket and pump
+                    // end still need closing (native fd handled above).
                     link.close()
                     btLink = null
                     stopSelf()
@@ -241,7 +243,7 @@ class MicCaptureService : Service() {
             if (!started) {
                 // Native consumed (closed) the fd even on failure; the
                 // reason is readable via StatsJson. The link's socket and
-                // the pipe read end are still ours to close.
+                // pump end are still ours to close.
                 val lastError = lastErrorFromStats()
                 Log.e(TAG, "nativeStartBt($device, $codec, ${frameMs}ms) failed: $lastError")
                 if (btLink === link) {
@@ -257,8 +259,8 @@ class MicCaptureService : Service() {
             lastXruns = 0
 
             // Pump failure (socket drop / IO error): stop capture cleanly —
-            // native records send errors once the pipe write side starts
-            // failing, and the stats path surfaces them.
+            // native records send errors once its fd starts failing, and the
+            // stats path surfaces them.
             link.startPump(serviceScope) { reason ->
                 if (btLink === link) {
                     Log.w(TAG, "BT link down: $reason — stopping capture")
@@ -311,7 +313,7 @@ class MicCaptureService : Service() {
         statsJob?.cancel()
         statsJob = null
         lastXruns = 0
-        // Native first: the engine closes the pipe's write fd, which ends the
+        // Native first: the engine closes the native fd, which ends the
         // pump (EOF) before the socket is torn down.
         if (nativeRunning()) nativeStop()
         stopBtLink()
@@ -486,8 +488,8 @@ class MicCaptureService : Service() {
         stopModeWatcher()
         releaseVoiceEffects()
         releaseWifiLock()
-        // Native first: for a BT session the engine closes the pipe's write
-        // fd, which ends the pump (EOF) before the socket is torn down.
+        // Native first: for a BT session the engine closes the native fd,
+        // which ends the pump (EOF) before the socket is torn down.
         if (nativeRunning()) nativeStop()
         stopBtLink()
         stopSelf()
@@ -524,8 +526,8 @@ class MicCaptureService : Service() {
     override fun onDestroy() {
         // Tear down in order: stop the UI refresh loop, cancel the scope,
         // release session resources, stop the native session, tear down the
-        // BT link (after native: the engine closing the pipe's write fd ends
-        // the pump first), and only then notify the framework.
+        // BT link (after native: the engine closing the native fd ends the
+        // pump first), and only then notify the framework.
         statsJob?.cancel()
         statsJob = null
         lastXruns = 0

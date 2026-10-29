@@ -217,6 +217,143 @@ fn bt_injected_stream_end_to_end() {
     );
 }
 
+/// Bluetooth control-plane parity (desktop side): the BT receive loop must
+/// do what the TCP loop does — answer `hello` with `hello-ack`, emit a
+/// liveness `ping` every second, and run the shared peer-stale watch. Trust
+/// is connection-scoped (pairing authenticates the RFCOMM link; no UDP-style
+/// latch) — the injected stream stands in for a paired, accepted connection.
+#[test]
+fn bt_control_plane_hello_pings_and_peer_stale() {
+    let inject = InjectedBtSource::default();
+    let config = EngineConfig {
+        transport: Transport::Bluetooth,
+        ..EngineConfig::default()
+    };
+    let handle = spawn_engine_with_bt_source(
+        Some(config.clone()),
+        DepthParams::default(),
+        Some(inject.clone()),
+    );
+    let rt = rt();
+    rt.block_on(async {
+        handle
+            .cmd()
+            .send(EngineCommand::Start(config))
+            .await
+            .expect("send Start");
+    });
+    assert!(
+        wait_until(&handle, Duration::from_secs(5), |s| s.running),
+        "engine must run"
+    );
+
+    let (engine_end, mut phone) = tokio::io::duplex(64 * 1024);
+    inject.push(BoxedByteStream::new(engine_end), "AA:BB:CC:00:00:07");
+
+    // hello: the engine must answer with hello-ack over the BT stream, and
+    // its per-connection writer task must emit liveness pings on the same
+    // wire (the phone hears the desktop exactly like over TCP).
+    rt.block_on(async {
+        phone
+            .write_all(&encode(&Packet {
+                kind: PayloadType::Control,
+                seq: 0,
+                payload: openay_protocol::control::control_payload(
+                    &openay_protocol::control::ControlMsg::Hello {
+                        app: "openay-mic".into(),
+                        proto: openay_protocol::control::CONTROL_PROTO,
+                        codecs: vec!["pcm".into(), "opus".into()],
+                        rate: 48_000,
+                    },
+                ),
+            }))
+            .await
+            .expect("write hello");
+
+        let mut framed = openay_transport::tcp::TcpPacketStream::new(&mut phone);
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut saw_ack = false;
+        let mut saw_ping = false;
+        while Instant::now() < deadline && !(saw_ack && saw_ping) {
+            let pkt = match tokio::time::timeout(
+                Duration::from_millis(1500),
+                framed.next_packet(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                _ => continue,
+            };
+            assert_eq!(pkt.kind, PayloadType::Control);
+            match openay_protocol::control::parse_control(&pkt.payload) {
+                Some(openay_protocol::control::ControlMsg::HelloAck { app, .. }) => {
+                    saw_ack = true;
+                    assert_eq!(app, "openay-server");
+                }
+                Some(openay_protocol::control::ControlMsg::Ping) => saw_ping = true,
+                other => panic!("unexpected control message: {other:?}"),
+            }
+        }
+        assert!(
+            saw_ack && saw_ping,
+            "hello-ack + liveness ping must arrive over BT (ack={saw_ack} ping={saw_ping})"
+        );
+    });
+
+    // One audio packet establishes the peer...
+    rt.block_on(async {
+        phone
+            .write_all(&wire_frame(0))
+            .await
+            .expect("write one audio frame");
+        phone.flush().await.expect("flush");
+    });
+    assert!(
+        wait_until(&handle, Duration::from_secs(5), |s| s.received >= 2),
+        "hello + audio must be ingested over BT"
+    );
+
+    // ...then the sender goes FULLY silent (no audio, no pongs — the
+    // engine's outgoing pings pile up in the duplex harmlessly). The shared
+    // peer-stale watch must fire on the BT path after PEER_STALE_AFTER.
+    let deadline = Instant::now() + Duration::from_secs(9);
+    while Instant::now() < deadline && !handle.status().peer_stale {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        handle.status().peer_stale,
+        "peer_stale must fire on BT after >5 s of total silence"
+    );
+
+    // Audio resumes: the flag must clear promptly.
+    rt.block_on(async {
+        phone
+            .write_all(&wire_frame(1))
+            .await
+            .expect("write audio resume frame");
+        phone.flush().await.expect("flush");
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !handle.status().peer_stale {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !handle.status().peer_stale,
+        "peer_stale must clear when audio resumes over BT"
+    );
+
+    rt.block_on(async {
+        handle
+            .cmd()
+            .send(EngineCommand::Stop)
+            .await
+            .expect("send Stop");
+    });
+}
+
 /// The device slot tracks the *current* connection: while a connection is
 /// being served it holds that phone's label, and it clears again when the
 /// connection ends (engine keeps running, waiting for a reconnect).

@@ -12,8 +12,10 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.content.ContextCompat
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -29,26 +31,30 @@ class BluetoothLinkException(message: String, cause: Throwable? = null) :
  * Bluetooth SPP (RFCOMM) link to the desktop console — the phone is the
  * CLIENT: it connects to the desktop's SPP service and pumps the native
  * engine's packets into it. Native owns no Bluetooth code, so the socket
- * lives here and the bridge to the engine is a plain pipe:
+ * lives here and the bridge to the engine is a full-duplex local socket
+ * pair (one end owned by native, handed to NativeBridge.nativeStartBt):
  *
- *   native engine -> pipe WRITE fd (owned by native, handed to
- *   NativeBridge.nativeStartBt) -> [pump] -> socket.outputStream -> desktop
+ *   native engine -> local end -> [pump] -> socket.outputStream -> desktop
+ *   native engine <- local end <- [pump] <- socket.inputStream <- desktop
  *
- * Audio is strictly one-way phone->desktop; socket.inputStream is never
- * read. The desktop SPP server sends nothing, so leaving it unread costs
- * nothing and cannot stall the pump.
+ * Audio flows phone->desktop; the desktop->phone direction carries the
+ * CONTROL plane (the desktop receiver's liveness pings and hello-ack),
+ * which the native sink reads back from the same fd — so the phone
+ * answers pings and reports receiver liveness exactly like over TCP.
  *
  * fd ownership (single-owner contract, no double close): [connect] detaches
- * the pipe's write end and returns its raw fd — from that moment NATIVE owns
+ * the native end and returns its raw fd — from that moment NATIVE owns
  * it and closes it exactly once (engine stop / re-configure / teardown).
- * This class never touches it again; [close] releases only the read end and
+ * This class never touches it again; [close] releases only the pump end and
  * the socket.
  *
  * Teardown order matters (MicCaptureService): stop native FIRST — the engine
- * closes the write fd, the pump's read() returns EOF and exits on its own;
- * [close] then gives the pump a short flush window and closes the socket.
- * On a mid-run socket failure the pump closes the read end itself, so native
- * writes fail fast (EPIPE) instead of blocking on a full pipe.
+ * closes the native end, the phone->desktop pump's read() returns EOF and
+ * exits on its own, and the desktop->phone pump's next write fails with
+ * EPIPE and exits quietly (a stop in progress, not a link error); [close]
+ * then gives the pumps a short flush window and closes the socket. On a
+ * mid-run socket failure the pump closes the pump end itself, so native
+ * writes fail fast (EPIPE) instead of blocking on a full buffer.
  */
 class BluetoothLink {
 
@@ -56,7 +62,7 @@ class BluetoothLink {
     data class BondedDevice(val name: String, val address: String)
 
     private var socket: BluetoothSocket? = null
-    private var pipeRead: ParcelFileDescriptor? = null
+    private var pumpEnd: ParcelFileDescriptor? = null
     private var pumpJob: Job? = null
 
     @Volatile private var closed = false
@@ -149,8 +155,12 @@ class BluetoothLink {
             throw BluetoothLinkException("link already closed")
         }
         socket = s
-        val pipe = try {
-            ParcelFileDescriptor.createPipe()  // [0] read (pump), [1] write (native)
+        // Full-duplex local pair: [0] pump (Kotlin), [1] native. Native's
+        // FdBytePipe writes phone audio into [1] and reads the desktop's
+        // control traffic back from it — the exact wire behavior of a TCP
+        // client socket, exercised unchanged by the host socketpair tests.
+        val pair = try {
+            ParcelFileDescriptor.createSocketPair()
         } catch (e: IOException) {
             try { s.close() } catch (_: IOException) {}
             socket = null
@@ -158,45 +168,93 @@ class BluetoothLink {
         }
         if (closed) {
             // Same race, one step later: close everything we just made —
-            // both pipe ends, since the detach below has not happened yet.
+            // both ends, since the detach below has not happened yet.
             try { s.close() } catch (_: IOException) {}
-            try { pipe[0].close() } catch (_: IOException) {}
-            try { pipe[1].close() } catch (_: IOException) {}
+            try { pair[0].close() } catch (_: IOException) {}
+            try { pair[1].close() } catch (_: IOException) {}
             socket = null
             throw BluetoothLinkException("link already closed")
         }
-        pipeRead = pipe[0]
+        pumpEnd = pair[0]
         // Detach: the fd belongs to native from the moment we return it.
-        return pipe[1].detachFd()
+        return pair[1].detachFd()
     }
 
     /**
-     * Starts the pump (pipe read end -> socket output) on [scope]. [onDown]
-     * fires at most once, on the socket dropping or any IO error — NOT on the
-     * clean EOF that follows a native stop. The handler runs on
+     * Starts the bidirectional pump on [scope]: native end -> socket output
+     * (phone audio) and socket input -> native end (desktop control traffic).
+     * [onDown] fires at most once, on the socket dropping or any IO error —
+     * NOT on the clean EOF that follows a native stop. The handler runs on
      * Dispatchers.IO.
      */
     fun startPump(scope: CoroutineScope, onDown: (String) -> Unit) {
-        val read = pipeRead ?: return
+        val local = pumpEnd ?: return
         val s = socket ?: return
         pumpJob = scope.launch(Dispatchers.IO) {
-            try {
-                FileInputStream(read.fileDescriptor).use { input ->
-                    s.outputStream.use { output ->
-                        val buf = ByteArray(PUMP_BUFFER_BYTES)
-                        while (true) {
-                            val n = input.read(buf)
-                            if (n < 0) return@launch  // native closed the write fd: clean stop
-                            output.write(buf, 0, n)
+            // The two directions fail independently and [onDown] must fire at
+            // most once (the service stops the session on the first report).
+            val reported = AtomicBoolean(false)
+            fun linkDown(reason: String) {
+                if (reported.compareAndSet(false, true)) {
+                    // Link dropped mid-run: close the pump end so native
+                    // writes fail fast (EPIPE) instead of blocking on a full
+                    // buffer.
+                    closePumpEnd()
+                    onDown(reason)
+                }
+            }
+            // phone -> desktop: native audio out.
+            launch {
+                try {
+                    FileInputStream(local.fileDescriptor).use { nativeInput ->
+                        s.outputStream.use { output ->
+                            val buf = ByteArray(PUMP_BUFFER_BYTES)
+                            while (true) {
+                                // < 0 = the native end closed (a clean stop in
+                                // progress) — exit quietly, like the old
+                                // pipe pump did on EOF.
+                                val n = nativeInput.read(buf)
+                                if (n < 0) return@launch
+                                output.write(buf, 0, n)
+                            }
                         }
                     }
+                } catch (e: Exception) {
+                    if (closed) return@launch  // teardown race, not an error
+                    linkDown(e.message ?: "socket I/O error")
                 }
-            } catch (e: Exception) {
-                if (closed) return@launch  // teardown race, not an error
-                // Link dropped mid-run: close the read end so native writes
-                // fail fast (EPIPE) instead of blocking on a full pipe.
-                closeReadEnd()
-                onDown(e.message ?: "socket I/O error")
+            }
+            // desktop -> phone: control traffic in (the desktop receiver
+            // sends liveness pings every second and answers hello). Blocking
+            // read: while the desktop is up this returns ~1 ping/s; on a
+            // socket drop it errors and is reported via linkDown.
+            launch {
+                try {
+                    s.inputStream.use { input ->
+                        FileOutputStream(local.fileDescriptor).use { nativeOutput ->
+                            val buf = ByteArray(PUMP_BUFFER_BYTES)
+                            while (true) {
+                                val n = input.read(buf)
+                                if (n < 0) {
+                                    linkDown("desktop closed the stream")
+                                    return@launch
+                                }
+                                try {
+                                    nativeOutput.write(buf, 0, n)
+                                } catch (_: IOException) {
+                                    // The native end closed mid-write — a
+                                    // native stop in progress, not a link
+                                    // error (the phone->desktop pump reports
+                                    // the same stop as a clean EOF above).
+                                    return@launch
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    if (closed) return@launch  // teardown race, not an error
+                    linkDown(e.message ?: "socket I/O error")
+                }
             }
         }
     }
@@ -216,7 +274,7 @@ class BluetoothLink {
             }
         }
         pumpJob = null
-        closeReadEnd()
+        closePumpEnd()
         try {
             socket?.close()
         } catch (_: IOException) {
@@ -224,12 +282,12 @@ class BluetoothLink {
         socket = null
     }
 
-    private fun closeReadEnd() {
+    private fun closePumpEnd() {
         try {
-            pipeRead?.close()
+            pumpEnd?.close()
         } catch (_: IOException) {
         }
-        pipeRead = null
+        pumpEnd = null
     }
 
     private fun adapter(context: Context): BluetoothAdapter? {

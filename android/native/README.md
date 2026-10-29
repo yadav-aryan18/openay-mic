@@ -32,7 +32,7 @@ android/native/
 │   ├── protocol.cpp
 │   ├── udp_transport.cpp       # one datagram = one packet
 │   ├── tcp_transport.cpp       # stream framing + 64 KiB bad-magic resync
-│   ├── fd_transport.cpp        # BytePipe over an owned fd (BT bridge write side)
+│   ├── fd_transport.cpp        # BytePipe over an owned fd (BT bridge, both directions)
 │   ├── opus_codec.cpp          # host: built when OPENAY_HAVE_OPUS (pkg-config)
 │   ├── ring_buffer.cpp
 │   ├── test_source.cpp         # sleep_until-paced sine generator
@@ -81,7 +81,7 @@ for the next `0xA7` and resumes, else the connection is a hard failure.
    ┌────────┴───────────────┬──────────────────┐
    ▼                        ▼                  ▼
  UdpPacketSink         TcpPacketSink      FdPacketSink
- (UdpSender)           (TcpClient)        (FdBytePipe over the Kotlin pipe fd)
+ (UdpSender)           (TcpClient)        (FdBytePipe over the Kotlin fd)
    │                        │                  │
    ▼                        ▼                  ▼
  UDP datagram          TCP stream          RFCOMM/SPP stream

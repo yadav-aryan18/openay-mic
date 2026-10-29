@@ -25,6 +25,7 @@
 //     handed-over fd — the ownership contract, proven via EBADF.
 #include "openay/capture_pipeline.h"
 #include "openay/capture_engine.h"
+#include "openay/control.h"
 #include "openay/protocol.h"
 #include "openay/test_source.h"
 #include "openay/transport.h"
@@ -49,13 +50,16 @@
 using openay::CaptureEngine;
 using openay::CapturePipeline;
 using openay::CodecType;
+using openay::ControlKind;
 using openay::DecodeError;
+using openay::EncodeControl;
 using openay::EncodePacket;
 using openay::FdBytePipe;
 using openay::HeaderPayloadLength;
 using openay::kHeaderLen;
 using openay::LoadU16BE;
 using openay::Packet;
+using openay::ParseControl;
 using openay::PayloadType;
 using openay::PipelineError;
 using openay::TestSource;
@@ -345,23 +349,41 @@ void TestBtPipeline() {
     recv_thread.join();
     close(sv[1]);
 
-    printf("capture_bt: received=%zu (%.1f pkt/s)\n", pkts.size(),
-           static_cast<double>(pkts.size()) / 2.0);
+    // Control plane (shared with every transport since the control-plane
+    // merge, same assertions as test_capture.cpp's CheckStream): the run is
+    // bracketed by a hello and a bye control packet, and the audio packets
+    // occupy the rest of the shared per-direction sequence space from 1.
+    std::vector<const Packet*> audio;
+    for (const Packet& p : pkts) {
+        if (p.type == PayloadType::Control) continue;
+        audio.push_back(&p);
+    }
+    printf("capture_bt: received=%zu (audio=%zu) (%.1f audio pkt/s)\n",
+           pkts.size(), audio.size(),
+           static_cast<double>(audio.size()) / 2.0);
+    CHECK(pkts.size() >= 2);
+    CHECK(pkts.front().type == PayloadType::Control);  // session hello
+    CHECK(pkts.back().type == PayloadType::Control);   // session bye
+    CHECK(pipe.control_sent() == 2);  // hello + bye (receiver sends nothing)
+    CHECK(pipe.control_received() == 0);
+    CHECK(pipe.peer_link() == openay::PeerLink::Unknown);
     // ~200 expected at 10 ms frames; the wide lower bound tolerates a ~0.6 s
     // scheduler stall without failing delivery (see the 1 MiB ring above).
-    CHECK(pkts.size() >= 140 && pkts.size() <= 230);
+    CHECK(audio.size() >= 140 && audio.size() <= 230);
     CHECK(parser.malformed == 0);
 
     size_t bad_seq = 0, bad_type = 0, bad_size = 0, sine_mismatch = 0;
     double sq = 0.0;
     size_t samples = 0;
-    for (size_t i = 0; i < pkts.size(); ++i) {
-        if (pkts[i].seq != static_cast<uint16_t>(i)) ++bad_seq;
-        if (pkts[i].type != PayloadType::Pcm) ++bad_type;
-        if (pkts[i].payload.size() != 960) ++bad_size;
-        for (size_t j = 0; j < pkts[i].payload.size() / 2; ++j) {
-            const int16_t got = SampleAt(pkts[i].payload.data(), j);
-            const int16_t want = ExpectedSine(pkts[i].seq, j);
+    for (size_t i = 0; i < audio.size(); ++i) {
+        if (audio[i]->seq != static_cast<uint16_t>(i + 1)) ++bad_seq;
+        if (audio[i]->type != PayloadType::Pcm) ++bad_type;
+        if (audio[i]->payload.size() != 960) ++bad_size;
+        for (size_t j = 0; j < audio[i]->payload.size() / 2; ++j) {
+            const int16_t got = SampleAt(audio[i]->payload.data(), j);
+            // Source frame k ships with seq k+1 (the session hello took seq
+            // 0), so the phase law keys on seq - 1.
+            const int16_t want = ExpectedSine(audio[i]->seq - 1, j);
             sq += static_cast<double>(got) * got;
             ++samples;
             if (std::abs(static_cast<int>(got) - static_cast<int>(want)) > 2) {
@@ -372,7 +394,7 @@ void TestBtPipeline() {
     const double rms = samples > 0 ? std::sqrt(sq / static_cast<double>(samples))
                                    : 0.0;
     printf("capture_bt: rms=%.1f sine_mismatches=%zu\n", rms, sine_mismatch);
-    CHECK(bad_seq == 0);   // contiguous from 0 (no dropped/reordered frames)
+    CHECK(bad_seq == 0);   // contiguous from 1 (hello took seq 0)
     CHECK(bad_type == 0);
     CHECK(bad_size == 0);
     CHECK(sine_mismatch == 0);  // sample-exact continuity: no byte loss
@@ -381,7 +403,114 @@ void TestBtPipeline() {
     CHECK(pipe.encode_errors() == 0);
     CHECK(pipe.send_errors() == 0);
     CHECK(pipe.Healthy());
-    CHECK(pipe.packets_sent() == pkts.size());
+    CHECK(pipe.packets_sent() == audio.size());
+}
+
+// ---------------------------------------------------------------------------
+// Bluetooth control-plane parity (the desktop's receiver now talks CONTROL
+// over the SPP stream): the fd sink must receive the desktop's control
+// traffic (framed with the same 6-byte header rules as TCP), answer ping
+// with pong, announce hello first / bye last, and surface receiver liveness
+// via peer_link() — the exact behavior the UDP/TCP senders already have.
+// The test plays the desktop role on the socketpair's other end.
+// ---------------------------------------------------------------------------
+
+void TestBtControlPlane() {
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    TestSource source;
+    CapturePipeline pipe;
+    CHECK(pipe.ConfigureBt(&source, sv[0], CodecType::Pcm, 10));
+    CHECK(pipe.Start());
+
+    StreamParser parser;
+    std::vector<Packet> pkts;
+    std::atomic<bool> stop{false};
+    std::thread recv_thread(RunReader, sv[1], &stop, &parser, &pkts);
+
+    // Desktop role: a liveness ping every 300 ms (the receiver sends them
+    // every 1 s in production; tighter here so the wait stays short), on the
+    // same wire framing the desktop's TCP/BT writer task uses.
+    std::atomic<bool> desktop_done{false};
+    std::thread desktop([sv, &desktop_done] {
+        for (int i = 0; i < 4 && !desktop_done.load(std::memory_order_relaxed);
+             ++i) {
+            Packet ping;
+            ping.type = PayloadType::Control;
+            ping.seq = static_cast<uint16_t>(i);  // desktop's own counter
+            ping.payload = EncodeControl(ControlKind::Ping, "", "", 0);
+            const std::vector<uint8_t> wire = EncodePacket(ping);
+            size_t off = 0;
+            while (off < wire.size()) {
+                const ssize_t w = write(sv[1], wire.data() + off,
+                                        wire.size() - off);
+                if (w <= 0) return;  // native end gone: session over
+                off += static_cast<size_t>(w);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    pipe.Stop();
+    desktop_done.store(true, std::memory_order_relaxed);
+    desktop.join();
+    stop.store(true, std::memory_order_relaxed);
+    close(sv[1]);  // native's Stop already closed sv[0] -> reader EOF
+    recv_thread.join();
+
+    CHECK(parser.malformed == 0);
+    CHECK(pkts.size() >= 3);
+    if (pkts.size() < 3) return;
+
+    // 1) The session opens with hello (app openay-mic, seq 0 — the first
+    //    packet on the shared per-direction counter).
+    CHECK(pkts.front().type == PayloadType::Control);
+    CHECK(pkts.front().seq == 0);
+    {
+        std::string app;
+        const ControlKind kind =
+            ParseControl(pkts.front().payload.data(),
+                         pkts.front().payload.size(), &app);
+        CHECK(kind == ControlKind::Hello);
+        CHECK(app == "openay-mic");
+    }
+    // 2) Audio starts immediately after the hello on the same counter.
+    CHECK(pkts[1].type == PayloadType::Pcm);
+    CHECK(pkts[1].seq == 1);
+    // 3) The desktop's pings were answered with pongs.
+    size_t pongs = 0;
+    for (const Packet& p : pkts) {
+        if (p.type != PayloadType::Control) continue;
+        const ControlKind kind =
+            ParseControl(p.payload.data(), p.payload.size(), nullptr);
+        if (kind == ControlKind::Pong) ++pongs;
+    }
+    CHECK(pongs >= 1);
+    // 4) The session closes with bye.
+    CHECK(pkts.back().type == PayloadType::Control);
+    {
+        const ControlKind kind = ParseControl(pkts.back().payload.data(),
+                                              pkts.back().payload.size(),
+                                              nullptr);
+        CHECK(kind == ControlKind::Bye);
+    }
+    // 5) ONE shared per-direction counter: no seq may ever repeat, across
+    //    audio and control traffic alike.
+    {
+        std::vector<uint16_t> seqs;
+        for (const Packet& p : pkts) seqs.push_back(p.seq);
+        std::sort(seqs.begin(), seqs.end());
+        CHECK(std::adjacent_find(seqs.begin(), seqs.end()) == seqs.end());
+    }
+    // 6) Receiver liveness is surfaced exactly like the TCP/UDP senders do:
+    //    the last desktop ping is < 5 s old at this point.
+    CHECK(pipe.control_received() >= 1);
+    CHECK(pipe.control_sent() >= 2);  // hello + pong(s)
+    CHECK(pipe.peer_link() == openay::PeerLink::Alive);
+    CHECK(pipe.Healthy());
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +589,7 @@ int main() {
     TestFdPipeByteFidelity();
     TestFdPipeClosedPeer();
     TestBtPipeline();
+    TestBtControlPlane();
     TestBtEngineSmoke();
     TestBtInvalidConfig();
     if (g_failures == 0) {
