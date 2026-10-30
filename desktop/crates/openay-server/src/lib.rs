@@ -656,31 +656,45 @@ async fn engine_main(mut cmd_rx: mpsc::Receiver<EngineCommand>, state: Arc<Engin
     let mut pipeline: Option<Pipeline> = None;
 
     let mut tick = tokio::time::interval(Duration::from_millis(200));
+    // The select! below only CLASSIFIES the next event; Start/Stop handling
+    // runs AFTER it, outside the select. Commands processed inside a select
+    // arm would be dropped if the arm's future were cancelled mid-await
+    // (start_pipeline awaits its socket bind; a 200 ms tick firing during
+    // that await used to silently discard the whole Start).
+    enum Event {
+        Start(EngineConfig),
+        Stop,
+        Tick,
+        Closed,
+    }
     loop {
-        tokio::select! {
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(EngineCommand::Start(cfg)) => {
-                        if let Some(p) = pipeline.take() {
-                            stop_pipeline(p, &state).await;
-                        }
-                        match start_pipeline(cfg, &state).await {
-                            Ok(p) => pipeline = Some(p),
-                            Err(e) => {
-                                state.set_error(format!("{e:#}"));
-                                state.mark_stopped();
-                            }
-                        }
+        let event = tokio::select! {
+            cmd = cmd_rx.recv() => match cmd {
+                Some(EngineCommand::Start(cfg)) => Event::Start(cfg),
+                Some(EngineCommand::Stop) => Event::Stop,
+                None => Event::Closed,
+            },
+            _ = tick.tick() => Event::Tick,
+        };
+        match event {
+            Event::Start(cfg) => {
+                if let Some(p) = pipeline.take() {
+                    stop_pipeline(p, &state).await;
+                }
+                match start_pipeline(cfg, &state).await {
+                    Ok(p) => pipeline = Some(p),
+                    Err(e) => {
+                        state.set_error(format!("{e:#}"));
+                        state.mark_stopped();
                     }
-                    Some(EngineCommand::Stop) => {
-                        if let Some(p) = pipeline.take() {
-                            stop_pipeline(p, &state).await;
-                        }
-                    }
-                    None => break,
                 }
             }
-            _ = tick.tick() => {
+            Event::Stop => {
+                if let Some(p) = pipeline.take() {
+                    stop_pipeline(p, &state).await;
+                }
+            }
+            Event::Tick => {
                 // Reap a pipeline that ended by itself (PipeWire setup
                 // failure, bind failure) so the state reflects reality.
                 if pipeline.as_ref().is_some_and(Pipeline::is_done) {
@@ -688,6 +702,7 @@ async fn engine_main(mut cmd_rx: mpsc::Receiver<EngineCommand>, state: Arc<Engin
                     stop_pipeline(p, &state).await;
                 }
             }
+            Event::Closed => break,
         }
     }
 
