@@ -364,6 +364,51 @@ async fn malformed_flood_does_not_hang_stop() {
     flood.abort();
 }
 
+/// Regression (Windows): after the engine pins a peer and starts pinging
+/// it, a peer that goes away must not take the engine down — Windows
+/// surfaces WSAECONNRESET on the listener's next recv_from, which used to
+/// end the network task and stop the whole pipeline. (Linux does not
+/// surface such errors on unconnected sockets, so this passes trivially
+/// there; CI's Windows runner is the real gate.)
+#[tokio::test]
+async fn pinged_dead_peer_does_not_stop_the_engine() {
+    let port = UDP_PORT + 8;
+    let handle = spawn_engine(Some(udp_config(port)));
+    handle
+        .cmd()
+        .send(EngineCommand::Start(udp_config(port)))
+        .await
+        .expect("send Start");
+    assert!(wait_running(&handle), "engine must start");
+
+    // Sender latches the peer slot, sends one audio packet, then VANISHES
+    // (socket dropped — exactly what the adaptive-depth tests do after
+    // their producer phase).
+    let vanishing = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    vanishing.connect(("127.0.0.1", port)).await.unwrap();
+    vanishing
+        .send(&encode(&Packet {
+            kind: PayloadType::Pcm,
+            seq: 0,
+            payload: vec![0u8; 960],
+        }))
+        .await
+        .unwrap();
+    drop(vanishing);
+
+    // The engine keeps pinging the dead peer every second. Past the stale
+    // window, the engine must STILL be running, and Stop must work.
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let s = handle.status();
+    assert!(s.running, "engine must survive pings to a dead peer");
+    handle.cmd().send(EngineCommand::Stop).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && handle.status().running {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(!handle.status().running, "Stop must complete");
+}
+
 /// Gain validation: non-finite values are rejected before reaching the
 /// engine (a NaN would poison every decoded sample).
 #[tokio::test]
