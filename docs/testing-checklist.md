@@ -69,8 +69,8 @@ openay-server --features openay-server/pipewire`; Windows
 ## Branch map (for development/debugging)
 
 - `main` — Linux product (PipeWire), all Phase 6 hardening.
-- `feature/windows-client` (worktree `WD-SN570\openay-mic-win`) — Windows exe +
+- `feature/windows-client` (worktree the Windows worktree (external-drive checkout)) — Windows exe +
   cpal/WASAPI audio output; merged with main's audit fixes.
-- `feature/bluetooth` (worktree `WD-SN570/openay-mic-bt`) — Bluetooth SPP
+- `feature/bluetooth` (worktree the Bluetooth worktree (external-drive checkout)) — Bluetooth SPP
   transport both sides (desktop: `openay-server --transport bt`; phone: BT
   segment + device picker).

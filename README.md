@@ -86,7 +86,7 @@ GUI's Windows build):
 
 ```bash
 scripts/build_windows.sh     # -> dist/openay-windows/: openay-gui.exe,
-                             #    openay-server.exe, openay-log.ps1, README
+                             #    openay-server.exe, openay-log.ps1, README-WINDOWS.txt, adb/
 ```
 
 The script cross-compiles with an MSVC target using user-space tooling (no
