@@ -849,31 +849,45 @@ async fn engine_main(mut cmd_rx: mpsc::Receiver<EngineCommand>, state: Arc<Engin
     let mut pipeline: Option<Pipeline> = None;
 
     let mut tick = tokio::time::interval(Duration::from_millis(200));
+    // The select! below only CLASSIFIES the next event; Start/Stop handling
+    // runs AFTER it, outside the select. Commands processed inside a select
+    // arm would be dropped if the arm's future were cancelled mid-await
+    // (start_pipeline awaits its socket bind; a 200 ms tick firing during
+    // that await used to silently discard the whole Start).
+    enum Event {
+        Start(EngineConfig),
+        Stop,
+        Tick,
+        Closed,
+    }
     loop {
-        tokio::select! {
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(EngineCommand::Start(cfg)) => {
-                        if let Some(p) = pipeline.take() {
-                            stop_pipeline(p, &state).await;
-                        }
-                        match start_pipeline(cfg, &state).await {
-                            Ok(p) => pipeline = Some(p),
-                            Err(e) => {
-                                state.set_error(format!("{e:#}"));
-                                state.mark_stopped();
-                            }
-                        }
+        let event = tokio::select! {
+            cmd = cmd_rx.recv() => match cmd {
+                Some(EngineCommand::Start(cfg)) => Event::Start(cfg),
+                Some(EngineCommand::Stop) => Event::Stop,
+                None => Event::Closed,
+            },
+            _ = tick.tick() => Event::Tick,
+        };
+        match event {
+            Event::Start(cfg) => {
+                if let Some(p) = pipeline.take() {
+                    stop_pipeline(p, &state).await;
+                }
+                match start_pipeline(cfg, &state).await {
+                    Ok(p) => pipeline = Some(p),
+                    Err(e) => {
+                        state.set_error(format!("{e:#}"));
+                        state.mark_stopped();
                     }
-                    Some(EngineCommand::Stop) => {
-                        if let Some(p) = pipeline.take() {
-                            stop_pipeline(p, &state).await;
-                        }
-                    }
-                    None => break,
                 }
             }
-            _ = tick.tick() => {
+            Event::Stop => {
+                if let Some(p) = pipeline.take() {
+                    stop_pipeline(p, &state).await;
+                }
+            }
+            Event::Tick => {
                 // Reap a pipeline that ended by itself (PipeWire setup
                 // failure, bind failure) so the state reflects reality.
                 if pipeline.as_ref().is_some_and(Pipeline::is_done) {
@@ -881,6 +895,7 @@ async fn engine_main(mut cmd_rx: mpsc::Receiver<EngineCommand>, state: Arc<Engin
                     stop_pipeline(p, &state).await;
                 }
             }
+            Event::Closed => break,
         }
     }
 
@@ -1106,6 +1121,42 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
         eprintln!("openay-server: no audio output requested — network+jitter only");
     }
 
+    // Bind SYNCHRONOUSLY before spawning the receive task: `running` must
+    // guarantee the transport is listening. An async bind let a test observe
+    // running == true and send into a socket that did not exist yet
+    // (ConnectionRefused), and made bind failures surface asynchronously.
+    let bind_addr = SocketAddr::new(config.bind, config.port);
+    let (bound_socket, bound_listener) = match config.transport {
+        // Bluetooth binds nothing here (SPP registers via BlueZ/SDP); a
+        // Start without the `bluetooth` feature fails later in run_network
+        // with the clean capability error.
+        Transport::Bluetooth => (None, None),
+        Transport::Udp => (
+            Some(
+                tokio::net::UdpSocket::bind(bind_addr)
+                    .await
+                    .with_context(|| format!("binding UDP {bind_addr}"))?,
+            ),
+            None,
+        ),
+        Transport::Tcp => (
+            None,
+            Some(
+                tokio::net::TcpListener::bind(bind_addr)
+                    .await
+                    .with_context(|| format!("binding TCP {bind_addr}"))?,
+            ),
+        ),
+    };
+    eprintln!(
+        "openay-server: {} listening on {bind_addr}",
+        match config.transport {
+            Transport::Udp => "UDP",
+            Transport::Tcp => "TCP",
+            Transport::Bluetooth => "BT",
+        }
+    );
+
     // Publish the run's config before `config` moves into the network task
     // (EngineConfig is never Copy — it carries the output-device String).
     let config_for_state = config.clone();
@@ -1113,6 +1164,8 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
 
     let net = tokio::spawn(run_network(
         config,
+        bound_socket,
+        bound_listener,
         ingest.clone(),
         jitter.clone(),
         state.effective_target.clone(),
@@ -1382,6 +1435,8 @@ async fn stop_pipeline(p: Pipeline, state: &Arc<EngineState>) {
 /// bind failure takes — the pipeline technically starts and dies at once).
 async fn run_network(
     config: EngineConfig,
+    socket: Option<tokio::net::UdpSocket>,
+    listener: Option<tokio::net::TcpListener>,
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
     effective_target: Arc<AtomicU32>,
@@ -1392,11 +1447,30 @@ async fn run_network(
 ) -> Result<String> {
     match config.transport {
         Transport::Udp => {
-            udp_loop(&config, ingest, jitter, effective_target, foreign, quit).await
+            udp_loop(
+                &config,
+                socket.expect("UDP run must carry its bound socket"),
+                ingest,
+                jitter,
+                effective_target,
+                foreign,
+                quit,
+            )
+            .await
         }
         // TCP is connection-scoped: every accepted connection is its own
         // peer, so the UDP source latch has no TCP equivalent.
-        Transport::Tcp => tcp_loop(&config, ingest, jitter, effective_target, quit).await,
+        Transport::Tcp => {
+            tcp_loop(
+                &config,
+                listener.expect("TCP run must carry its bound listener"),
+                ingest,
+                jitter,
+                effective_target,
+                quit,
+            )
+            .await
+        }
         #[cfg(feature = "bluetooth")]
         Transport::Bluetooth => {
             bt_loop(
@@ -1738,16 +1812,14 @@ async fn stream_accept_loop(
 /// cannot block ingestion from others.
 async fn tcp_loop(
     config: &EngineConfig,
+    listener: tokio::net::TcpListener,
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
     effective_target: Arc<AtomicU32>,
     quit: Arc<AtomicBool>,
 ) -> Result<String> {
     let addr = SocketAddr::new(config.bind, config.port);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding TCP {addr}"))?;
-    eprintln!("openay-server: TCP listening on {addr}");
+    eprintln!("openay-server: TCP serving on {addr}");
 
     let mut source = TcpSource { listener };
     stream_accept_loop(
@@ -1842,18 +1914,13 @@ async fn bt_loop(
 /// [`EngineStatus::foreign_packets`] and rate-limit-logged, never fatal.
 async fn udp_loop(
     config: &EngineConfig,
+    socket: tokio::net::UdpSocket,
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
     effective_target: Arc<AtomicU32>,
     foreign: Arc<AtomicU64>,
     quit: Arc<AtomicBool>,
 ) -> Result<String> {
-    let addr = SocketAddr::new(config.bind, config.port);
-    let socket = tokio::net::UdpSocket::bind(addr)
-        .await
-        .with_context(|| format!("binding UDP {addr}"))?;
-    eprintln!("openay-server: UDP listening on {addr}");
-
     let mut buf = [0u8; MAX_DATAGRAM];
     let mut last_stats = Instant::now();
     let mut last_underruns = jitter.underruns();
