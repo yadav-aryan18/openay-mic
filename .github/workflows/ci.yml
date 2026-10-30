@@ -25,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libopus-dev libpipewire-0.3-dev libdbus-1-dev \
+            libopus-dev libasound2-dev libpipewire-0.3-dev libdbus-1-dev \
             clang libclang-dev \
             cmake ninja-build g++ pkg-config \
             pipewire pipewire-bin wireplumber
