@@ -5,6 +5,16 @@ All notable changes to OpenAY Mic are documented here. The format follows
 semantic (major.minor.patch — the wire protocol is frozen at v1, so minors
 carry features).
 
+## [Unreleased]
+
+### Fixed
+- **Android GUI**: fixed misalignment and disparate sizing of Chain stage cards
+  (MIC, LINK, CONSOLE). Cards now share an equal-height body footprint
+  (`STAGE_BODY_HEIGHT = 56.dp`) and `IntrinsicSize.Max` row constraints with
+  centered content, ensuring uniform dimensions, aligned borders, and clean cable
+  connectors across all three tiles (matching desktop `STAGE_BODY_HEIGHT`
+  architecture).
+
 ## [0.3.0] - 2026-10-30
 
 ### Added
