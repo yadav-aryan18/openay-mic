@@ -1233,7 +1233,13 @@ async fn udp_loop(
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             r = socket.recv_from(&mut buf) => {
-                let (n, src) = r.context("UDP recv error")?;
+                // A recv_from ERROR is never fatal: Windows surfaces
+                // WSAECONNRESET here after the keepalive ping hits a peer
+                // that has gone away — an expected consequence of the
+                // control plane, not a listener failure. Fall through so
+                // the loop keeps observing `quit` (same rule as the
+                // malformed-datagram path below).
+                if let Ok((n, src)) = r {
                 // A malformed datagram is counted and NOT ingested, but the
                 // loop must still observe `quit` below: falling through (not
                 // `continue`-ing) keeps Stop responsive under a garbage
@@ -1312,6 +1318,7 @@ async fn udp_loop(
                         // inside ingest_packet; nothing to do here.
                     }
                 }
+                } // recv_from Ok
             }
         }
         if quit.load(Ordering::Relaxed) {
