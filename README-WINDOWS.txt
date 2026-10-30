@@ -9,9 +9,9 @@ Requirements
 ------------
 - Windows 10 or newer (x86_64). No admin rights needed to run the exe.
 - A sound output device. To expose the stream to other apps as a
-  microphone, install a virtual audio cable (e.g. a virtual-audio-cable driver, free from
-  vb-audio.com) and select it as the output device — apps then pick
-  the cable's recording side ("Output") as their input. To simply monitor the audio, any
+  microphone, install a virtual audio cable (any package that exposes a
+  playback device routed to a recording device works) and select it as the
+  output device — apps then pick the cable's recording side ("Output") as their input. To simply monitor the audio, any
   speakers/headset works.
 - The phone app (OpenAY Mic on Android) and this receiver.
 
@@ -39,8 +39,11 @@ Wi-Fi usage
 USB usage (lower latency, more reliable)
 ----------------------------------------
 1. Enable USB debugging on the phone, connect the cable.
-2. Forward the port with adb (from Android SDK platform-tools):
-       adb.exe forward tcp:41700 tcp:41700
+2. Forward the port with the bundled adb (dist\openay-windows\adb\; an
+   SDK install is not needed — see adb\NOTICE.txt for its license):
+       adb\adb.exe forward tcp:41700 tcp:41700
+   (If the folder is missing, use adb from your own Android SDK
+   platform-tools instead.)
 3. Start the receiver:
        openay-server.exe --transport tcp --output
 4. In the phone app choose TCP transport and connect to 127.0.0.1:41700.
@@ -68,9 +71,10 @@ Audio renders on the system DEFAULT output device — to feed other apps,
 install a virtual audio cable, set the cable's playback side ("Input") as the default playback
 device in Windows Sound settings, and select the cable's recording side ("Output") in the consumer
 app (or edit output_device in %APPDATA%\openay-mic\config.toml).
-Differences from Linux, on purpose: no system tray (window close quits —
-same contract), autostart uses the Startup folder, audio routing happens
-in Windows Sound settings instead of WirePlumber.
+Windows extras: a Win32 system tray icon (Show Console / Start / Stop /
+Quit — window close still quits, same contract as Linux), and autostart
+uses the Startup folder. Audio routing happens in Windows Sound settings
+instead of WirePlumber.
 
 Collecting logs for bug reports
 -------------------------------
@@ -98,6 +102,7 @@ Common flags
   --codec auto|pcm|opus   which payloads to accept (default auto)
   --target-ms 10          prebuffer target, 5..20 ms
   --capacity-ms 100       jitter buffer capacity
+  --gain 1.0              output gain, 0..4 (1 = unity), applied after decode
 
 Rebuilding from source
 ----------------------
