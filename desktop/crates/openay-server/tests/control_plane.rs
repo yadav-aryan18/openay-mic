@@ -340,7 +340,7 @@ async fn malformed_flood_does_not_hang_stop() {
     let flooder = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let flood_port = port;
     let flood = tokio::spawn(async move {
-        let mut buf = [0u8; 1];
+        let buf = [0u8; 1];
         let deadline = Instant::now() + Duration::from_secs(6);
         while Instant::now() < deadline {
             // 1-byte datagrams: always decode-Err, cheap to send at line rate.

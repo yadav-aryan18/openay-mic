@@ -965,11 +965,13 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
         config,
         bound_socket,
         bound_listener,
-        ingest.clone(),
-        jitter.clone(),
-        state.effective_target.clone(),
-        state.foreign.clone(),
-        quit.clone(),
+        NetDeps {
+            ingest: ingest.clone(),
+            jitter: jitter.clone(),
+            effective_target: state.effective_target.clone(),
+            foreign: state.foreign.clone(),
+            quit: quit.clone(),
+        },
     ));
     let retarget = spawn_depth_controller(
         jitter.clone(),
@@ -1217,26 +1219,34 @@ async fn stop_pipeline(p: Pipeline, state: &Arc<EngineState>) {
 
 /// Run the receive pipeline until `quit` is set, then return the final
 /// stats line.
-async fn run_network(
-    config: EngineConfig,
-    socket: Option<tokio::net::UdpSocket>,
-    listener: Option<tokio::net::TcpListener>,
+/// Shared per-pipeline state handed to the transport loops (all `Arc` clones
+/// from [`start_pipeline`]; the loops own their copies for the run's life).
+struct NetDeps {
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
     effective_target: Arc<AtomicU32>,
     foreign: Arc<AtomicU64>,
     quit: Arc<AtomicBool>,
+}
+
+async fn run_network(
+    config: EngineConfig,
+    socket: Option<tokio::net::UdpSocket>,
+    listener: Option<tokio::net::TcpListener>,
+    deps: NetDeps,
 ) -> Result<String> {
     match config.transport {
         Transport::Udp => {
             udp_loop(
                 &config,
                 socket.expect("UDP run must carry its bound socket"),
-                ingest,
-                jitter,
-                effective_target,
-                foreign,
-                quit,
+                NetDeps {
+                    ingest: deps.ingest,
+                    jitter: deps.jitter,
+                    effective_target: deps.effective_target,
+                    foreign: deps.foreign,
+                    quit: deps.quit,
+                },
             )
             .await
         }
@@ -1246,10 +1256,13 @@ async fn run_network(
             tcp_loop(
                 &config,
                 listener.expect("TCP run must carry its bound listener"),
-                ingest,
-                jitter,
-                effective_target,
-                quit,
+                NetDeps {
+                    ingest: deps.ingest,
+                    jitter: deps.jitter,
+                    effective_target: deps.effective_target,
+                    quit: deps.quit,
+                    foreign: deps.foreign,
+                },
             )
             .await
         }
@@ -1274,12 +1287,15 @@ async fn run_network(
 async fn udp_loop(
     config: &EngineConfig,
     socket: tokio::net::UdpSocket,
-    ingest: Arc<Mutex<Ingest>>,
-    jitter: Arc<JitterBuffer>,
-    effective_target: Arc<AtomicU32>,
-    foreign: Arc<AtomicU64>,
-    quit: Arc<AtomicBool>,
+    deps: NetDeps,
 ) -> Result<String> {
+    let NetDeps {
+        ingest,
+        jitter,
+        effective_target,
+        foreign,
+        quit,
+    } = deps;
     let mut buf = [0u8; MAX_DATAGRAM];
     let mut last_stats = Instant::now();
     let mut last_underruns = jitter.underruns();
@@ -1322,7 +1338,7 @@ async fn udp_loop(
                     _ if !accept => {}
                     Some(pinned) if pinned != src => {
                         let takeover = peer_last_rx
-                            .map_or(true, |t| t.elapsed() >= PEER_STALE_AFTER);
+                            .is_none_or(|t| t.elapsed() >= PEER_STALE_AFTER);
                         if takeover {
                             eprintln!(
                                 "openay-server: peer latch moved {pinned} -> {src} (previous peer quiet >{}s)",
@@ -1342,7 +1358,7 @@ async fn udp_loop(
                             accept = false;
                             foreign.fetch_add(1, Ordering::Relaxed);
                             foreign_seen += 1;
-                            if foreign_seen == 1 || foreign_seen % 1000 == 0 {
+                            if foreign_seen == 1 || foreign_seen.is_multiple_of(1000) {
                                 eprintln!(
                                     "openay-server: dropping datagrams from foreign sender {src} (total {foreign_seen})"
                                 );
@@ -1428,11 +1444,15 @@ async fn udp_loop(
 async fn tcp_loop(
     config: &EngineConfig,
     listener: tokio::net::TcpListener,
-    ingest: Arc<Mutex<Ingest>>,
-    jitter: Arc<JitterBuffer>,
-    effective_target: Arc<AtomicU32>,
-    quit: Arc<AtomicBool>,
+    deps: NetDeps,
 ) -> Result<String> {
+    let NetDeps {
+        ingest,
+        jitter,
+        effective_target,
+        quit,
+        foreign: _,
+    } = deps;
     // Per-connection tasks are tracked so a Stop reclaims them: abort_all
     // cancels a task parked in next_packet() on an idle socket (quit is only
     // checked between packets), and the Arc clones held per connection die
@@ -1616,10 +1636,10 @@ fn control_reply(
             },
             rate: SAMPLE_RATE as u32,
         }),
-        ControlMsg::Ping { .. } => Some(ControlMsg::Pong),
+        ControlMsg::Ping => Some(ControlMsg::Pong),
         // HelloAck/Pong prove the receiver is alive; Bye ends the session.
-        ControlMsg::HelloAck { .. } | ControlMsg::Pong { .. } => None,
-        ControlMsg::Bye { .. } => {
+        ControlMsg::HelloAck { .. } | ControlMsg::Pong => None,
+        ControlMsg::Bye => {
             if !*bye_logged {
                 *bye_logged = true;
                 eprintln!("openay-server: peer ended the session (bye)");
