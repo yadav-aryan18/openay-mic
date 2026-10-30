@@ -910,6 +910,37 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
         eprintln!("openay-server: no audio output requested — network+jitter only");
     }
 
+    // Bind SYNCHRONOUSLY before spawning the receive task: `running` must
+    // guarantee the transport is listening. An async bind let a test observe
+    // running == true and send into a socket that did not exist yet
+    // (ConnectionRefused), and made bind failures surface asynchronously.
+    let bind_addr = SocketAddr::new(config.bind, config.port);
+    let (bound_socket, bound_listener) = match config.transport {
+        Transport::Udp => (
+            Some(
+                tokio::net::UdpSocket::bind(bind_addr)
+                    .await
+                    .with_context(|| format!("binding UDP {bind_addr}"))?,
+            ),
+            None,
+        ),
+        Transport::Tcp => (
+            None,
+            Some(
+                tokio::net::TcpListener::bind(bind_addr)
+                    .await
+                    .with_context(|| format!("binding TCP {bind_addr}"))?,
+            ),
+        ),
+    };
+    eprintln!(
+        "openay-server: {} listening on {bind_addr}",
+        match config.transport {
+            Transport::Udp => "UDP",
+            Transport::Tcp => "TCP",
+        }
+    );
+
     // Publish the run's config before `config` moves into the network task
     // (EngineConfig is never Copy — it carries the output-device String).
     let config_for_state = config.clone();
@@ -917,6 +948,8 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
 
     let net = tokio::spawn(run_network(
         config,
+        bound_socket,
+        bound_listener,
         ingest.clone(),
         jitter.clone(),
         state.effective_target.clone(),
@@ -1171,6 +1204,8 @@ async fn stop_pipeline(p: Pipeline, state: &Arc<EngineState>) {
 /// stats line.
 async fn run_network(
     config: EngineConfig,
+    socket: Option<tokio::net::UdpSocket>,
+    listener: Option<tokio::net::TcpListener>,
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
     effective_target: Arc<AtomicU32>,
@@ -1179,11 +1214,30 @@ async fn run_network(
 ) -> Result<String> {
     match config.transport {
         Transport::Udp => {
-            udp_loop(&config, ingest, jitter, effective_target, foreign, quit).await
+            udp_loop(
+                &config,
+                socket.expect("UDP run must carry its bound socket"),
+                ingest,
+                jitter,
+                effective_target,
+                foreign,
+                quit,
+            )
+            .await
         }
         // TCP is connection-scoped: every accepted connection is its own
         // peer, so the UDP source latch has no TCP equivalent.
-        Transport::Tcp => tcp_loop(&config, ingest, jitter, effective_target, quit).await,
+        Transport::Tcp => {
+            tcp_loop(
+                &config,
+                listener.expect("TCP run must carry its bound listener"),
+                ingest,
+                jitter,
+                effective_target,
+                quit,
+            )
+            .await
+        }
     }
 }
 
@@ -1204,18 +1258,13 @@ async fn run_network(
 /// [`EngineStatus::foreign_packets`] and rate-limit-logged, never fatal.
 async fn udp_loop(
     config: &EngineConfig,
+    socket: tokio::net::UdpSocket,
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
     effective_target: Arc<AtomicU32>,
     foreign: Arc<AtomicU64>,
     quit: Arc<AtomicBool>,
 ) -> Result<String> {
-    let addr = SocketAddr::new(config.bind, config.port);
-    let socket = tokio::net::UdpSocket::bind(addr)
-        .await
-        .with_context(|| format!("binding UDP {addr}"))?;
-    eprintln!("openay-server: UDP listening on {addr}");
-
     let mut buf = [0u8; MAX_DATAGRAM];
     let mut last_stats = Instant::now();
     let mut last_underruns = jitter.underruns();
@@ -1363,17 +1412,12 @@ async fn udp_loop(
 /// sequence counter.
 async fn tcp_loop(
     config: &EngineConfig,
+    listener: tokio::net::TcpListener,
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
     effective_target: Arc<AtomicU32>,
     quit: Arc<AtomicBool>,
 ) -> Result<String> {
-    let addr = SocketAddr::new(config.bind, config.port);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding TCP {addr}"))?;
-    eprintln!("openay-server: TCP listening on {addr}");
-
     // Per-connection tasks are tracked so a Stop reclaims them: abort_all
     // cancels a task parked in next_packet() on an idle socket (quit is only
     // checked between packets), and the Arc clones held per connection die
