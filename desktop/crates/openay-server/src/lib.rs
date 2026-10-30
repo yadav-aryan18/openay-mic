@@ -1166,11 +1166,13 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
         config,
         bound_socket,
         bound_listener,
-        ingest.clone(),
-        jitter.clone(),
-        state.effective_target.clone(),
-        state.foreign.clone(),
-        quit.clone(),
+        NetDeps {
+            ingest: ingest.clone(),
+            jitter: jitter.clone(),
+            effective_target: state.effective_target.clone(),
+            foreign: state.foreign.clone(),
+            quit: quit.clone(),
+        },
         bt_device.clone(),
         state.bt_inject.clone(),
     ));
@@ -1433,15 +1435,21 @@ async fn stop_pipeline(p: Pipeline, state: &Arc<EngineState>) {
 /// Start on that transport returns an error immediately, which the engine
 /// reaper turns into `last_error` + `running == false` (the same path a UDP
 /// bind failure takes — the pipeline technically starts and dies at once).
-async fn run_network(
-    config: EngineConfig,
-    socket: Option<tokio::net::UdpSocket>,
-    listener: Option<tokio::net::TcpListener>,
+/// Shared per-pipeline state handed to the transport loops (all `Arc` clones
+/// from [`start_pipeline`]; the loops own their copies for the run's life).
+struct NetDeps {
     ingest: Arc<Mutex<Ingest>>,
     jitter: Arc<JitterBuffer>,
     effective_target: Arc<AtomicU32>,
     foreign: Arc<AtomicU64>,
     quit: Arc<AtomicBool>,
+}
+
+async fn run_network(
+    config: EngineConfig,
+    socket: Option<tokio::net::UdpSocket>,
+    listener: Option<tokio::net::TcpListener>,
+    deps: NetDeps,
     bt_device: BtDeviceSlot,
     bt_inject: Option<InjectedBtSource>,
 ) -> Result<String> {
@@ -1450,11 +1458,13 @@ async fn run_network(
             udp_loop(
                 &config,
                 socket.expect("UDP run must carry its bound socket"),
-                ingest,
-                jitter,
-                effective_target,
-                foreign,
-                quit,
+                NetDeps {
+                    ingest: deps.ingest,
+                    jitter: deps.jitter,
+                    effective_target: deps.effective_target,
+                    foreign: deps.foreign,
+                    quit: deps.quit,
+                },
             )
             .await
         }
@@ -1464,25 +1474,19 @@ async fn run_network(
             tcp_loop(
                 &config,
                 listener.expect("TCP run must carry its bound listener"),
-                ingest,
-                jitter,
-                effective_target,
-                quit,
+                NetDeps {
+                    ingest: deps.ingest,
+                    jitter: deps.jitter,
+                    effective_target: deps.effective_target,
+                    quit: deps.quit,
+                    foreign: deps.foreign,
+                },
             )
             .await
         }
         #[cfg(feature = "bluetooth")]
         Transport::Bluetooth => {
-            bt_loop(
-                &config,
-                ingest,
-                jitter,
-                effective_target,
-                quit,
-                bt_device,
-                bt_inject,
-            )
-            .await
+            bt_loop(&config, deps, bt_device, bt_inject).await
         }
         #[cfg(not(feature = "bluetooth"))]
         Transport::Bluetooth => {
@@ -1678,12 +1682,16 @@ async fn stream_accept_loop(
     transport: Transport,
     source: &mut dyn ConnSource,
     codec: CodecMode,
-    ingest: Arc<Mutex<Ingest>>,
-    jitter: Arc<JitterBuffer>,
-    effective_target: Arc<AtomicU32>,
-    quit: Arc<AtomicBool>,
+    deps: NetDeps,
     device_slot: Option<BtDeviceSlot>,
 ) -> Result<String> {
+    let NetDeps {
+        ingest,
+        jitter,
+        effective_target,
+        quit,
+        foreign: _,
+    } = deps;
     let mut last_stats = Instant::now();
     let mut last_underruns = jitter.underruns();
     let mut last_underrun_log: Option<Instant> = None;
@@ -1813,10 +1821,7 @@ async fn stream_accept_loop(
 async fn tcp_loop(
     config: &EngineConfig,
     listener: tokio::net::TcpListener,
-    ingest: Arc<Mutex<Ingest>>,
-    jitter: Arc<JitterBuffer>,
-    effective_target: Arc<AtomicU32>,
-    quit: Arc<AtomicBool>,
+    deps: NetDeps,
 ) -> Result<String> {
     let addr = SocketAddr::new(config.bind, config.port);
     eprintln!("openay-server: TCP serving on {addr}");
@@ -1826,10 +1831,7 @@ async fn tcp_loop(
         Transport::Tcp,
         &mut source,
         config.codec,
-        ingest,
-        jitter,
-        effective_target,
-        quit,
+        deps,
         None,
     )
     .await
@@ -1851,10 +1853,7 @@ async fn tcp_loop(
 #[cfg(feature = "bluetooth")]
 async fn bt_loop(
     config: &EngineConfig,
-    ingest: Arc<Mutex<Ingest>>,
-    jitter: Arc<JitterBuffer>,
-    effective_target: Arc<AtomicU32>,
-    quit: Arc<AtomicBool>,
+    deps: NetDeps,
     device_slot: BtDeviceSlot,
     bt_inject: Option<InjectedBtSource>,
 ) -> Result<String> {
@@ -1888,10 +1887,7 @@ async fn bt_loop(
         Transport::Bluetooth,
         source.as_mut(),
         config.codec,
-        ingest,
-        jitter,
-        effective_target,
-        quit,
+        deps,
         Some(device_slot),
     )
     .await
@@ -1915,12 +1911,15 @@ async fn bt_loop(
 async fn udp_loop(
     config: &EngineConfig,
     socket: tokio::net::UdpSocket,
-    ingest: Arc<Mutex<Ingest>>,
-    jitter: Arc<JitterBuffer>,
-    effective_target: Arc<AtomicU32>,
-    foreign: Arc<AtomicU64>,
-    quit: Arc<AtomicBool>,
+    deps: NetDeps,
 ) -> Result<String> {
+    let NetDeps {
+        ingest,
+        jitter,
+        effective_target,
+        foreign,
+        quit,
+    } = deps;
     let mut buf = [0u8; MAX_DATAGRAM];
     let mut last_stats = Instant::now();
     let mut last_underruns = jitter.underruns();
@@ -1963,7 +1962,7 @@ async fn udp_loop(
                     _ if !accept => {}
                     Some(pinned) if pinned != src => {
                         let takeover = peer_last_rx
-                            .map_or(true, |t| t.elapsed() >= PEER_STALE_AFTER);
+                            .is_none_or(|t| t.elapsed() >= PEER_STALE_AFTER);
                         if takeover {
                             eprintln!(
                                 "openay-server: peer latch moved {pinned} -> {src} (previous peer quiet >{}s)",
@@ -1983,7 +1982,7 @@ async fn udp_loop(
                             accept = false;
                             foreign.fetch_add(1, Ordering::Relaxed);
                             foreign_seen += 1;
-                            if foreign_seen == 1 || foreign_seen % 1000 == 0 {
+                            if foreign_seen == 1 || foreign_seen.is_multiple_of(1000) {
                                 eprintln!(
                                     "openay-server: dropping datagrams from foreign                                      sender {src} (total {foreign_seen})"
                                 );
@@ -2081,10 +2080,10 @@ fn control_reply(
             },
             rate: SAMPLE_RATE as u32,
         }),
-        ControlMsg::Ping { .. } => Some(ControlMsg::Pong),
+        ControlMsg::Ping => Some(ControlMsg::Pong),
         // HelloAck/Pong prove the receiver is alive; Bye ends the session.
-        ControlMsg::HelloAck { .. } | ControlMsg::Pong { .. } => None,
-        ControlMsg::Bye { .. } => {
+        ControlMsg::HelloAck { .. } | ControlMsg::Pong => None,
+        ControlMsg::Bye => {
             if !*bye_logged {
                 *bye_logged = true;
                 eprintln!("openay-server: peer ended the session (bye)");
