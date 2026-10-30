@@ -55,6 +55,7 @@ fn bt_transport_fails_cleanly_without_feature() {
         output_device: None,
         // Unity gain: this test predates the receiver-gain config field.
         gain: 1.0,
+        monitor: false,
     };
     let handle = spawn_engine(Some(config.clone()));
 
