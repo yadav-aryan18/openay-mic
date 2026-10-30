@@ -14,9 +14,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -106,13 +109,15 @@ fun ChainCard(
             .padding(12.dp),
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(IntrinsicSize.Max),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            StageCard(Modifier.weight(1f), "MIC", lit[0].value) { LevelRing(level) }
+            StageCard(Modifier.weight(1f).fillMaxHeight(), "MIC", lit[0].value) { LevelRing(level) }
             CableSegment(hot = running, reducedMotion = reducedMotion, pulse = pulse)
-            StageCard(Modifier.weight(1f), "LINK", lit[1].value) {
+            StageCard(Modifier.weight(1f).fillMaxHeight(), "LINK", lit[1].value) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -126,7 +131,7 @@ fun ChainCard(
                 }
             }
             CableSegment(hot = running, reducedMotion = reducedMotion, pulse = pulse)
-            StageCard(Modifier.weight(1f), "CONSOLE", lit[2].value) {
+            StageCard(Modifier.weight(1f).fillMaxHeight(), "CONSOLE", lit[2].value) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -152,9 +157,21 @@ fun ChainCard(
     }
 }
 
+/**
+ * Height of the stage-card body region; keeps the three cards equal sized
+ * (the MIC ring is 52 dp, so the LINK/CONSOLE bodies center within the same
+ * footprint). Matches desktop STAGE_BODY_HEIGHT architecture.
+ */
+private val STAGE_BODY_HEIGHT = 56.dp
+
 /** Instrument card: engraved caps label + live value, panel + hairline. */
 @Composable
-private fun StageCard(modifier: Modifier, label: String, lit: Float, content: @Composable () -> Unit) {
+private fun StageCard(
+    modifier: Modifier = Modifier,
+    label: String,
+    lit: Float,
+    content: @Composable () -> Unit,
+) {
     Column(
         modifier = modifier
             .clip(RoundedCornerShape(2.dp))
@@ -165,8 +182,18 @@ private fun StageCard(modifier: Modifier, label: String, lit: Float, content: @C
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Text(label, style = MaterialTheme.typography.labelMedium, color = Dim.copy(alpha = 0.9f))
-        // The value content dims with the stage ("cold" strip when idle).
-        Box(Modifier.graphicsLayer { alpha = 0.25f + 0.75f * lit }) { content() }
+        // Equal-height body region: every card's instrument is centered within
+        // the same footprint so the three cards render at identical sizes.
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .heightIn(min = STAGE_BODY_HEIGHT)
+                .graphicsLayer { alpha = 0.25f + 0.75f * lit },
+            contentAlignment = Alignment.Center,
+        ) {
+            content()
+        }
     }
 }
 
