@@ -71,7 +71,8 @@ audio as a PipeWire virtual microphone source node named `openay_mic`
 ```
 openay-server [--transport udp|tcp] [--port N] [--bind ADDR]
               [--codec pcm|opus|auto] [--target-ms F] [--capacity-ms F]
-              [--gain F]
+              [--gain F] [--monitor] [--output] [--output-device NAME]
+              [--list-devices]
 
 ```
 
@@ -82,6 +83,11 @@ openay-server [--transport udp|tcp] [--port N] [--bind ADDR]
 - `--target-ms` default `10.0`, clamped to `[MIN_PREBUFFER_MS, MAX_PREBUFFER_MS]`.
 - `--gain` default `1.0` (unity), clamped to `0..=4` — receiver-side output
   gain applied after decode (the phone's capture/encode chain is untouched).
+- `--output` (needs `--features audio-output`) — render the received audio
+  on a local output device INSTEAD of the virtual microphone (WASAPI
+  playback on Windows; useful with a virtual audio cable). `--output-device
+  NAME` narrows the device by case-insensitive substring; `--list-devices`
+  prints the available names and exits.
 - `--monitor` (needs `--features audio-output`) — LISTEN: play the received
   audio on a local output device for mic tests, additively: on Linux the
   PipeWire virtual microphone keeps running alongside it, so the monitor can
@@ -250,7 +256,7 @@ device (e.g. the Android app paired over BT); the `rfcomm_adapter_presence`
 test is `#[ignore]`d and only probes for an adapter, printing `SKIP` when
 none is available.
 
-## Deviations from the original task spec
+## Deliberate deviations from the shared crate defaults
 
 - **openay-server UDP path**: the transport crate's `UdpReceiver` hardcodes
   binding to `127.0.0.1`, but the server CLI must honor `--bind` (default

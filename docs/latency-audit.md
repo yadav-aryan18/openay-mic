@@ -10,7 +10,7 @@ speaker ──acoustic──▶ phone mic ──(Oboe capture + codec)──▶ 
 openay-server ──(jitter buffer)──▶ PipeWire "openay_mic" ──▶ pw-cat recording
 ```
 
-Two toolkits cover the audit:
+Two toolkits — an acoustic kit and the software probe — cover the audit:
 
 - `scripts/gen_click_track.py` — synthesizes the acoustic click track (48 kHz
   mono 16-bit WAV) plus a `<out>.clicks.tsv` ground-truth file with every

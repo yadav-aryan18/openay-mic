@@ -9,9 +9,9 @@ Requirements
 ------------
 - Windows 10 or newer (x86_64). No admin rights needed to run the exe.
 - A sound output device. To expose the stream to other apps as a
-  microphone, install a virtual audio cable (e.g. a virtual-audio-cable driver, free from
-  vb-audio.com) and select it as the output device — apps then pick
-  the cable's recording side ("Output") as their input. To simply monitor the audio, any
+  microphone, install a virtual audio cable (any package that exposes a
+  playback device routed to a recording device works) and select it as the
+  output device — apps then pick the cable's recording side ("Output") as their input. To simply monitor the audio, any
   speakers/headset works.
 - The phone app (OpenAY Mic on Android) and this receiver.
 

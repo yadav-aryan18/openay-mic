@@ -74,7 +74,7 @@ carry features).
   cross-builds them with user-space tooling.
 - **Session loggers** for both platforms: `scripts/devlog.sh` (Ubuntu: app
   log, environment snapshot, virtual-source state, optional phone logcat)
-  and `dist/openay-log.ps1` (Windows: app log + device snapshot).
+  and `scripts/openay-log.ps1` (Windows: app log + device snapshot).
 - Adaptive jitter buffer: `DepthController` (+2 ms per underrun to a 20 ms
   ceiling, −1 ms per 60 s underrun-free toward the user floor, injectable
   clock) with live retargeting — no pipeline restart;
