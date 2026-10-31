@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.drawable.ColorDrawable
+import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.Settings
@@ -46,6 +47,8 @@ import androidx.core.content.ContextCompat
 import com.openay.mic.logic.LinkDelta
 import com.openay.mic.logic.linkDelta
 import com.openay.mic.logic.smoothLevel
+import com.openay.mic.ui.BtDeviceChip
+import com.openay.mic.ui.BtDevicePickerDialog
 import com.openay.mic.ui.ChainCard
 import com.openay.mic.ui.ChipOption
 import com.openay.mic.ui.ChipRow
@@ -109,6 +112,7 @@ private fun CaptureScreen() {
     var portText by remember { mutableStateOf(prefs.port) }
     var codec by remember { mutableStateOf(prefs.codec) }
     var frameMs by remember { mutableStateOf(prefs.frameMs) }
+    var btDevice by remember { mutableStateOf(prefs.btDevice) }
     var voiceFx by remember { mutableStateOf(prefs.voiceFx) }
     var muteOnCall by remember { mutableStateOf(prefs.muteOnCall) }
 
@@ -122,6 +126,11 @@ private fun CaptureScreen() {
     var uptimeSeconds by remember { mutableLongStateOf(0L) }
     var sessionStartElapsed by remember { mutableLongStateOf(0L) }
 
+    // --- BT device picker (transport "bt") ---
+    val btLink = remember { BluetoothLink() }
+    var showDevicePicker by remember { mutableStateOf(false) }
+    var pickerDevices by remember { mutableStateOf(listOf<BluetoothLink.BondedDevice>()) }
+
     val reducedMotion = rememberReducedMotion()
 
     // ---------- capture lifecycle ----------
@@ -132,6 +141,36 @@ private fun CaptureScreen() {
 
     fun startCapture() {
         if (nativeError != null) return
+        if (codec == "opus" && frameMs == 5) {
+            // Defense for configs persisted before the UI gated this combo:
+            // the native capture pipeline rejects 5 ms Opus (protocol).
+            showSnackbar("Opus streams at 10 ms frames (protocol)")
+            return
+        }
+        if (transport == "bt" && codec == "pcm") {
+            // Non-blocking warning: raw PCM needs ~1.54 Mbps, at or above the
+            // practical Bluetooth SPP ceiling — expect dropouts. Opus
+            // (32 kbps) is the codec the protocol designed for BT-class links.
+            showSnackbar("PCM can exceed Bluetooth throughput — OPUS recommended")
+        }
+        if (transport == "bt") {
+            if (btDevice.isBlank()) {
+                showSnackbar("Select a Bluetooth device first")
+                return
+            }
+            // host/port are meaningless over RFCOMM; the device address rides
+            // along and the service performs the connect + pipe handover.
+            val intent = MicCaptureService.captureIntent(
+                context, "bt", host, 0, codec, frameMs, voiceFx, muteOnCall,
+                device = btDevice
+            )
+            // Optimistic flip: the service connects asynchronously (an RFCOMM
+            // connect can take seconds); the stats poll self-corrects to
+            // StandBy if the start fails.
+            running = true
+            ContextCompat.startForegroundService(context, intent)
+            return
+        }
         val port = portText.trim().toIntOrNull()
         if (port == null || port !in 1..65535) {
             showSnackbar("Port must be 1–65535")
@@ -142,8 +181,10 @@ private fun CaptureScreen() {
             return
         }
         val intent = MicCaptureService.captureIntent(
-            context, transport, host, port, codec, frameMs, voiceFx, muteOnCall
+            context, transport, host, port, codec, frameMs, voiceFx, muteOnCall,
+            device = btDevice
         )
+        running = true
         ContextCompat.startForegroundService(context, intent)
     }
 
@@ -152,23 +193,87 @@ private fun CaptureScreen() {
         running = false
     }
 
+    fun needsBtPermission(): Boolean = transport == "bt" &&
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+        ContextCompat.checkSelfPermission(
+            context, Manifest.permission.BLUETOOTH_CONNECT
+        ) != PackageManager.PERMISSION_GRANTED
+
+    // Permission-request hooks: the launchers below are declared after
+    // beginCapture (their granted callbacks call it — local declarations
+    // cannot be referenced forward), so the requests they perform are
+    // injected into beginCapture through these vars once the launchers exist.
+    var requestBtPermission: () -> Unit = {}
+    var requestMicPermission: () -> Unit = {}
+
+    // The single capture-entry ladder: every runtime-permission callback and
+    // the ON AIR toggle funnel through here so no granted-permission callback
+    // can bypass a check that comes earlier in the ladder (e.g. starting BT
+    // with RECORD_AUDIO still missing, which the service would refuse
+    // silently).
+    fun beginCapture() {
+        when {
+            running -> stopCapture()
+            nativeError != null -> showSnackbar("Native library unavailable — cannot start")
+            needsBtPermission() -> requestBtPermission()
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED -> startCapture()
+            else -> requestMicPermission()
+        }
+    }
+
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
-            startCapture()
+            beginCapture()
         } else {
             showSnackbar("Microphone permission denied — capture not started")
         }
     }
 
-    fun onTogglePress() {
-        when {
-            running -> stopCapture()
-            nativeError != null -> showSnackbar("Native library unavailable — cannot start")
-            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
-                == PackageManager.PERMISSION_GRANTED -> startCapture()
-            else -> permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+    // BLUETOOTH_CONNECT gates both the bonded-device picker and a BT capture
+    // start (S+ only; on <S the manifest's BLUETOOTH is install-time).
+    val btPickPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            showDevicePicker = true
+        } else {
+            showSnackbar("Bluetooth permission denied — cannot list devices")
+        }
+    }
+
+    val btStartPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            beginCapture()
+        } else {
+            showSnackbar("Bluetooth permission denied — capture not started")
+        }
+    }
+
+    requestBtPermission = {
+        btStartPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+    }
+    requestMicPermission = { permissionLauncher.launch(Manifest.permission.RECORD_AUDIO) }
+
+    fun openDevicePicker() {
+        if (btLink.needsConnectPermission(context)) {
+            btPickPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            showDevicePicker = true
+        }
+    }
+
+    fun onTogglePress() = beginCapture()
+
+    // ---------- BT picker refresh (bonded list on open, not per frame) ----------
+
+    LaunchedEffect(showDevicePicker) {
+        if (showDevicePicker) {
+            pickerDevices = btLink.bondedDevices(context)
         }
     }
 
@@ -251,12 +356,16 @@ private fun CaptureScreen() {
 
             nativeError?.let { ErrorPanel(it, Modifier.fillMaxWidth()) }
 
+            // CONSOLE stage shows the BT device for transport "bt" (host:port
+            // is meaningless over RFCOMM).
+            val consoleHost = if (transport == "bt") btDevice else host
+            val consolePort = if (transport == "bt") "SPP" else portText
             ChainCard(
                 running = running,
                 level = level,
                 link = link,
-                consoleHost = host,
-                consolePort = portText,
+                consoleHost = consoleHost,
+                consolePort = consolePort,
                 reducedMotion = reducedMotion,
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -264,6 +373,11 @@ private fun CaptureScreen() {
             lastError?.let { ErrorPanel(it, Modifier.fillMaxWidth()) }
 
             // ON AIR lamp + mono status line
+            val target = if (transport == "bt") {
+                btDevice.ifBlank { "NO DEVICE" }
+            } else {
+                "${if (host.isBlank()) "0.0.0.0" else host}:${portText.ifBlank { "0" }}"
+            }
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -277,8 +391,7 @@ private fun CaptureScreen() {
                 )
                 val linkNote = if (running && stats?.peerLink == "lost") " · LINK LOST" else ""
                 Text(
-                    "${transportLabel(transport)} · " +
-                        "${if (host.isBlank()) "0.0.0.0" else host}:${portText.ifBlank { "0" }} · " +
+                    "${transportLabel(transport)} · $target · " +
                         "${codecLabel(codec)} ${frameMs}MS$linkNote",
                     style = OpenAyDataStyles.micro,
                     color = Dim.copy(alpha = 0.85f),
@@ -294,9 +407,20 @@ private fun CaptureScreen() {
                     onSelect = {
                         transport = it
                         prefs.transport = it
+                        if (it == "bt") openDevicePicker()
                     },
                     modifier = Modifier.fillMaxWidth(),
                 )
+            }
+
+            if (transport == "bt") {
+                SettingsRow(label = "BT DEVICE") {
+                    BtDeviceChip(
+                        label = btDevice.ifBlank { "SELECT DEVICE" },
+                        selected = btDevice.isNotBlank(),
+                        onClick = ::openDevicePicker,
+                    )
+                }
             }
 
             SettingsRow(label = "CODEC") {
@@ -306,6 +430,12 @@ private fun CaptureScreen() {
                     onSelect = {
                         codec = it
                         prefs.codec = it
+                        if (it == "opus" && frameMs == 5) {
+                            // Auto-correct: Opus requires 10 ms frames.
+                            frameMs = 10
+                            prefs.frameMs = 10
+                            showSnackbar("Opus requires 10 ms frames — frame switched to 10 MS")
+                        }
                     },
                 )
             }
@@ -315,6 +445,13 @@ private fun CaptureScreen() {
                     options = listOf(ChipOption("5 MS", "5"), ChipOption("10 MS", "10")),
                     selected = frameMs.toString(),
                     onSelect = {
+                        if (codec == "opus" && it == "5") {
+                            // Protocol constraint (shared/protocol.md): Opus is
+                            // exactly one packet per 10 ms frame — the native
+                            // capture pipeline rejects 5 ms Opus outright.
+                            showSnackbar("Opus streams at 10 ms frames (protocol)")
+                            return@ChipRow
+                        }
                         frameMs = it.toInt()
                         prefs.frameMs = it.toInt()
                     },
@@ -360,6 +497,20 @@ private fun CaptureScreen() {
                 modifier = Modifier.fillMaxWidth(),
             )
         }
+    }
+
+    // Bonded-device picker lives outside the scroll column (overlay).
+    if (showDevicePicker) {
+        BtDevicePickerDialog(
+            devices = pickerDevices,
+            selectedAddress = btDevice,
+            onSelect = { device ->
+                btDevice = device.address
+                prefs.btDevice = device.address
+                showDevicePicker = false
+            },
+            onDismiss = { showDevicePicker = false },
+        )
     }
 }
 
@@ -414,6 +565,11 @@ private class AppPrefs(context: Context) {
         get() = sp.getInt(KEY_FRAME_MS, DEFAULT_FRAME_MS)
         set(value) = sp.edit().putInt(KEY_FRAME_MS, value).apply()
 
+    /** Bonded BT device address for transport "bt" (blank = none picked). */
+    var btDevice: String
+        get() = sp.getString(KEY_BT_DEVICE, DEFAULT_BT_DEVICE) ?: DEFAULT_BT_DEVICE
+        set(value) = sp.edit().putString(KEY_BT_DEVICE, value).apply()
+
     var voiceFx: Boolean
         get() = sp.getBoolean(KEY_VOICE_FX, DEFAULT_VOICE_FX)
         set(value) = sp.edit().putBoolean(KEY_VOICE_FX, value).apply()
@@ -429,6 +585,7 @@ private class AppPrefs(context: Context) {
         const val KEY_PORT = "port"
         const val KEY_CODEC = "codec"
         const val KEY_FRAME_MS = "frame_ms"
+        const val KEY_BT_DEVICE = "bt_device"
         const val KEY_VOICE_FX = "voice_fx"
         const val KEY_MUTE_ON_CALL = "mute_on_call"
         const val DEFAULT_TRANSPORT = "udp"
@@ -436,6 +593,7 @@ private class AppPrefs(context: Context) {
         const val DEFAULT_PORT = "41700"
         const val DEFAULT_CODEC = "pcm"
         const val DEFAULT_FRAME_MS = 10
+        const val DEFAULT_BT_DEVICE = ""
         const val DEFAULT_VOICE_FX = true
         const val DEFAULT_MUTE_ON_CALL = true
     }
@@ -460,6 +618,7 @@ private fun rememberReducedMotion(): Boolean {
 
 private fun transportLabel(transport: String): String = when (transport) {
     "tcp" -> "USB"
+    "bt" -> "BT"
     else -> "UDP"
 }
 

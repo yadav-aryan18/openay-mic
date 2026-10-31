@@ -18,6 +18,10 @@ use openay_server::{
 enum TransportArg {
     Udp,
     Tcp,
+    /// Bluetooth SPP over BlueZ: registers the "OpenAY Mic SPP" profile on
+    /// the default adapter and receives framed packets from paired phones
+    /// over RFCOMM. `--bind`/`--port` are stored for display but unused.
+    Bt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -38,7 +42,9 @@ enum CodecArg {
     about = "OpenAY Mic desktop receiver: network -> jitter buffer -> PipeWire virtual microphone"
 )]
 struct Args {
-    /// Transport to receive audio on.
+    /// Transport to receive audio on: `udp`, `tcp`, or `bt` (Bluetooth SPP
+    /// via BlueZ; needs a running bluetoothd and, without the `bluetooth`
+    /// build feature, fails cleanly at startup).
     #[arg(long, value_enum, default_value = "udp")]
     transport: TransportArg,
     /// Port to listen on.
@@ -132,6 +138,7 @@ async fn main() -> Result<()> {
         transport: match args.transport {
             TransportArg::Udp => Transport::Udp,
             TransportArg::Tcp => Transport::Tcp,
+            TransportArg::Bt => Transport::Bluetooth,
         },
         bind,
         port: args.port,

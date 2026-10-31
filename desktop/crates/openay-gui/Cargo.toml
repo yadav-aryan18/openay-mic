@@ -11,9 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 # Platform output backend, selected by target: the SAME console ships with
-# the PipeWire virtual microphone on Linux and WASAPI playback (cpal
-# audio-output) on Windows — one GUI source, one engine, per-OS audio arm.
-# Base entry carries no features; the target tables add exactly one.
+# the PipeWire virtual microphone + the Bluetooth SPP receive path on Linux,
+# and WASAPI playback (cpal audio-output) on Windows — one GUI source, one
+# engine, per-OS audio arm. Base entry carries no features; the target
+# tables add exactly the platform set.
 openay-server = { path = "../openay-server" }
 # Software renderer only (tiny-skia, NOT wgpu); tokio integration for the
 # async engine commands; canvas for the custom-drawn instruments.
@@ -25,16 +26,18 @@ dirs = "6"
 if-addrs = "0.15"
 
 [target.'cfg(not(windows))'.dependencies]
-# Linux (and every other Unix): the virtual microphone is the product.
-openay-server = { path = "../openay-server", features = ["pipewire", "audio-output"] }
+# Linux (and every other Unix): the virtual microphone is the product, and
+# the Bluetooth SPP receive path ships with it (BT chip in the settings
+# transport control).
+openay-server = { path = "../openay-server", features = ["pipewire", "audio-output", "bluetooth"] }
 ksni = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Windows: local playback via cpal/WASAPI (a system-wide virtual mic needs
-# a kernel driver — out of scope; see README-WINDOWS.txt).
+# Windows: local playback via cpal/WASAPI. The Bluetooth transport is not
+# ported to Windows yet — selecting it in a future Windows build would fail
+# cleanly until then. The Win32 system tray (tray-icon + its muda menu
+# re-export) is Windows-only by nature; the Unix side uses ksni.
 openay-server = { path = "../openay-server", features = ["audio-output"] }
-# System tray (Shell_NotifyIcon) + context menu; the menu API is re-exported
-# as tray_icon::menu (muda). Version verified against docs.rs 0.26.1.
 tray-icon = "0.26"
 # The tray-event pump sleeps between receiver drains (iced's tokio executor
 # is already in the build; this only unlocks the time helper).

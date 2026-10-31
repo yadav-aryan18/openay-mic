@@ -16,6 +16,7 @@ import android.media.audiofx.NoiseSuppressor
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -39,6 +40,11 @@ import org.json.JSONObject
  * native session and the service. While running, a lightweight coroutine
  * refreshes the notification with live counters every 2 s.
  *
+ * Transport "bt" routes through [BluetoothLink]: the RFCOMM socket lives in
+ * Kotlin (the NDK has no BT socket APIs), the service connects + pumps, and
+ * native only sees one end of a full-duplex local socket pair via
+ * nativeStartBt (audio out, desktop control traffic in).
+ *
  * Session-scoped extras: [EXTRA_VOICE_FX] attaches platform echo
  * cancellation / noise suppression to the capture session; [EXTRA_MUTE_ON_CALL]
  * mutes the stream whenever the device enters a call/communication audio
@@ -49,10 +55,18 @@ import org.json.JSONObject
 class MicCaptureService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private var statsJob: Job? = null
+    // statsJob/btJob/lastXruns are written from the main thread AND from the
+    // BT connect/pump continuations on Dispatchers.IO: @Volatile gives the
+    // cross-thread visibility (all mutations are single-assignment style, no
+    // read-modify-write).
+    @Volatile private var statsJob: Job? = null
     // Previous session's xrun count; a refresh seeing a higher value logs a
     // warning (increase tracking only — the notification text is untouched).
-    private var lastXruns = 0
+    @Volatile private var lastXruns = 0
+    // Bluetooth link + its connect/pump coroutine (transport "bt" only).
+    // btLink is touched from the main thread and the IO pump/coroutines.
+    @Volatile private var btLink: BluetoothLink? = null
+    @Volatile private var btJob: Job? = null
 
     // Voice processing effects bound to the native capture session; created
     // per session, released on stop.
@@ -80,10 +94,17 @@ class MicCaptureService : Service() {
         val port = intent.getIntExtra(EXTRA_PORT, -1)
         val codec = intent.getStringExtra(EXTRA_CODEC) ?: DEFAULT_CODEC
         val frameMs = intent.getIntExtra(EXTRA_FRAME_MS, DEFAULT_FRAME_MS)
+        val device = intent.getStringExtra(EXTRA_DEVICE).orEmpty()
         val voiceFx = intent.getBooleanExtra(EXTRA_VOICE_FX, false)
         muteOnCall = intent.getBooleanExtra(EXTRA_MUTE_ON_CALL, false)
 
-        if (port <= 0 || port > 65535 || host.isBlank()) {
+        if (transport == TRANSPORT_BT) {
+            if (device.isBlank()) {
+                Log.e(TAG, "BT transport without a device address — refusing to start")
+                stopSelf()
+                return START_NOT_STICKY
+            }
+        } else if (port <= 0 || port > 65535 || host.isBlank()) {
             Log.e(TAG, "Invalid capture parameters (host='$host', port=$port) — refusing to start")
             stopSelf()
             return START_NOT_STICKY
@@ -115,11 +136,12 @@ class MicCaptureService : Service() {
         // (e.g. service started by adb or a system restart), and the
         // microphone FGS type must be active before capture begins. A
         // rejection is logged and answered with a clean stop — never a crash.
+        val target = if (transport == TRANSPORT_BT) device else "$host:$port"
         try {
             ServiceCompat.startForeground(
                 this,
                 NOTIFICATION_ID,
-                buildNotification("OpenAY Mic · $transport/$codec → $host:$port"),
+                buildNotification("OpenAY Mic · $transport/$codec → $target"),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             )
         } catch (e: Exception) {
@@ -128,20 +150,25 @@ class MicCaptureService : Service() {
             return START_NOT_STICKY
         }
 
+        if (transport == TRANSPORT_BT) {
+            startBtCapture(device, codec, frameMs, voiceFx)
+            return START_NOT_STICKY
+        }
+
+        // Switching BT -> wired: the previous BT link (socket + pump) must be
+        // torn down explicitly. The nativeStop() above already closed the
+        // native fd, so the pump has EOF-exited and this is quiet —
+        // without it the idle RFCOMM socket would survive, leaking a fd and
+        // leaving the desktop console showing a stale BT device.
+        if (transport != TRANSPORT_BT) stopBtLink()
+
         val started = nativeStart(transport, host, port, codec, frameMs, voiceFx)
         if (!started) {
             val lastError = lastErrorFromStats()
             Log.e(TAG, "nativeStart($transport, $host, $port, $codec, ${frameMs}ms) failed: $lastError")
             // Foreground promotion already happened, so surface the failure
             // with a plain notification update and stop.
-            try {
-                NotificationManagerCompat.from(this).notify(
-                    NOTIFICATION_ID,
-                    buildNotification("OpenAY Mic · start failed: $lastError")
-                )
-            } catch (e: SecurityException) {
-                Log.w(TAG, "POST_NOTIFICATIONS not granted — failure not shown")
-            }
+            notifyFailure("start failed: $lastError")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -162,6 +189,106 @@ class MicCaptureService : Service() {
         }
 
         return START_NOT_STICKY
+    }
+
+    /**
+     * BT transport: connect the RFCOMM socket, create the full-duplex local
+     * pair, start native with the native end's fd, then pump both directions
+     * (audio out, desktop control traffic in). Runs on Dispatchers.IO —
+     * a cold RFCOMM connect can take seconds and must not block the main
+     * thread (the wired transports connect inside nativeStart instead).
+     */
+    private fun startBtCapture(device: String, codec: String, frameMs: Int, voiceFx: Boolean) {
+        stopBtLink()  // tear down any in-flight/previous link before the new one
+        val link = BluetoothLink()
+        btLink = link
+        btJob = serviceScope.launch(Dispatchers.IO) {
+            val fd = try {
+                link.connect(applicationContext, device)
+            } catch (e: BluetoothLinkException) {
+                Log.w(TAG, "BT connect to $device failed: ${e.message}")
+                if (btLink === link) {
+                    // Close first: the link may hold a connected socket even
+                    // after connect() threw (see BluetoothLink.connect()).
+                    link.close()
+                    btLink = null
+                    notifyFailure("BT connect failed: ${e.message}")
+                    stopSelf()
+                }
+                return@launch
+            }
+            if (btLink !== link) {
+                // Superseded while connecting; native never saw the fd and
+                // we are its only owner in this window.
+                ParcelFileDescriptor.adoptFd(fd).close()
+                return@launch
+            }
+            // Ownership: from nativeStartBt on, the fd belongs to native
+            // (closed by the engine sink). Only an exception BEFORE that
+            // call leaves it ours to close.
+            val started = try {
+                NativeBridge.nativeStartBt(fd, device, codec, frameMs, voiceFx)
+            } catch (e: UnsatisfiedLinkError) {
+                Log.e(TAG, "Native library unavailable", e)
+                ParcelFileDescriptor.adoptFd(fd).close()
+                if (btLink === link) {
+                    // Native never took the fd; the link's socket and pump
+                    // end still need closing (native fd handled above).
+                    link.close()
+                    btLink = null
+                    stopSelf()
+                }
+                return@launch
+            }
+            if (started && (btLink !== link || link.isClosed)) {
+                // The user pressed Stop while the blocking connect/start was
+                // in flight: native is running with a pump end that will
+                // never be drained. Stop it here — nothing else will.
+                Log.w(TAG, "BT session superseded during start — stopping native")
+                nativeStop()
+                return@launch
+            }
+            if (!started) {
+                // Native consumed (closed) the fd even on failure; the
+                // reason is readable via StatsJson. The link's socket and
+                // pump end are still ours to close.
+                val lastError = lastErrorFromStats()
+                Log.e(TAG, "nativeStartBt($device, $codec, ${frameMs}ms) failed: $lastError")
+                if (btLink === link) {
+                    link.close()
+                    btLink = null
+                    notifyFailure("start failed: $lastError")
+                    stopSelf()
+                }
+                return@launch
+            }
+
+            // Fresh xrun baseline for the new session (same as the wired path).
+            lastXruns = 0
+
+            // Pump failure (socket drop / IO error): stop capture cleanly —
+            // native records send errors once its fd starts failing, and the
+            // stats path surfaces them.
+            link.startPump(serviceScope) { reason ->
+                if (btLink === link) {
+                    Log.w(TAG, "BT link down: $reason — stopping capture")
+                    stopBtSession("BT link down: $reason")
+                }
+            }
+
+            // Session-scoped features, identical to the wired transports:
+            // the capture session exists (Oboe allocated it) and the toggles
+            // were passed in, so BT users get the same behavior.
+            if (voiceFx) attachVoiceEffects()
+            if (muteOnCall) startModeWatcher()
+
+            statsJob = serviceScope.launch {
+                while (isActive) {
+                    delay(STATS_INTERVAL_MS)
+                    updateStatsNotification()
+                }
+            }
+        }
     }
 
     /**
@@ -193,6 +320,29 @@ class MicCaptureService : Service() {
                 Log.i(TAG, "noise suppressor enabled (session $sessionId)")
             }
         }
+    }
+
+    /** BT link failure path: stop native, surface the reason, stop the service. */
+    private fun stopBtSession(reason: String) {
+        statsJob?.cancel()
+        statsJob = null
+        lastXruns = 0
+        stopModeWatcher()
+        releaseVoiceEffects()
+        // Native first: the engine closes the native fd, which ends the
+        // pump (EOF) before the socket is torn down.
+        if (nativeRunning()) nativeStop()
+        stopBtLink()
+        notifyFailure(reason)
+        stopSelf()
+    }
+
+    /** Tears down the BT link (socket + pump); native is untouched here. */
+    private fun stopBtLink() {
+        btLink?.close()
+        btLink = null
+        btJob?.cancel()
+        btJob = null
     }
 
     /**
@@ -306,6 +456,18 @@ class MicCaptureService : Service() {
         "unknown error (${e.message})"
     }
 
+    /** Plain notification update used to surface start/link failures. */
+    private fun notifyFailure(text: String) {
+        try {
+            NotificationManagerCompat.from(this).notify(
+                NOTIFICATION_ID,
+                buildNotification("OpenAY Mic · $text")
+            )
+        } catch (e: SecurityException) {
+            Log.w(TAG, "POST_NOTIFICATIONS not granted — failure not shown")
+        }
+    }
+
     private fun nativeStart(
         transport: String,
         host: String,
@@ -342,7 +504,10 @@ class MicCaptureService : Service() {
         stopModeWatcher()
         releaseVoiceEffects()
         releaseWifiLock()
+        // Native first: for a BT session the engine closes the native fd,
+        // which ends the pump (EOF) before the socket is torn down.
         if (nativeRunning()) nativeStop()
+        stopBtLink()
         stopSelf()
     }
 
@@ -376,8 +541,9 @@ class MicCaptureService : Service() {
 
     override fun onDestroy() {
         // Tear down in order: stop the UI refresh loop, cancel the scope,
-        // release session resources, stop the native session, and only then
-        // notify the framework.
+        // release session resources, stop the native session, tear down the
+        // BT link (after native: the engine closing the native fd ends the
+        // pump first), and only then notify the framework.
         statsJob?.cancel()
         statsJob = null
         lastXruns = 0
@@ -386,6 +552,7 @@ class MicCaptureService : Service() {
         releaseWifiLock()
         serviceScope.cancel()
         if (nativeRunning()) nativeStop()
+        stopBtLink()
         super.onDestroy()
     }
 
@@ -401,15 +568,23 @@ class MicCaptureService : Service() {
 
         const val ACTION_STOP = "com.openay.mic.action.STOP"
 
+        /** Transport value for the Bluetooth RFCOMM (SPP) link. */
+        const val TRANSPORT_BT = "bt"
+
         private const val EXTRA_TRANSPORT = "transport"
         private const val EXTRA_HOST = "host"
         private const val EXTRA_PORT = "port"
         private const val EXTRA_CODEC = "codec"
         private const val EXTRA_FRAME_MS = "frame_ms"
+        private const val EXTRA_DEVICE = "device"
         private const val EXTRA_VOICE_FX = "voice_fx"
         private const val EXTRA_MUTE_ON_CALL = "mute_on_call"
 
-        /** Builds the intent that starts capture with the given parameters. */
+        /**
+         * Builds the intent that starts capture with the given parameters.
+         * `device` (bonded MAC address) is only read for transport "bt",
+         * which ignores host/port.
+         */
         fun captureIntent(
             context: Context,
             transport: String,
@@ -418,7 +593,8 @@ class MicCaptureService : Service() {
             codec: String,
             frameMs: Int,
             voiceFx: Boolean,
-            muteOnCall: Boolean
+            muteOnCall: Boolean,
+            device: String = ""
         ): Intent = Intent(context, MicCaptureService::class.java).apply {
             putExtra(EXTRA_TRANSPORT, transport)
             putExtra(EXTRA_HOST, host)
@@ -427,6 +603,7 @@ class MicCaptureService : Service() {
             putExtra(EXTRA_FRAME_MS, frameMs)
             putExtra(EXTRA_VOICE_FX, voiceFx)
             putExtra(EXTRA_MUTE_ON_CALL, muteOnCall)
+            putExtra(EXTRA_DEVICE, device)
         }
     }
 }

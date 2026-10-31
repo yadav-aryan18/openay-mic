@@ -17,7 +17,9 @@ use iced::{
     window, Color, Element, Length, Point, Radians, Rectangle, Size, Subscription, Task, Theme,
 };
 
-use openay_server::{CodecMode, EngineCommand, EngineConfig, EngineHandle, EngineStatus};
+use openay_server::{
+    CodecMode, EngineCommand, EngineConfig, EngineHandle, EngineStatus, Transport,
+};
 
 use crate::config::{self, apply_autostart, autostart_path, Config};
 use crate::theme;
@@ -104,6 +106,8 @@ pub struct App {
     port_input: String,
     bind_input: String,
     bind_options: Vec<String>,
+    /// Pending transport selection (applied on Save).
+    transport: Transport,
     codec: CodecMode,
     target_ms: f32,
     /// Output gain applied to decoded samples (engine clamps 0..=4).
@@ -118,6 +122,13 @@ pub struct App {
     // settings / the virtual cable's default-device state.
     output_device: Option<String>,
     dirty: bool,
+    // Display mirrors of engine state (polled in tick())
+    /// Bluetooth device currently connected to the engine (its MAC
+    /// address), for the "BT · <device>" status line; `None` while waiting.
+    bt_device: Option<String>,
+    /// Most recent fatal engine error (e.g. BlueZ unavailable for BT):
+    /// shown in the status line until the next successful start.
+    last_error: Option<String>,
     // Persistence
     config: Config,
     config_path: PathBuf,
@@ -141,6 +152,7 @@ pub enum Message {
     ToggleSettings,
     PortChanged(String),
     BindSelected(String),
+    TransportSelected(Transport),
     CodecSelected(CodecMode),
     TargetChanged(f32),
     GainChanged(f32),
@@ -171,6 +183,7 @@ impl App {
         let engine_cfg = config.to_engine();
         let port_input = config.port.to_string();
         let bind_input = config.bind.clone();
+        let transport = config.transport_mode();
         let codec = config.codec_mode();
         let target_ms = config.target_ms;
         let gain = config.gain;
@@ -220,6 +233,7 @@ impl App {
             port_input,
             bind_input,
             bind_options,
+            transport,
             codec,
             target_ms,
             gain,
@@ -229,6 +243,8 @@ impl App {
             reduce_motion,
             output_device,
             dirty: false,
+            bt_device: None,
+            last_error: None,
             config,
             config_path: flags.config_path,
             tray_bus: flags.tray_bus,
@@ -277,6 +293,11 @@ impl App {
             }
             Message::BindSelected(s) => {
                 self.bind_input = s.clone();
+                self.dirty = true;
+                Task::none()
+            }
+            Message::TransportSelected(t) => {
+                self.transport = t;
                 self.dirty = true;
                 Task::none()
             }
@@ -389,6 +410,10 @@ impl App {
         self.streaming = status.running && received_delta > 0;
         self.effective_target_ms = status.effective_target_ms;
         self.status = status;
+        // Display mirrors: the connected BT device (for "BT · <device>") and
+        // the engine's fatal error (BlueZ unavailable, bind failure, ...).
+        self.bt_device = self.engine.bt_device();
+        self.last_error = self.engine.last_error();
 
         // VU ballistics: instant attack, ~12 dB/s decay. When the engine is
         // not running the ballistics reset — an idle console shows a fully
@@ -511,6 +536,7 @@ impl App {
         let cfg = Config {
             port,
             bind: self.bind_input.clone(),
+            transport: self.transport.as_str().to_string(),
             codec: self.codec.as_str().to_string(),
             target_ms: self.target_ms.clamp(
                 openay_server::MIN_PREBUFFER_MS,
@@ -954,22 +980,40 @@ impl App {
 
     // ---- Status line ----
 
-    fn status_line<'a>(&'a self) -> Element<'a, Message> {
-        let transport = self.engine_cfg.transport.as_str().to_uppercase();
+    /// The single-line status readout (pure, so tests assert it directly):
+    /// `UDP · 0.0.0.0:41700 · AUTO`, or over Bluetooth
+    /// `BT · <device> · <codec>` where `<device>` is the connected phone's
+    /// MAC address or `waiting` while no device is connected. A fatal
+    /// engine error (e.g. BlueZ unavailable for BT) replaces the whole line
+    /// until the next successful start.
+    fn status_line_text(&self) -> String {
+        if let Some(err) = &self.last_error {
+            return truncate_with_ellipsis(err, STATUS_LINE_MAX_CHARS);
+        }
         let codec = self.engine_cfg.codec.as_str().to_uppercase();
-        let bind = self.engine_cfg.bind;
-        let port = self.engine_cfg.port;
+        let s = if self.engine_cfg.transport == Transport::Bluetooth {
+            let device = self.bt_device.as_deref().unwrap_or("waiting");
+            format!("BT · {device} · {codec}")
+        } else {
+            let transport = self.engine_cfg.transport.as_str().to_uppercase();
+            format!(
+                "{transport} · {}:{} · {codec}",
+                self.engine_cfg.bind, self.engine_cfg.port
+            )
+        };
+        truncate_with_ellipsis(&s, STATUS_LINE_MAX_CHARS)
+    }
+
+    fn status_line<'a>(&'a self) -> Element<'a, Message> {
         // Mono, dim, single line: never wraps, truncates with an ellipsis
         // (design.md layout sketch; iced 0.13 has no Text ellipsis, so the
-        // truncation is done here with a conservative char budget).
-        let s = truncate_with_ellipsis(
-            &format!("{transport} · {bind}:{port} · {codec}"),
-            STATUS_LINE_MAX_CHARS,
-        );
-        text(s)
+        // truncation is done here with a conservative char budget). A fatal
+        // error reads in the amber attention color instead of dim.
+        let has_error = self.last_error.is_some();
+        text(self.status_line_text())
             .font(theme::FONT_MONO)
             .size(11)
-            .color(theme::DIM)
+            .color(if has_error { theme::AMBER } else { theme::DIM })
             .wrapping(iced::widget::text::Wrapping::None)
             .into()
     }
@@ -1004,6 +1048,20 @@ impl App {
                 .style(theme::flat_button),
             ],
             Space::new(8.0, 8.0),
+            text("TRANSPORT")
+                .font(theme::FONT_LABEL)
+                .size(10)
+                .color(theme::DIM),
+            // Segmented control (same chip treatment as the codec row):
+            // UDP/TCP sockets, or BT = Bluetooth SPP via BlueZ. For BT the
+            // port/bind fields below are stored for display only.
+            row![
+                transport_chip("UDP", Transport::Udp, self.transport),
+                transport_chip("TCP", Transport::Tcp, self.transport),
+                transport_chip("BT", Transport::Bluetooth, self.transport),
+            ]
+            .spacing(8),
+            Space::new(4.0, 4.0),
             text("PORT")
                 .font(theme::FONT_LABEL)
                 .size(10)
@@ -1167,15 +1225,17 @@ impl App {
 // Free helpers
 // ---------------------------------------------------------------------------
 
-fn codec_chip<'a>(label: &'a str, value: CodecMode, current: CodecMode) -> Element<'a, Message> {
-    let selected = value == current;
+/// One segment of a settings segmented control (codec, transport): PANEL
+/// fill, hairline border at rest; the selected chip gets the amber accent
+/// ring and CREAM text (design.md tokens).
+fn setting_chip<'a>(label: &'a str, selected: bool, on_press: Message) -> Element<'a, Message> {
     let (fg, border) = if selected {
         (theme::CREAM, theme::AMBER)
     } else {
         (theme::DIM, theme::LINE)
     };
     button(text(label).font(theme::FONT_LABEL).size(12).color(fg))
-        .on_press(Message::CodecSelected(value))
+        .on_press(on_press)
         .style(move |_t, _s| button::Style {
             background: Some(iced::Background::Color(theme::PANEL)),
             border: iced::Border {
@@ -1187,6 +1247,18 @@ fn codec_chip<'a>(label: &'a str, value: CodecMode, current: CodecMode) -> Eleme
             ..button::Style::default()
         })
         .into()
+}
+
+fn codec_chip<'a>(label: &'a str, value: CodecMode, current: CodecMode) -> Element<'a, Message> {
+    setting_chip(label, value == current, Message::CodecSelected(value))
+}
+
+fn transport_chip<'a>(
+    label: &'a str,
+    value: Transport,
+    current: Transport,
+) -> Element<'a, Message> {
+    setting_chip(label, value == current, Message::TransportSelected(value))
 }
 
 fn engine_cmd(engine: &EngineHandle, cmd: EngineCommand) -> Task<Message> {
@@ -2222,6 +2294,101 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Transport control: the settings pane's segmented UDP/TCP/BT chips
+    // (same chip treatment as the codec row). Switching marks the form
+    // dirty, Save persists the engine's transport name and retargets the
+    // engine config; the status line renders "BT · <device> · <codec>",
+    // and a fatal engine error (e.g. BlueZ unavailable) verbatim.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transport_control_selects_and_saves_bt() {
+        let mut app = test_app(Config::default());
+        assert_eq!(app.transport, Transport::Udp);
+
+        let _ = app.update(Message::TransportSelected(Transport::Bluetooth));
+        assert_eq!(app.transport, Transport::Bluetooth);
+        assert!(app.dirty, "a transport switch marks the form dirty");
+
+        // Not applied until Save.
+        assert_eq!(app.engine_cfg.transport, Transport::Udp);
+        let _ = app.update(Message::SaveSettings);
+        assert!(!app.dirty);
+        assert_eq!(
+            app.config.transport, "bt",
+            "persisted as the engine's transport name"
+        );
+        assert_eq!(app.engine_cfg.transport, Transport::Bluetooth);
+
+        // Switch back to UDP on the same form.
+        let _ = app.update(Message::TransportSelected(Transport::Udp));
+        let _ = app.update(Message::SaveSettings);
+        assert_eq!(app.config.transport, "udp");
+        assert_eq!(app.engine_cfg.transport, Transport::Udp);
+    }
+
+    #[test]
+    fn transport_setting_round_trips_through_config() {
+        // A persisted "bt" config initialises the control on BT, the engine
+        // config with the Bluetooth transport, and the standby status line
+        // shows BT waiting for a device.
+        let app = test_app(Config {
+            transport: "bt".into(),
+            ..Config::default()
+        });
+        assert_eq!(app.transport, Transport::Bluetooth);
+        assert_eq!(app.engine_cfg.transport, Transport::Bluetooth);
+        assert_eq!(app.status_line_text(), "BT · waiting · AUTO");
+    }
+
+    #[test]
+    fn status_line_renders_bt_device_and_waiting() {
+        let mut app = test_app(Config::default());
+        // The non-BT line keeps its exact existing format.
+        assert_eq!(app.status_line_text(), "UDP · 0.0.0.0:41700 · AUTO");
+
+        app.engine_cfg.transport = Transport::Bluetooth;
+        assert_eq!(
+            app.status_line_text(),
+            "BT · waiting · AUTO",
+            "no device connected yet"
+        );
+        app.bt_device = Some("AA:BB:CC:DD:EE:FF".into());
+        assert_eq!(app.status_line_text(), "BT · AA:BB:CC:DD:EE:FF · AUTO");
+    }
+
+    #[test]
+    fn status_line_shows_engine_last_error() {
+        let mut app = test_app(Config::default());
+        app.engine_cfg.transport = Transport::Bluetooth;
+        app.last_error = Some(
+            "Bluetooth SPP setup failed (is the BlueZ daemon running \
+             and an adapter powered?): no adapter"
+                .into(),
+        );
+        let s = app.status_line_text();
+        assert!(
+            s.starts_with("Bluetooth SPP setup failed"),
+            "a fatal engine error must surface verbatim in the status line, got: {s}"
+        );
+    }
+
+    /// The settings panel lays out finite with the BT chip selected — the
+    /// transport segmented control renders for all three transports.
+    #[test]
+    fn settings_panel_renders_transport_chips_with_bt_selected() {
+        let mut app = test_app(Config {
+            transport: "bt".into(),
+            ..Config::default()
+        });
+        app.settings_open = true;
+        let node = layout(&app, 460.0, 600.0);
+        assert_finite_layout(&node);
+        let node = layout(&app, 420.0, 520.0);
+        assert_finite_layout(&node);
+    }
+
+    // -----------------------------------------------------------------------
     // Adaptive jitter depth: the CONSOLE card shows the live effective
     // target while running (with an "↑" marker when loss adaptation lifts
     // it above the configured base) and the configured base while stopped;
@@ -2320,6 +2487,10 @@ mod tests {
         "STANDBY",
         "SETTINGS",
         "×", // close button; present in all four bundled fonts (cmap audit)
+        "TRANSPORT",
+        "UDP",
+        "TCP",
+        "BT",
         "PORT",
         "41700", // port placeholder
         "Port must be 1-65535",
@@ -2339,6 +2510,8 @@ mod tests {
         "{:.0}/s",
         "{} LOST",
         "{transport} · {bind}:{port} · {codec}",
+        "BT · {device} · {codec}", // status line over Bluetooth
+        "waiting",                 // BT status line while no device is connected
     ];
 
     /// Characters verified (via cmap parsing) to exist in every bundled

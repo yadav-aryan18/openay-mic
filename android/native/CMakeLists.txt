@@ -77,6 +77,7 @@ set(OPENAY_CORE_SOURCES
   src/control.cpp
   src/udp_transport.cpp
   src/tcp_transport.cpp
+  src/fd_transport.cpp
   src/ring_buffer.cpp
   src/capture_pipeline.cpp
   src/test_source.cpp
@@ -147,6 +148,11 @@ if(OPENAY_BUILD_TESTS)
   endif()
   add_test(NAME capture COMMAND test_capture)
 
+  # Bluetooth fd-bridge: the Android BT transport is a plain fd seam (Kotlin
+  # owns the RFCOMM socket); a host socketpair/pipe exercises the whole path.
+  add_executable(test_capture_bt tests/test_capture_bt.cpp)
+  target_link_libraries(test_capture_bt PRIVATE openay_core)
+  add_test(NAME capture_bt COMMAND test_capture_bt)
   add_executable(test_control tests/test_control.cpp)
   target_link_libraries(test_control PRIVATE openay_core)
   add_test(NAME control COMMAND test_control)

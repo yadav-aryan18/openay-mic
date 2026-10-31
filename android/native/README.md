@@ -20,7 +20,7 @@ android/native/
 │   ├── protocol.h              # packet struct, encode/decode, big-endian helpers
 │   ├── stats.h                 # PacketStats, FormatStats, SeqTracker (header-only)
 │   ├── transport.h             # UdpSender/UdpReceiver/TcpClient/TcpServer/TcpConn,
-│   │                           #   BytePipe (Bluetooth RFCOMM seam, not wired yet)
+│   │                           #   BytePipe + FdBytePipe (Bluetooth RFCOMM bridge)
 │   ├── opus_codec.h            # 48 kHz mono 10 ms Opus encoder/decoder wrappers
 │   ├── audio_source.h          # IAudioSource + RT-thread callback contract
 │   ├── test_source.h           # host-only real-time 440 Hz sine source
@@ -32,6 +32,7 @@ android/native/
 │   ├── protocol.cpp
 │   ├── udp_transport.cpp       # one datagram = one packet
 │   ├── tcp_transport.cpp       # stream framing + 64 KiB bad-magic resync
+│   ├── fd_transport.cpp        # BytePipe over an owned fd (BT bridge, both directions)
 │   ├── opus_codec.cpp          # host: built when OPENAY_HAVE_OPUS (pkg-config)
 │   ├── ring_buffer.cpp
 │   ├── test_source.cpp         # sleep_until-paced sine generator
@@ -48,7 +49,8 @@ android/native/
 │   ├── test_transport.cpp      # UDP/TCP loopback, SeqTracker, malformed, resync
 │   ├── test_opus.cpp           # 440 Hz fidelity test (requires libopus)
 │   ├── test_ring.cpp           # SPSC stress + drop-whole-block/overrun tests
-│   └── test_capture.cpp        # end-to-end pipeline (PCM + Opus) + engine smoke
+│   ├── test_capture.cpp        # end-to-end pipeline (PCM + Opus) + engine smoke
+│   └── test_capture_bt.cpp     # BT fd-bridge over socketpair/pipe (no BT stack)
 └── build-host/                 # out-of-source host build (created by cmake)
 ```
 
@@ -76,13 +78,14 @@ for the next `0xA7` and resumes, else the connection is a hard failure.
    encode: PCM passthrough / Opus (48 kHz mono, RESTRICTED_LOWDELAY)
             │
             ▼  Packet{type, seq++ mod 65536, payload} → IPacketSink::Send
-   ┌────────┴─────────┐
-   ▼                  ▼
- UdpPacketSink      TcpPacketSink
- (UdpSender)        (TcpClient)
-   │                  │
-   ▼                  ▼
- UDP datagram       TCP stream (adb forward)
+   ┌────────┴───────────────┬──────────────────┐
+   ▼                        ▼                  ▼
+ UdpPacketSink         TcpPacketSink      FdPacketSink
+ (UdpSender)           (TcpClient)        (FdBytePipe over the Kotlin fd)
+   │                        │                  │
+   ▼                        ▼                  ▼
+ UDP datagram          TCP stream          RFCOMM/SPP stream
+                      (adb forward)        (pumped by BluetoothLink)
 ```
 
 Thread ownership:
@@ -107,6 +110,9 @@ close sink.
  "last_error":"","level_peak":40}
 ```
 
+For BT runs `transport` is `"bt"`, `host` is the bonded device address and
+`port` is 0.
+
 `level_peak` (Phase 5 input metering) is the peak input level of the current
 poll interval as a percent 0..100, `round(peak/32767*100)`; reading it consumes
 the peak (each poll covers exactly its own interval), so the UI's 500 ms
@@ -124,6 +130,7 @@ host they are "exclusive"/0/"".
 | Kotlin | JNI symbol | Semantics |
 |--------|-----------|-----------|
 | `nativeStart(transport, host, port, codec, frameMs): Boolean` | `Java_com_openay_mic_NativeBridge_nativeStart` | `"udp"`/`"tcp"`; `"pcm"`/`"opus"`; frameMs 5 or 10 (Opus is 10 ms only per protocol). Replaces a running stream. `false` on any configure/start error (reason in `last_error`). |
+| `nativeStartBt(fd, deviceAddress, codec, frameMs): Boolean` | `Java_com_openay_mic_NativeBridge_nativeStartBt` | `"bt"`: `fd` is the WRITE end of the Kotlin pipe (ownership passes to native on entry — closed exactly once by the engine sink; Kotlin must `detachFd()` and never close it). `deviceAddress` is display-only (StatsJson `"host"`; `"port"` is 0). |
 | `nativeStop(): Boolean` | `Java_com_openay_mic_NativeBridge_nativeStop` | Clean teardown. |
 | `nativeIsRunning(): Boolean` | `Java_com_openay_mic_NativeBridge_nativeIsRunning` | |
 | `nativeGetStats(): String` | `Java_com_openay_mic_NativeBridge_nativeGetStats` | UTF-8 JSON from `StatsJson()`. |

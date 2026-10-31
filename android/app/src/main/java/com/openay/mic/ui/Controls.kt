@@ -3,6 +3,8 @@ package com.openay.mic.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,6 +15,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -31,7 +34,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import com.openay.mic.BluetoothLink
 import com.openay.mic.logic.formatCount
 import com.openay.mic.logic.formatUptime
 import com.openay.mic.ui.theme.Amber
@@ -92,8 +95,8 @@ fun ErrorPanel(message: String, modifier: Modifier = Modifier) {
 }
 
 /**
- * TRANSPORT segmented control: WI-FI -> udp, USB -> tcp (adb), BT disabled
- * with a SOON tag — dim, not invisible.
+ * TRANSPORT segmented control: WI-FI -> udp, USB -> tcp (adb), BT -> the
+ * Bluetooth RFCOMM (SPP) link to the console.
  */
 @Composable
 fun TransportSegments(selected: String, onSelect: (String) -> Unit, modifier: Modifier = Modifier) {
@@ -105,9 +108,9 @@ fun TransportSegments(selected: String, onSelect: (String) -> Unit, modifier: Mo
             .padding(3.dp),
         horizontalArrangement = Arrangement.spacedBy(3.dp),
     ) {
-        TransportSegment("WI-FI", selected = selected == "udp", enabled = true, onClick = { onSelect("udp") }, modifier = Modifier.weight(1f))
-        TransportSegment("USB", selected = selected == "tcp", enabled = true, onClick = { onSelect("tcp") }, modifier = Modifier.weight(1f))
-        TransportSegment("BT", selected = false, enabled = false, onClick = {}, modifier = Modifier.weight(1f))
+        TransportSegment("WI-FI", selected = selected == "udp", onClick = { onSelect("udp") }, modifier = Modifier.weight(1f))
+        TransportSegment("USB", selected = selected == "tcp", onClick = { onSelect("tcp") }, modifier = Modifier.weight(1f))
+        TransportSegment("BT", selected = selected == "bt", onClick = { onSelect("bt") }, modifier = Modifier.weight(1f))
     }
 }
 
@@ -115,7 +118,6 @@ fun TransportSegments(selected: String, onSelect: (String) -> Unit, modifier: Mo
 private fun TransportSegment(
     label: String,
     selected: Boolean,
-    enabled: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -124,7 +126,7 @@ private fun TransportSegment(
             .clip(RoundedCornerShape(2.dp))
             .background(if (selected) Amber.copy(alpha = 0.10f) else Color.Transparent)
             .then(if (selected) Modifier.border(1.dp, Amber, RoundedCornerShape(2.dp)) else Modifier)
-            .clickable(enabled = enabled) { onClick() }
+            .clickable { onClick() }
             .padding(vertical = 8.dp),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
@@ -132,24 +134,97 @@ private fun TransportSegment(
         Text(
             label,
             style = MaterialTheme.typography.labelMedium,
-            color = when {
-                !enabled -> Dim.copy(alpha = 0.7f)
-                selected -> Amber
-                else -> Dim
-            },
+            color = if (selected) Amber else Dim,
         )
-        if (!enabled) {
-            Text(
-                "SOON",
-                style = OpenAyDataStyles.micro.copy(fontSize = 7.sp, lineHeight = 9.sp),
-                color = Dim.copy(alpha = 0.8f),
-                modifier = Modifier
-                    .padding(start = 5.dp)
-                    .border(1.dp, Line, RoundedCornerShape(2.dp))
-                    .padding(horizontal = 3.dp, vertical = 1.dp),
-            )
-        }
     }
+}
+
+/** BT DEVICE chip: shows the picked device (or a prompt), opens the picker. */
+@Composable
+fun BtDeviceChip(label: String, selected: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(2.dp))
+            .background(if (selected) Amber.copy(alpha = 0.10f) else Panel)
+            .border(1.dp, if (selected) Amber else Line, RoundedCornerShape(2.dp))
+            .clickable { onClick() }
+            .padding(horizontal = 14.dp, vertical = 7.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (selected) Amber else Dim,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/**
+ * BT DEVICE picker: bonded devices as rack rows (panel + hairline idiom, amber
+ * when selected); picking persists and closes. The empty state prompts pairing
+ * the console in system settings.
+ */
+@Composable
+fun BtDevicePickerDialog(
+    devices: List<BluetoothLink.BondedDevice>,
+    selectedAddress: String,
+    onSelect: (BluetoothLink.BondedDevice) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Panel,
+        titleContentColor = Dim,
+        textContentColor = Cream,
+        title = { Text("BT DEVICE", style = MaterialTheme.typography.labelSmall) },
+        text = {
+            // Scrollable: a long bonded-device list must not overflow the dialog.
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                if (devices.isEmpty()) {
+                    Text(
+                        "NO BONDED DEVICES — PAIR THE CONSOLE IN SYSTEM SETTINGS",
+                        style = OpenAyDataStyles.micro,
+                        color = Dim,
+                    )
+                }
+                devices.forEach { device ->
+                    val selected = device.address == selectedAddress
+                    Column(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(if (selected) Amber.copy(alpha = 0.10f) else Color.Transparent)
+                            .then(if (selected) Modifier.border(1.dp, Amber, RoundedCornerShape(2.dp)) else Modifier)
+                            .clickable { onSelect(device) }
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Text(
+                            device.name.ifBlank { "Unnamed device" },
+                            style = OpenAyDataStyles.small,
+                            color = if (selected) Amber else Cream,
+                        )
+                        Text(device.address, style = OpenAyDataStyles.micro, color = Dim)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Text(
+                "CANCEL",
+                style = MaterialTheme.typography.labelMedium,
+                color = Dim,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(2.dp))
+                    .clickable { onDismiss() }
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+            )
+        },
+    )
 }
 
 /** Single-select chip row (CODEC / FRAME). */

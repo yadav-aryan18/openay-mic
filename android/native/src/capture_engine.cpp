@@ -13,7 +13,12 @@ namespace openay {
 namespace {
 
 const char* TransportName(TransportType t) {
-    return t == TransportType::Udp ? "udp" : "tcp";
+    switch (t) {
+        case TransportType::Udp: return "udp";
+        case TransportType::Tcp: return "tcp";
+        case TransportType::Bt: return "bt";
+    }
+    return "unknown";
 }
 const char* CodecName(CodecType c) {
     return c == CodecType::Pcm ? "pcm" : "opus";
@@ -59,6 +64,38 @@ bool CaptureEngine::Configure(TransportType transport, const std::string& host,
     auto pipe = std::make_unique<CapturePipeline>();
     if (!pipe->Configure(src.get(), transport, host, port, codec, frame_ms)) {
         // Keep the failed pipeline around so StatsJson reports the reason.
+        pipeline_ = std::move(pipe);
+        source_ = std::move(src);
+        return false;
+    }
+    pipeline_ = std::move(pipe);
+    source_ = std::move(src);
+    return true;
+}
+
+bool CaptureEngine::ConfigureBt(int fd, const std::string& device_address,
+                                CodecType codec, int frame_ms,
+                                bool session_for_effects) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (running_) StopLocked();
+
+    // Record the attempted config first so a failed Configure still shows the
+    // intended transport/device/codec next to last_error in StatsJson. The
+    // fd is owned by the pipeline's sink from entry (closed on Stop or when
+    // a later Configure replaces this pipeline); device_address is
+    // display-only and port has no meaning over RFCOMM.
+    transport_ = TransportType::Bt;
+    host_ = device_address;
+    port_ = 0;
+    codec_ = codec;
+    frame_ms_ = frame_ms;
+    sharing_ = "exclusive";
+
+    auto src = MakeSource(session_for_effects);
+    auto pipe = std::make_unique<CapturePipeline>();
+    if (!pipe->ConfigureBt(src.get(), fd, codec, frame_ms)) {
+        // Keep the failed pipeline around so StatsJson reports the reason.
+        // The fd was consumed either way (closed by the configure attempt).
         pipeline_ = std::move(pipe);
         source_ = std::move(src);
         return false;

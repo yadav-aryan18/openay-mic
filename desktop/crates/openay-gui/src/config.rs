@@ -33,6 +33,8 @@ pub const DEFAULT_BIND: &str = "0.0.0.0";
 pub const DEFAULT_TARGET_MS: f32 = 10.0;
 /// Default output gain (unity). Applied receiver-side, after decode.
 pub const DEFAULT_GAIN: f32 = 1.0;
+/// Default transport (stored as the engine's lowercase name).
+pub const DEFAULT_TRANSPORT: &str = "udp";
 
 /// The persisted user settings. Serialized as TOML; every field has a
 /// default so a missing or partial file loads fine.
@@ -41,6 +43,9 @@ pub const DEFAULT_GAIN: f32 = 1.0;
 pub struct Config {
     pub port: u16,
     pub bind: String,
+    /// Transport as the engine's lowercase name ("udp" | "tcp" | "bt");
+    /// unknown strings fall back to UDP.
+    pub transport: String,
     pub codec: String,
     pub target_ms: f32,
     /// Output gain applied to decoded samples (1.0 = unity, clamped
@@ -65,6 +70,7 @@ impl Default for Config {
         Config {
             port: DEFAULT_PORT,
             bind: DEFAULT_BIND.to_string(),
+            transport: DEFAULT_TRANSPORT.to_string(),
             codec: "auto".to_string(),
             target_ms: DEFAULT_TARGET_MS,
             gain: DEFAULT_GAIN,
@@ -87,7 +93,21 @@ impl Config {
         }
     }
 
+    /// The config transport as the engine enum (unknown strings fall back
+    /// to UDP).
+    pub fn transport_mode(&self) -> Transport {
+        match self.transport.to_ascii_lowercase().as_str() {
+            "tcp" => Transport::Tcp,
+            "bt" => Transport::Bluetooth,
+            _ => Transport::Udp,
+        }
+    }
+
     /// The config as an engine config (bind parsed; unparseable -> 0.0.0.0).
+    /// For [`Transport::Bluetooth`] the engine's BT loop ignores bind/port
+    /// (the SPP profile registers on the default BlueZ adapter), but the
+    /// values are still stored and shown.
+    ///
     ///
     /// The output request is the platform's product surface: on Linux the
     /// PipeWire virtual microphone (audio_output stays false), on Windows
@@ -101,7 +121,7 @@ impl Config {
             .parse()
             .unwrap_or_else(|_| "0.0.0.0".parse().expect("static IP"));
         EngineConfig {
-            transport: Transport::Udp,
+            transport: self.transport_mode(),
             bind,
             port: self.port,
             codec: self.codec_mode(),
@@ -331,6 +351,10 @@ mod tests {
         let cfg = load_config(&path).unwrap();
         assert_eq!(cfg.port, 43210);
         assert_eq!(cfg.bind, DEFAULT_BIND, "missing fields keep defaults");
+        assert_eq!(
+            cfg.transport, DEFAULT_TRANSPORT,
+            "missing fields keep defaults"
+        );
         assert_eq!(cfg.codec, "auto");
         assert_eq!(cfg.target_ms, DEFAULT_TARGET_MS);
         assert!(!cfg.autostart);
@@ -344,6 +368,7 @@ mod tests {
         let cfg = Config {
             port: 41_700,
             bind: "127.0.0.1".to_string(),
+            transport: "bt".to_string(),
             codec: "opus".to_string(),
             target_ms: 15.0,
             gain: 1.5,
@@ -365,6 +390,7 @@ mod tests {
         let cfg = Config {
             port: 42_000,
             bind: "0.0.0.0".to_string(),
+            transport: "tcp".to_string(),
             codec: "pcm".to_string(),
             target_ms: 5.0,
             gain: 1.0,
@@ -404,11 +430,33 @@ mod tests {
         assert_eq!(cfg.codec_mode(), CodecMode::Auto);
     }
 
+    /// Transport string -> engine enum: the three known values
+    /// (case-insensitive) and the UDP fallback for anything else.
+    #[test]
+    fn transport_mode_mapping() {
+        for (s, expected) in [
+            ("udp", Transport::Udp),
+            ("UDP", Transport::Udp),
+            ("tcp", Transport::Tcp),
+            ("bt", Transport::Bluetooth),
+            ("BT", Transport::Bluetooth),
+            ("weird", Transport::Udp),
+            ("", Transport::Udp),
+        ] {
+            let cfg = Config {
+                transport: s.to_string(),
+                ..Config::default()
+            };
+            assert_eq!(cfg.transport_mode(), expected, "transport {s:?}");
+        }
+    }
+
     #[test]
     fn engine_config_translation() {
         let cfg = Config {
             bind: "127.0.0.1".to_string(),
             port: 12_345,
+            transport: "bt".to_string(),
             codec: "pcm".to_string(),
             target_ms: 17.0,
             ..Config::default()
@@ -416,9 +464,11 @@ mod tests {
         let e = cfg.to_engine();
         assert_eq!(e.bind, "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
         assert_eq!(e.port, 12_345);
+        assert_eq!(e.transport, Transport::Bluetooth);
         assert_eq!(e.codec, CodecMode::Pcm);
         assert_eq!(e.target_ms, 17.0);
-        assert_eq!(e.transport, Transport::Udp);
+        // Default config still maps to UDP.
+        assert_eq!(Config::default().to_engine().transport, Transport::Udp);
         // Unparseable bind falls back to 0.0.0.0.
         let cfg = Config {
             bind: "not-an-ip".to_string(),

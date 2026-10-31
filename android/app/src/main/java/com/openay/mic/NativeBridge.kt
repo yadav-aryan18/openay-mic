@@ -6,7 +6,7 @@ object NativeBridge {
     /**
      * Starts the capture engine.
      *
-     * @param transport "udp"|"tcp"
+     * @param transport "udp"|"tcp"|"bt" (bt goes through [nativeStartBt])
      * @param codec     "pcm"|"opus"
      * @param frameMs   5|10
      * @param sessionForEffects allocate an audio session id for the capture
@@ -17,6 +17,22 @@ object NativeBridge {
         transport: String,
         host: String,
         port: Int,
+        codec: String,
+        frameMs: Int,
+        sessionForEffects: Boolean
+    ): Boolean
+
+    /**
+     * transport "bt": fd is the WRITE end of a pipe Kotlin created — ownership
+     * passes to native on entry (native closes it exactly once, on stop /
+     * re-configure / teardown; Kotlin must detachFd() before the call and
+     * never close it afterwards). deviceAddress is display-only (StatsJson
+     * "host"); codec/frameMs as nativeStart. sessionForEffects as nativeStart
+     * (the BT capture stream gets the same effects handling).
+     */
+    external fun nativeStartBt(
+        fd: Int,
+        deviceAddress: String,
         codec: String,
         frameMs: Int,
         sessionForEffects: Boolean
