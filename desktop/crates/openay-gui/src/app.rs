@@ -1125,7 +1125,12 @@ impl App {
                     .color(theme::CREAM),
             ]
             .align_y(alignment::Vertical::Center),
-            slider(5.0..=20.0, self.target_ms, Message::TargetChanged).step(0.5_f32),
+            slider(
+                openay_server::MIN_PREBUFFER_MS..=openay_server::MAX_PREBUFFER_MS,
+                self.target_ms,
+                Message::TargetChanged,
+            )
+            .step(1.0_f32),
             {
                 // Live-state note: while running, show when the depth
                 // controller lifted the buffer above this setting (the
@@ -2244,7 +2249,7 @@ mod tests {
         let _ = app.update(Message::PortChanged("43210".into()));
         let _ = app.update(Message::BindSelected("127.0.0.1".into()));
         let _ = app.update(Message::CodecSelected(CodecMode::Opus));
-        let _ = app.update(Message::TargetChanged(12.5));
+        let _ = app.update(Message::TargetChanged(45.0));
         let _ = app.update(Message::AutostartToggled(true));
         let _ = app.update(Message::MotionToggled(true));
         assert!(app.dirty);
@@ -2254,7 +2259,7 @@ mod tests {
         assert_eq!(app.config.port, 43210);
         assert_eq!(app.config.bind, "127.0.0.1");
         assert_eq!(app.config.codec, "opus");
-        assert_eq!(app.config.target_ms, 12.5);
+        assert_eq!(app.config.target_ms, 45.0);
         assert!(app.config.autostart);
         assert!(app.config.reduce_motion);
         // The engine config mirrors the saved settings.
@@ -2274,8 +2279,8 @@ mod tests {
             assert_eq!(app.config.port, config::DEFAULT_PORT);
         }
 
-        // Out-of-range jitter target is clamped to the engine limits (5..=20).
-        let _ = app.update(Message::TargetChanged(100.0));
+        // Out-of-range jitter target is clamped to the engine limits.
+        let _ = app.update(Message::TargetChanged(999.0));
         let _ = app.update(Message::PortChanged("41700".into()));
         let _ = app.update(Message::SaveSettings);
         assert_eq!(app.config.target_ms, openay_server::MAX_PREBUFFER_MS);
@@ -2286,10 +2291,10 @@ mod tests {
     fn settings_apply_to_engine_config() {
         let mut app = test_app(Config::default());
         let _ = app.update(Message::CodecSelected(CodecMode::Pcm));
-        let _ = app.update(Message::TargetChanged(7.5));
+        let _ = app.update(Message::TargetChanged(45.0));
         let _ = app.update(Message::SaveSettings);
         assert_eq!(app.engine_cfg.codec, CodecMode::Pcm);
-        assert_eq!(app.engine_cfg.target_ms, 7.5);
+        assert_eq!(app.engine_cfg.target_ms, 45.0);
         assert_eq!(app.engine_cfg.transport, openay_server::Transport::Udp);
     }
 

@@ -69,18 +69,31 @@ const LINK_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 /// Maximum link-factory attempts.
 const MAX_LINK_ATTEMPTS: u32 = 10;
 
-/// Opt-in smaller graph quantum for latency tuning (Phase 6 `node.latency`
-/// evaluation). When `OPENAY_NODE_LATENCY` is set to a PipeWire fraction
-/// like `480/48000` (a bare sample count is also accepted), it is requested
-/// as the `node.latency` property on BOTH the engine stream and the
-/// null-sink driver — a quantum only shrinks if every node in the driven
-/// chain asks for it. Unset keeps the daemon default (1024/48000 ≈ 21.3 ms
-/// here, which dominates end-to-end latency).
+/// Default graph quantum request: 10 ms — one wire frame per callback. A
+/// quantum only shrinks if every node in the driven chain asks for it, so it
+/// is requested on BOTH the engine stream and the null-sink driver (the
+/// daemon default ~21 ms makes the consumer pop 2 wire frames per callback,
+/// which drained the buffer to zero slack between pops and showed up as
+/// mid-sentence dropouts). `OPENAY_NODE_LATENCY` overrides with a PipeWire
+/// fraction (`960/48000`) or a bare sample count; set it to `1024/48000` to
+/// restore the daemon-default cadence.
 ///
 /// Pure setup-time configuration: properties are passed at object creation,
 /// so the RT callback path is unaffected.
+pub const DEFAULT_NODE_LATENCY: &str = "480/48000";
+
 fn node_latency_property() -> Option<(&'static str, String)> {
-    parse_node_latency(std::env::var("OPENAY_NODE_LATENCY").ok().as_deref())
+    node_latency_for(std::env::var("OPENAY_NODE_LATENCY").ok().as_deref())
+}
+
+/// Pure decision so tests need no env mutation: an absent or blank override
+/// selects [`DEFAULT_NODE_LATENCY`], anything non-blank goes through
+/// [`parse_node_latency`].
+fn node_latency_for(raw: Option<&str>) -> Option<(&'static str, String)> {
+    match raw {
+        Some(r) if !r.trim().is_empty() => parse_node_latency(Some(r)),
+        _ => Some(("node.latency", DEFAULT_NODE_LATENCY.to_string())),
+    }
 }
 
 fn parse_node_latency(raw: Option<&str>) -> Option<(&'static str, String)> {
@@ -135,6 +148,17 @@ pub struct PwShared {
     /// strict-max CAS loop; the status reader exchanges it on read
     /// (each snapshot consumes the interval).
     pub peak_level: Arc<AtomicU32>,
+    /// Last sample emitted to the graph (f32 bits) — the hold value for
+    /// dry-quantum concealment. Written by the RT callback, read by the RT
+    /// callback (single consumer), Relaxed everywhere.
+    pub last_sample: Arc<AtomicU32>,
+    /// Consecutive fully-dry quanta while streaming. The RT callback
+    /// increments it on a dry pop and clears it the moment data flows; a
+    /// sustained run (>= [`DRY_RESET_QUANTA`]) resets the streaming latch so
+    /// the stream re-prebuffers. A brief dry blip is instead concealed
+    /// (hold + decay), which is why single blips do not count as underruns
+    /// for the depth controller.
+    pub dry_quanta: Arc<AtomicU32>,
 }
 
 /// Run the PipeWire source until `quit` is set. Blocking; call on a
@@ -379,22 +403,33 @@ fn create_link_verified(
 /// Real-time process callback: fill the PipeWire buffer from the jitter
 /// buffer. No allocation, no locking, no logging.
 ///
-/// Policy (per plan): emit silence until `available >= target_samples`, then
-/// pop as much as fits and keep streaming. The graph quantum (1024 samples
-/// @ 48 kHz ≈ 21 ms) exceeds the prebuffer target (default 10 ms), so a
-/// partial pop — zero-filling the tail of a quantum — is *normal* operation
-/// and does not stop streaming. Only a completely dry pop while streaming is
-/// an underrun: it is counted and drops the stream back to the prebuffer
-/// state so the next burst starts clean instead of crackling.
+/// Policy: emit silence until `available >= target_samples`, then pop as
+/// much as fits and keep streaming. The graph quantum (10 ms requested) may
+/// still exceed the momentary buffered amount, so a partial pop —
+/// zero-filling the tail of a quantum — is normal operation and does not
+/// stop streaming.
+///
+/// Dryness is *concealed*, not hard-cut: a fully dry pop while streaming
+/// holds the last emitted sample and decays it toward silence over
+/// consecutive dry quanta (a hard zero-cut mid-word is audible as
+/// truncation; a fast decaying hold reads as a soft dropout). Only a
+/// sustained dry run ([`DRY_RESET_QUANTA`]) counts as a real underrun:
+/// `note_underrun` fires once and the latch drops so the stream
+/// re-prebuffers with silence — continuous with the decay that preceded it.
 ///
 /// The dequeued buffer's data slice can be much larger than one quantum
 /// (the negotiated pool block may hold 16384 samples while the graph's
-/// quantum is 1024). We therefore fill at most one quantum per callback and
-/// advertise exactly that in `chunk.size`; claiming the whole slice would
-/// make the sink consume ~16 quanta per callback and stall the stream (the
-/// callback would only fire every ~16 driver cycles, draining the jitter
-/// buffer at a fraction of the production rate).
+/// quantum is smaller). We therefore fill at most one quantum per callback
+/// and advertise exactly that in `chunk.size`; claiming the whole slice
+/// would make the sink consume ~16 quanta per callback and stall the stream.
 const QUANTUM_SAMPLES: usize = 1024;
+/// Fully-dry quanta tolerated (with decaying hold) before the stream latch
+/// drops and the engine's depth controller raises the prebuffer target.
+/// At the default 10 ms quantum this is ~50 ms of concealment.
+const DRY_RESET_QUANTA: u32 = 5;
+/// Fade-in length after a dry episode, in samples (~0.7 ms) — masks the
+/// step from the decayed hold back to live signal.
+const FADE_IN_SAMPLES: usize = 32;
 
 fn process_callback(stream: &pw::stream::StreamRef, shared: &mut PwShared) {
     let Some(mut buffer) = stream.dequeue_buffer() else {
@@ -425,16 +460,50 @@ fn process_callback(stream: &pw::stream::StreamRef, shared: &mut PwShared) {
         written = shared.jitter.pop(&mut samples[..fill]);
     }
     if written < fill {
-        // Zero-fill the remainder: either still prebuffering (silence is
-        // expected) or the tail of a quantum that the jitter buffer could
-        // not fill yet (normal, the quantum exceeds the prebuffer target).
-        samples[written..fill].fill(0.0);
-        // Only a completely dry pop while streaming is a real underrun; it
-        // resets the streaming latch so the stream re-prebuffers.
+        let dry = shared.dry_quanta.load(Ordering::Relaxed);
+        let hold = f32::from_bits(shared.last_sample.load(Ordering::Relaxed));
         if written == 0 && shared.streaming.load(Ordering::Relaxed) {
-            shared.jitter.note_underrun();
-            shared.streaming.store(false, Ordering::Relaxed);
+            // Fully dry while streaming: hold the last sample, decaying by
+            // half per consecutive dry quantum, then silence.
+            let gain = 0.5f32.powi(dry.min(16) as i32);
+            let value = if hold.abs() * gain < 1e-6 { 0.0 } else { hold * gain };
+            samples[written..fill].fill(value);
+            let next = dry + 1;
+            if next >= DRY_RESET_QUANTA {
+                // Sustained dryness: count the underrun once, drop the latch,
+                // and let the re-prebuffer take over (from near-silence, so
+                // the transition is inaudible).
+                shared.jitter.note_underrun();
+                shared.streaming.store(false, Ordering::Relaxed);
+                shared.dry_quanta.store(0, Ordering::Relaxed);
+                shared.last_sample.store(0.0f32.to_bits(), Ordering::Relaxed);
+            } else {
+                shared.dry_quanta.store(next, Ordering::Relaxed);
+            }
+        } else {
+            // Prebuffering silence, or the tail of a partially-filled
+            // quantum: hold the last written sample across the tail (data
+            // is flowing; this bridge is shorter than one quantum).
+            let bridge = if written > 0 { samples[written - 1] } else { hold };
+            samples[written..fill].fill(bridge);
+            if written > 0 {
+                shared.last_sample
+                    .store(samples[written - 1].to_bits(), Ordering::Relaxed);
+            }
         }
+    } else {
+        // Data filled the quantum. After a dry episode, fade the live
+        // signal in over FADE_IN_SAMPLES to mask the step from the decayed
+        // hold; otherwise continue at unity.
+        let dry = shared.dry_quanta.swap(0, Ordering::Relaxed);
+        if dry > 0 {
+            let fade = FADE_IN_SAMPLES.min(written);
+            for (i, s) in samples[..fade].iter_mut().enumerate() {
+                *s *= i as f32 / fade as f32;
+            }
+        }
+        shared.last_sample
+            .store(samples[written - 1].to_bits(), Ordering::Relaxed);
     }
 
     // Level metering (RT-safe: no locks, no allocation, no logging). Fold
@@ -469,10 +538,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn node_latency_unset_or_empty_is_none() {
-        assert_eq!(parse_node_latency(None), None);
-        assert_eq!(parse_node_latency(Some("")), None);
-        assert_eq!(parse_node_latency(Some("   ")), None);
+    fn node_latency_unset_or_empty_uses_default() {
+        let default = Some(("node.latency", DEFAULT_NODE_LATENCY.to_string()));
+        assert_eq!(node_latency_for(None), default, "unset env: 10 ms default");
+        assert_eq!(node_latency_for(Some("")), default, "blank env: 10 ms default");
+        assert_eq!(node_latency_for(Some("  ")), default, "blank env: 10 ms default");
+    }
+
+    #[test]
+    fn node_latency_env_overrides_the_default() {
+        assert_eq!(
+            node_latency_for(Some("960/48000")),
+            Some(("node.latency", "960/48000".to_string()))
+        );
+        assert_eq!(
+            node_latency_for(Some(" 1024 / 48000 ")),
+            Some(("node.latency", "1024/48000".to_string()))
+        );
     }
 
     #[test]

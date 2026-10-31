@@ -12,7 +12,6 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioManager
 import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.NoiseSuppressor
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -71,7 +70,6 @@ class MicCaptureService : Service() {
     // Voice processing effects bound to the native capture session; created
     // per session, released on stop.
     private var echoCanceler: AcousticEchoCanceler? = null
-    private var noiseSuppressor: NoiseSuppressor? = null
     // Held while UDP capture runs; keeps the Wi-Fi radio at high perf.
     private var wifiLock: WifiManager.WifiLock? = null
     // Call/communication mode watcher that drives the native mute flag.
@@ -292,9 +290,11 @@ class MicCaptureService : Service() {
     }
 
     /**
-     * Attaches platform echo cancellation / noise suppression to the native
-     * capture session. Best effort per effect: an unavailable or refused
-     * effect is logged and skipped (the stream runs unprocessed).
+     * Attaches platform echo cancellation to the native capture session (the
+     * noise-cleanup and level-normalization stage of voice FX runs in the
+     * native pipeline instead — the platform noise suppressor is a black box
+     * that ducks word tails on several devices). Best effort: an unavailable
+     * or refused effect is logged and skipped.
      */
     private fun attachVoiceEffects() {
         val sessionId = try {
@@ -311,13 +311,6 @@ class MicCaptureService : Service() {
                 if (!aec.enabled) aec.enabled = true
                 echoCanceler = aec
                 Log.i(TAG, "acoustic echo cancellation enabled (session $sessionId)")
-            }
-        }
-        if (NoiseSuppressor.isAvailable()) {
-            NoiseSuppressor.create(sessionId)?.let { ns ->
-                if (!ns.enabled) ns.enabled = true
-                noiseSuppressor = ns
-                Log.i(TAG, "noise suppressor enabled (session $sessionId)")
             }
         }
     }
@@ -413,9 +406,6 @@ class MicCaptureService : Service() {
         echoCanceler?.let { if (it.enabled) it.enabled = false }
         echoCanceler?.release()
         echoCanceler = null
-        noiseSuppressor?.let { if (it.enabled) it.enabled = false }
-        noiseSuppressor?.release()
-        noiseSuppressor = null
     }
 
     /** Refreshes the notification with sent-packets / ring overruns / xruns. */

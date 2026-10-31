@@ -59,7 +59,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use openay_jitter::{DepthController, DepthParams, JitterBuffer, RealClock};
+use openay_jitter::{DepthController, DepthParams, JitterBuffer, RealClock, TARGET_PREBUFFER_MS};
 use openay_protocol::control::{control_payload, parse_control, ControlMsg};
 use openay_protocol::{encode, Packet, PayloadType};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -346,7 +346,7 @@ impl Default for EngineConfig {
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: 41_700,
             codec: CodecMode::Auto,
-            target_ms: 10.0,
+            target_ms: TARGET_PREBUFFER_MS,
             capacity_ms: DEFAULT_CAPACITY_MS,
             audio_output: false,
             output_device: None,
@@ -1100,6 +1100,8 @@ async fn start_pipeline(config: EngineConfig, state: &Arc<EngineState>) -> Resul
                 quit: quit.clone(),
                 target_samples: state.effective_target.clone(),
                 peak_level: state.peak.clone(),
+                last_sample: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                dry_quanta: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             };
             let thread = std::thread::Builder::new()
                 .name("openay-pipewire".into())
@@ -2205,7 +2207,7 @@ mod tests {
     fn validated_clamps_target_ms() {
         for (input, expected) in [
             (3.0, MIN_PREBUFFER_MS),
-            (10.0, 10.0),
+            (45.0, 45.0),
             (500.0, MAX_PREBUFFER_MS),
             (-1.0, MIN_PREBUFFER_MS),
         ] {
@@ -2235,7 +2237,7 @@ mod tests {
             port: 4321,
             codec: CodecMode::Pcm,
             monitor: false,
-            target_ms: 17.0,
+            target_ms: 45.0,
             capacity_ms: 200.0,
             audio_output: false,
             output_device: Some("cable".to_string()),
@@ -2246,7 +2248,7 @@ mod tests {
         assert_eq!(v.bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(v.port, 4321);
         assert_eq!(v.codec, CodecMode::Pcm);
-        assert_eq!(v.target_ms, 17.0);
+        assert_eq!(v.target_ms, 45.0);
         assert_eq!(v.capacity_ms, 200.0);
         assert_eq!(v.gain, 2.0, "gain passes through validation");
         #[cfg(feature = "audio-output")]
@@ -2301,7 +2303,7 @@ mod tests {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 41_700,
             codec: CodecMode::Auto,
-            target_ms: 10.0,
+            target_ms: 40.0,
             capacity_ms: 100.0,
             audio_output: false,
             output_device: None,
@@ -2329,7 +2331,7 @@ mod tests {
         assert_eq!(cfg.bind, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(cfg.port, 41_700);
         assert_eq!(cfg.codec, CodecMode::Auto);
-        assert_eq!(cfg.target_ms, 10.0);
+        assert_eq!(cfg.target_ms, TARGET_PREBUFFER_MS);
         assert_eq!(cfg.capacity_ms, 100.0);
         #[cfg(feature = "audio-output")]
         {
@@ -2377,13 +2379,13 @@ mod tests {
     #[test]
     fn status_reports_config_target_as_effective_while_stopped() {
         let cfg = EngineConfig {
-            target_ms: 17.0,
+            target_ms: 45.0,
             ..EngineConfig::default()
         };
         let handle = spawn_engine(Some(cfg));
         let s = handle.status();
         assert!(!s.running);
-        assert_eq!(s.effective_target_ms, 17.0);
+        assert_eq!(s.effective_target_ms, 45.0);
     }
 
     /// The per-run reset: a new `Start` seeds the live target with the
@@ -2395,7 +2397,7 @@ mod tests {
         let cfg = || EngineConfig {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 41_701,
-            target_ms: 12.0,
+            target_ms: 45.0,
             ..EngineConfig::default()
         };
         let handle = spawn_engine(Some(cfg()));
@@ -2420,8 +2422,8 @@ mod tests {
         let s = handle.status();
         assert!(s.running);
         assert!(
-            (s.effective_target_ms - 12.0).abs() < 0.01,
-            "fresh run targets the configured 12 ms, got {}",
+            (s.effective_target_ms - 45.0).abs() < 0.01,
+            "fresh run targets the configured 45 ms, got {}",
             s.effective_target_ms
         );
         rt.block_on(async {

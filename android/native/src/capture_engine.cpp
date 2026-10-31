@@ -68,6 +68,10 @@ bool CaptureEngine::Configure(TransportType transport, const std::string& host,
         source_ = std::move(src);
         return false;
     }
+    // The app's voice-FX toggle: the cleanup/level stage runs in the native
+    // pipeline (the platform effects attached by the service are limited to
+    // echo cancellation).
+    pipe->SetVoiceFx(session_for_effects);
     pipeline_ = std::move(pipe);
     source_ = std::move(src);
     return true;
@@ -100,6 +104,7 @@ bool CaptureEngine::ConfigureBt(int fd, const std::string& device_address,
         source_ = std::move(src);
         return false;
     }
+    pipe->SetVoiceFx(session_for_effects);
     pipeline_ = std::move(pipe);
     source_ = std::move(src);
     return true;

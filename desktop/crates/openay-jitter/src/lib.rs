@@ -36,12 +36,17 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub use depth::{Clock, DepthController, DepthParams, RealClock};
 
-/// Nominal target prebuffer in milliseconds (plan: 5–15 ms window).
-pub const TARGET_PREBUFFER_MS: f32 = 10.0;
+/// Nominal target prebuffer in milliseconds. 40 ms keeps real slack above
+/// the graph quantum and typical Wi-Fi/RFCOMM jitter spikes, so the consumer
+/// does not run dry between quanta (a dry consumer meant silence gaps
+/// mid-sentence — the buffer needs steady-state depth, not just a start
+/// gate).
+pub const TARGET_PREBUFFER_MS: f32 = 40.0;
 /// Minimum prebuffer in milliseconds.
-pub const MIN_PREBUFFER_MS: f32 = 5.0;
-/// Maximum prebuffer in milliseconds (Phase 6 may raise this ceiling).
-pub const MAX_PREBUFFER_MS: f32 = 20.0;
+pub const MIN_PREBUFFER_MS: f32 = 20.0;
+/// Maximum prebuffer in milliseconds (adaptive ceiling: underruns raise the
+/// live target toward this, sustained clean streaming decays it back).
+pub const MAX_PREBUFFER_MS: f32 = 150.0;
 
 /// Smallest power of two not smaller than `x`, clamped to at least 1024.
 fn next_pow2(x: usize) -> usize {

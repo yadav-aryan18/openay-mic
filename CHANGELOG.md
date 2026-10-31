@@ -7,7 +7,30 @@ carry features).
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-10-31
+
 ### Fixed
+- **Desktop (virtual mic)**: mid-sentence dropouts on Wi-Fi and Bluetooth,
+  worst in third-party apps. The PipeWire consumer ran with effectively zero
+  steady-state slack (the graph quantum exceeded the 10-20 ms prebuffer
+  range), so a single dry callback silenced the stream until it re-prebuffered.
+  The prebuffer now starts at 40 ms (adaptive to 150 ms, +10 ms per underrun,
+  -2 ms per 30 s clean window), the engine requests a 10 ms graph quantum by
+  default (one wire frame per callback; `OPENAY_NODE_LATENCY` still overrides),
+  and dry callbacks are concealed — the last sample is held with a fast decay
+  and a short fade-in on recovery — instead of hard-cutting to zero. Only a
+  sustained dry run (~50 ms) now counts as an underrun and re-prebuffers.
+- **Phone (voice FX)**: the platform noise suppressor (an untunable black box
+  on many devices) ducked word tails and distant speech hard enough to read
+  as truncation. Voice FX now runs our own bounded cleanup in the native
+  pipeline before encoding: a noise-floor gate that holds ~80 ms of quiet
+  before ducking, never attenuates more than ~14 dB, and reopens fast enough
+  that word onsets are not swallowed. Platform echo cancellation is unchanged.
+- **Phone (loudness)**: added always-on capture-side level normalization —
+  speech is pulled toward -20 dBFS RMS (up to ~+21 dB for a desk-distant
+  phone, down for close talk), frozen while the gate is closed, with a
+  per-frame peak limiter. Unity receiver gain is now audible without holding
+  the phone near the mouth.
 - **Android GUI**: fixed misalignment and disparate sizing of Chain stage cards
   (MIC, LINK, CONSOLE). Cards now share an equal-height body footprint
   (`STAGE_BODY_HEIGHT = 56.dp`) and `IntrinsicSize.Max` row constraints with

@@ -51,8 +51,8 @@ const SHRUNK_PARAMS: DepthParams = DepthParams {
     decay_step_ms: 1.0,
 };
 
-/// Base (configured) depth for the scenarios, within the 5..=20 clamp.
-const BASE_MS: f32 = 10.0;
+/// Base (configured) depth for the scenarios, within the 20..=150 clamp.
+const BASE_MS: f32 = 30.0;
 /// Samples per 10 ms frame at 48 kHz — the phone's frame size.
 const FRAME_SAMPLES: usize = 480;
 /// Producer pacing: ~100 pkt/s.

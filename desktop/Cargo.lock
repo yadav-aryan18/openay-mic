@@ -3054,14 +3054,14 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openay-codec"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "audiopus",
 ]
 
 [[package]]
 name = "openay-gui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -3080,11 +3080,11 @@ dependencies = [
 
 [[package]]
 name = "openay-jitter"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "openay-loopback"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "openay-protocol",
@@ -3094,7 +3094,7 @@ dependencies = [
 
 [[package]]
 name = "openay-protocol"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3102,7 +3102,7 @@ dependencies = [
 
 [[package]]
 name = "openay-proxy"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap 4.6.6",
@@ -3111,7 +3111,7 @@ dependencies = [
 
 [[package]]
 name = "openay-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap 4.6.6",
@@ -3127,7 +3127,7 @@ dependencies = [
 
 [[package]]
 name = "openay-transport"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bluer",
  "futures-core",

@@ -79,6 +79,7 @@ set(OPENAY_CORE_SOURCES
   src/tcp_transport.cpp
   src/fd_transport.cpp
   src/ring_buffer.cpp
+  src/voice_cleaner.cpp
   src/capture_pipeline.cpp
   src/test_source.cpp
   src/capture_engine.cpp
@@ -140,6 +141,10 @@ if(OPENAY_BUILD_TESTS)
   add_executable(test_ring tests/test_ring.cpp)
   target_link_libraries(test_ring PRIVATE openay_core)
   add_test(NAME ring COMMAND test_ring)
+
+  add_executable(test_voice_cleaner tests/test_voice_cleaner.cpp)
+  target_link_libraries(test_voice_cleaner PRIVATE openay_core)
+  add_test(NAME voice_cleaner COMMAND test_voice_cleaner)
 
   add_executable(test_capture tests/test_capture.cpp)
   target_link_libraries(test_capture PRIVATE openay_core)

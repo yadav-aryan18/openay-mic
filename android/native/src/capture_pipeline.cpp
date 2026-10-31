@@ -256,6 +256,9 @@ bool CapturePipeline::ConfigureTail(IAudioSource* source,
     scratch_.resize(frame_bytes_);
     pcm_bytes_.resize(frame_bytes_);
     pcm_samples_.resize(frame_samples_);
+    // Voice FX geometry follows the frame size; the enable flag survives a
+    // re-Configure (SetVoiceFx is an engine-level setting).
+    cleaner_.Reset(frame_samples_);
 
     sink_ = std::move(sink);
     if (!sink_->Valid()) {
@@ -488,13 +491,21 @@ bool CapturePipeline::ProcessFrame(uint16_t* seq, Packet* pkt) {
     if (ring_->Pop(pcm_bytes_.data(), frame_bytes_) != frame_bytes_) {
         return false;  // unreachable given the Available() gate
     }
+    // little-endian bytes -> native int16 samples: both the voice FX stage
+    // and the Opus encoder work on native samples, so unpack unconditionally
+    // (the wire payload is re-packed from the samples below for PCM).
+    for (size_t i = 0; i < frame_samples_; ++i) {
+        pcm_samples_[i] = static_cast<int16_t>(
+            static_cast<uint16_t>(pcm_bytes_[2 * i]) |
+            (static_cast<uint16_t>(pcm_bytes_[2 * i + 1]) << 8));
+    }
+    // Voice FX (our own gate + AGC, see voice_cleaner.h) — applied before
+    // encoding so every transport and codec carries the cleaned, normalized
+    // signal.
+    if (voice_fx_) {
+        cleaner_.Process(pcm_samples_.data(), frame_samples_);
+    }
     if (codec_ == CodecType::Opus) {
-        // little-endian bytes -> native int16 samples for the encoder.
-        for (size_t i = 0; i < frame_samples_; ++i) {
-            pcm_samples_[i] = static_cast<int16_t>(
-                static_cast<uint16_t>(pcm_bytes_[2 * i]) |
-                (static_cast<uint16_t>(pcm_bytes_[2 * i + 1]) << 8));
-        }
         if (!opus_enc_->Encode(pcm_samples_.data(), &pkt->payload)) {
             encode_errors_.fetch_add(1, std::memory_order_relaxed);
             last_error_.store(static_cast<int>(PipelineError::Encode),
@@ -502,7 +513,13 @@ bool CapturePipeline::ProcessFrame(uint16_t* seq, Packet* pkt) {
             return false;
         }
     } else {
-        pkt->payload.assign(pcm_bytes_.begin(), pcm_bytes_.end());
+        // Native samples -> little-endian wire bytes (post voice FX).
+        pkt->payload.resize(frame_bytes_);
+        for (size_t i = 0; i < frame_samples_; ++i) {
+            const uint16_t v = static_cast<uint16_t>(pcm_samples_[i]);
+            pkt->payload[2 * i] = static_cast<uint8_t>(v & 0xFF);
+            pkt->payload[2 * i + 1] = static_cast<uint8_t>(v >> 8);
+        }
     }
     pkt->seq = *seq;
     ++*seq;  // uint16 wraps modulo 65536 per protocol

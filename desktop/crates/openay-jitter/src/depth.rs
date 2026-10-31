@@ -2,9 +2,9 @@
 //!
 //! The engine's prebuffer target is adaptive, per the plan's xrun policy:
 //! an underrun (the buffer ran dry while streaming) raises the target by
-//! [`DepthParams::rise_ms`] (2 ms) toward [`MAX_PREBUFFER_MS`] (20 ms), and
-//! every fully elapsed [`DepthParams::decay_window`] (60 s) of streaming
-//! without an underrun lowers it by [`DepthParams::decay_step_ms`] (1 ms)
+//! [`DepthParams::rise_ms`] (10 ms) toward [`MAX_PREBUFFER_MS`] (150 ms), and
+//! every fully elapsed [`DepthParams::decay_window`] (30 s) of streaming
+//! without an underrun lowers it by [`DepthParams::decay_step_ms`] (2 ms)
 //! back toward the configured base depth — the user setting, which is both
 //! the decay floor and the initial value.
 //!
@@ -82,9 +82,9 @@ pub struct DepthParams {
 impl Default for DepthParams {
     fn default() -> Self {
         DepthParams {
-            rise_ms: 2.0,
-            decay_window: Duration::from_secs(60),
-            decay_step_ms: 1.0,
+            rise_ms: 10.0,
+            decay_window: Duration::from_secs(30),
+            decay_step_ms: 2.0,
         }
     }
 }
@@ -130,14 +130,15 @@ impl DepthParams {
 /// use openay_jitter::{DepthController, DepthParams};
 /// use std::time::Duration;
 ///
-/// let mut c = DepthController::new(10.0);
+/// let mut c = DepthController::new(45.0);
 /// c.on_underrun();
-/// assert_eq!(c.target_ms(), 12.0, "one underrun raises by the default 2 ms");
+/// assert_eq!(c.target_ms(), 55.0, "one underrun raises by the default 10 ms");
 ///
-/// // Shrink the window for tests: one full 100 ms clean window earns −1 ms.
+/// // Shrink the window and the rise for tests: one full 100 ms clean window
+/// // earns −1 ms.
 /// let mut c = DepthController::with_params(
 ///     openay_jitter::RealClock,
-///     10.0,
+///     45.0,
 ///     DepthParams { rise_ms: 2.0, decay_window: Duration::from_millis(100),
 ///                   decay_step_ms: 1.0, ..DepthParams::default() },
 /// );
@@ -274,7 +275,17 @@ mod tests {
 
     fn controller_60s(base: f32) -> (FakeClock, DepthController<FakeClock>) {
         let clock = FakeClock::new();
-        let c = DepthController::with_params(clock.clone(), base, DepthParams::default());
+        // Explicit params (not `default`) so the arithmetic assertions below
+        // stay valid regardless of production tuning.
+        let c = DepthController::with_params(
+            clock.clone(),
+            base,
+            DepthParams {
+                rise_ms: 2.0,
+                decay_window: Duration::from_secs(60),
+                decay_step_ms: 1.0,
+            },
+        );
         (clock, c)
     }
 
@@ -301,14 +312,14 @@ mod tests {
         let clock = FakeClock::new();
         let mut c = DepthController::with_params(
             clock.clone(),
-            5.0, // the decay floor
+            25.0, // the decay floor
             DepthParams {
                 rise_ms: 2.0,
                 decay_window: Duration::from_nanos(1),
                 decay_step_ms: 1.0,
             },
         );
-        c.on_underrun(); // raise to 7 ms and arm the window at t=0
+        c.on_underrun(); // raise to 27 ms and arm the window at t=0
         clock.advance(Duration::from_millis(200));
         let t0 = std::time::Instant::now();
         let target = c.on_tick(true);
@@ -319,7 +330,7 @@ mod tests {
             "sub-ms window must not spin the decay loop"
         );
         assert_eq!(
-            target, 5.0,
+            target, 25.0,
             "200 bounded steps of 1 ms decay floor out at the base"
         );
     }
@@ -333,7 +344,7 @@ mod tests {
         c.on_underrun();
         assert_eq!(c.target_ms(), TARGET_PREBUFFER_MS + 2.0);
         // Decay floors at the recovered base instead of sinking unbounded:
-        // 120 windows x 1 ms step = 120 ms of decay from 12 ms -> the base.
+        // 120 s at a 60 s window = 2 steps of decay -> the base.
         c.on_tick(true); // arm the post-underrun window
         clock.advance(Duration::from_secs(120));
         assert_eq!(c.on_tick(true), TARGET_PREBUFFER_MS);
@@ -341,26 +352,30 @@ mod tests {
 
     #[test]
     fn starts_at_base_and_underrun_raises_by_rise() {
-        let (_clock, mut c) = controller_60s(10.0);
-        assert_eq!(c.target_ms(), 10.0, "initial target is the base");
+        let (_clock, mut c) = controller_60s(25.0);
+        assert_eq!(c.target_ms(), 25.0, "initial target is the base");
         c.on_underrun();
-        assert_eq!(c.target_ms(), 12.0, "+2 ms per underrun by default");
+        assert_eq!(c.target_ms(), 27.0, "+2 ms per underrun");
         c.on_underrun();
-        assert_eq!(c.target_ms(), 14.0);
+        assert_eq!(c.target_ms(), 29.0);
     }
 
     #[test]
     fn underrun_clamps_at_ceiling() {
-        let (_clock, mut c) = controller_60s(19.0);
+        let (_clock, mut c) = controller_60s(MAX_PREBUFFER_MS - 1.0);
         c.on_underrun();
-        assert_eq!(c.target_ms(), 20.0, "19 + 2 clamps to the 20 ms ceiling");
+        assert_eq!(
+            c.target_ms(),
+            MAX_PREBUFFER_MS,
+            "ceiling clamps the rise"
+        );
         c.on_underrun();
-        assert_eq!(c.target_ms(), 20.0, "ceiling holds");
+        assert_eq!(c.target_ms(), MAX_PREBUFFER_MS, "ceiling holds");
     }
 
     #[test]
     fn base_is_clamped_into_range() {
-        let (_clock, c) = controller_60s(50.0);
+        let (_clock, c) = controller_60s(MAX_PREBUFFER_MS + 10.0);
         assert_eq!(c.base_ms(), MAX_PREBUFFER_MS);
         assert_eq!(c.target_ms(), MAX_PREBUFFER_MS);
         let (_clock, c) = controller_60s(0.5);
@@ -370,97 +385,97 @@ mod tests {
 
     #[test]
     fn no_decay_before_window_elapses() {
-        let (clock, mut c) = controller_60s(10.0);
-        c.on_underrun(); // raise to 12 and arm the window at t=0
-        assert_eq!(c.on_tick(true), 12.0, "first tick just arms the window");
+        let (clock, mut c) = controller_60s(25.0);
+        c.on_underrun(); // raise to 27 and arm the window at t=0
+        assert_eq!(c.on_tick(true), 27.0, "first tick just arms the window");
         clock.advance(Duration::from_secs(59));
-        assert_eq!(c.on_tick(true), 12.0, "59 s < 60 s window: no decay yet");
+        assert_eq!(c.on_tick(true), 27.0, "59 s < 60 s window: no decay yet");
         clock.advance(Duration::from_secs(1));
-        assert_eq!(c.on_tick(true), 11.0, "the 60th second completes the window");
+        assert_eq!(c.on_tick(true), 26.0, "the 60th second completes the window");
     }
 
     #[test]
     fn exact_one_step_per_fully_elapsed_window() {
-        let (clock, mut c) = controller_60s(10.0);
+        let (clock, mut c) = controller_60s(25.0);
         for _ in 0..3 {
-            c.on_underrun(); // target 16, window start t=0
+            c.on_underrun(); // target 31, window start t=0
         }
-        assert_eq!(c.target_ms(), 16.0);
+        assert_eq!(c.target_ms(), 31.0);
         clock.advance(Duration::from_secs(60));
-        assert_eq!(c.on_tick(true), 15.0, "first clean window: −1");
+        assert_eq!(c.on_tick(true), 30.0, "first clean window: −1");
         clock.advance(Duration::from_secs(60));
-        assert_eq!(c.on_tick(true), 14.0, "second consecutive clean window: −1 again");
+        assert_eq!(c.on_tick(true), 29.0, "second consecutive clean window: −1 again");
         // A long tick spanning several windows earns one step per window.
         clock.advance(Duration::from_secs(180));
-        assert_eq!(c.on_tick(true), 11.0, "3 more windows → exact −1 each");
+        assert_eq!(c.on_tick(true), 26.0, "3 more windows → exact −1 each");
         clock.advance(Duration::from_secs(360));
-        assert_eq!(c.on_tick(true), 10.0, "floor holds at the base, never below");
+        assert_eq!(c.on_tick(true), 25.0, "floor holds at the base, never below");
     }
 
     #[test]
     fn decay_never_goes_below_base_floor() {
-        let (clock, mut c) = controller_100ms(7.0);
+        let (clock, mut c) = controller_100ms(25.0);
         c.on_underrun();
         c.on_underrun();
-        assert_eq!(c.target_ms(), 11.0, "raised above the base");
+        assert_eq!(c.target_ms(), 29.0, "raised above the base");
         for _ in 0..50 {
             clock.advance(Duration::from_millis(100));
             c.on_tick(true);
         }
-        assert_eq!(c.target_ms(), 7.0, "decay floors at the configured base");
+        assert_eq!(c.target_ms(), 25.0, "decay floors at the configured base");
     }
 
     #[test]
     fn underrun_mid_window_resets_the_streak() {
-        let (clock, mut c) = controller_100ms(10.0);
+        let (clock, mut c) = controller_100ms(25.0);
         c.on_tick(true); // arm at t=0
         clock.advance(Duration::from_millis(30));
         c.on_underrun(); // t=30: +2 and the window restarts at t=30
-        assert_eq!(c.target_ms(), 12.0);
+        assert_eq!(c.target_ms(), 27.0);
         clock.advance(Duration::from_millis(30));
         // t=60: only 30 ms elapsed since the underrun.
-        assert_eq!(c.on_tick(true), 12.0, "streak starts after the underrun, not before");
+        assert_eq!(c.on_tick(true), 27.0, "streak starts after the underrun, not before");
         clock.advance(Duration::from_millis(70));
         // t=130: a full 100 ms window elapsed since t=30.
-        assert_eq!(c.on_tick(true), 11.0, "decay resumes one window after the underrun");
+        assert_eq!(c.on_tick(true), 26.0, "decay resumes one window after the underrun");
     }
 
     #[test]
     fn tick_reports_effective_target() {
-        let (_clock, mut c) = controller_60s(10.0);
-        assert_eq!(c.on_tick(true), 10.0);
+        let (_clock, mut c) = controller_60s(25.0);
+        assert_eq!(c.on_tick(true), 25.0);
         c.on_underrun();
-        assert_eq!(c.on_tick(true), 12.0, "on_tick returns the live target");
-        assert_eq!(c.target_ms(), 12.0, "getter agrees");
+        assert_eq!(c.on_tick(true), 27.0, "on_tick returns the live target");
+        assert_eq!(c.target_ms(), 27.0, "getter agrees");
     }
 
     #[test]
     fn inert_while_stopped() {
-        let (clock, mut c) = controller_60s(10.0);
+        let (clock, mut c) = controller_60s(25.0);
         c.on_underrun();
-        assert_eq!(c.target_ms(), 12.0);
+        assert_eq!(c.target_ms(), 27.0);
         // A long stop changes nothing and discards the window.
         clock.advance(Duration::from_secs(60_000));
-        assert_eq!(c.on_tick(false), 12.0, "stopped: no decay");
-        assert_eq!(c.target_ms(), 12.0);
+        assert_eq!(c.on_tick(false), 27.0, "stopped: no decay");
+        assert_eq!(c.target_ms(), 27.0);
     }
 
     #[test]
     fn accrual_restarts_after_restart() {
-        let (clock, mut c) = controller_60s(10.0);
-        c.on_underrun(); // target 12, window armed at t=0
+        let (clock, mut c) = controller_60s(25.0);
+        c.on_underrun(); // target 27, window armed at t=0
         c.on_tick(true);
         clock.advance(Duration::from_secs(30));
-        assert_eq!(c.on_tick(true), 12.0, "30 s < 60 s window: no decay");
+        assert_eq!(c.on_tick(true), 27.0, "30 s < 60 s window: no decay");
         // Stop: the partial 30 s window is discarded; stop time never counts.
         clock.advance(Duration::from_secs(50));
         c.on_tick(false);
         clock.advance(Duration::from_secs(61));
-        assert_eq!(c.on_tick(false), 12.0, "stop time never accrues");
+        assert_eq!(c.on_tick(false), 27.0, "stop time never accrues");
         // Restart: the window is re-armed at the first running tick; only a
         // full clean window after that decays.
-        assert_eq!(c.on_tick(true), 12.0, "restart arms a fresh window at t=141");
+        assert_eq!(c.on_tick(true), 27.0, "restart arms a fresh window at t=141");
         clock.advance(Duration::from_secs(60));
-        assert_eq!(c.on_tick(true), 11.0, "accrual resumes after the restart");
+        assert_eq!(c.on_tick(true), 26.0, "accrual resumes after the restart");
     }
 }

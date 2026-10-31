@@ -29,8 +29,10 @@ pub const CONFIG_DIR: &str = "openay-mic";
 pub const DEFAULT_PORT: u16 = 41_700;
 /// Default bind address: all interfaces.
 pub const DEFAULT_BIND: &str = "0.0.0.0";
-/// Default jitter target in ms (design.md chain: `10.0 ms`).
-pub const DEFAULT_TARGET_MS: f32 = 10.0;
+/// Default jitter target in ms. 40 ms keeps steady-state slack above the
+/// graph quantum and typical Wi-Fi/RFCOMM jitter (a dry consumer showed up
+/// as mid-sentence dropouts); the engine adapts it live from here.
+pub const DEFAULT_TARGET_MS: f32 = 40.0;
 /// Default output gain (unity). Applied receiver-side, after decode.
 pub const DEFAULT_GAIN: f32 = 1.0;
 /// Default transport (stored as the engine's lowercase name).

@@ -44,6 +44,7 @@
 #include "openay/control.h"
 #include "openay/protocol.h"
 #include "openay/ring_buffer.h"
+#include "openay/voice_cleaner.h"
 
 namespace openay {
 
@@ -194,6 +195,14 @@ public:
     }
     bool IsMuted() const { return muted_.load(std::memory_order_relaxed); }
 
+    // Voice FX (our own gate + AGC stage in the capture path) — call once
+    // after Configure/ConfigureBt with the app's voice-FX toggle. Off by
+    // default; toggling mid-run is allowed and resumes adaptation state.
+    void SetVoiceFx(bool on) {
+        voice_fx_ = on;
+        cleaner_.set_enabled(on);
+    }
+
     // Input level peak since the last call (max absolute sample, 0..32767);
     // atomically consumed AND reset, so each call covers exactly its own
     // interval (one UI poll period). RT-thread safe; no effect on the stream.
@@ -263,6 +272,11 @@ private:
     // Digital-silence switch (call auto-mute): set from the control thread,
     // read on the RT thread. Muted capture still streams, keeping timing.
     std::atomic<bool> muted_{false};
+
+    // Voice FX stage (network thread only, pre-encode). armed via SetVoiceFx;
+    // geometry is reset in ConfigureTail once frame_samples_ is known.
+    VoiceCleaner cleaner_;
+    bool voice_fx_ = false;
 
     // Input level meter: max |sample| seen since the last ExchangeLevelPeak(),
     // 0..32767 (INT16_MIN clamps to 32767). Written on the RT thread with a
