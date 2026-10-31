@@ -308,6 +308,92 @@ if [ "$EXE_OK" -eq 0 ]; then
   check "copy openay-log.ps1 -> dist/openay-windows/" 0
 fi
 
+# --- Bundled adb (USB transport) -------------------------------------------
+# dist/openay-windows/adb/ carries adb.exe (+ its two DLLs) so USB forwarding
+# works without a separate Android SDK install. Android platform-tools are
+# Apache-2.0 licensed; the license text and NOTICE are staged next to the
+# binaries (see adb/LICENSE-2.0.txt / adb/NOTICE.txt). Best effort: prefers
+# the local SDK ($ANDROID_HOME/platform-tools) and otherwise downloads the
+# official zip; a missing bundle only warns (USB users can still point at
+# their own adb install).
+ADB_DIR="$DIST/adb"
+ADB_FILES="adb.exe AdbWinApi.dll AdbWinUsbApi.dll"
+ADB_OK=0  # rc-style like the rest of the script: 0 = bundled, 1 = missing
+
+stage_adb_from() { # <source dir>
+  local src="$1" f
+  [ -d "$src" ] || return 1
+  for f in $ADB_FILES; do
+    [ -f "$src/$f" ] || return 1
+  done
+  mkdir -p "$ADB_DIR"
+  for f in $ADB_FILES; do
+    cp -f "$src/$f" "$ADB_DIR/$f"
+  done
+  return 0
+}
+
+if [ "$EXE_OK" -ne 0 ]; then
+  echo "skip: adb bundle (no openay-server.exe staged)"
+elif stage_adb_from "${ANDROID_HOME:-}/platform-tools"; then
+  echo "adb: staged from the local SDK ($ANDROID_HOME/platform-tools)"
+elif stage_adb_from "$HOME/Android/Sdk/platform-tools"; then
+  echo "adb: staged from the local SDK (~/Android/Sdk/platform-tools)"
+else
+  echo "adb: not in the local SDK — downloading platform-tools (windows)..."
+  ADB_TMP="$(mktemp -d)"
+  ADB_ZIP="$ADB_TMP/platform-tools.zip"
+  if curl -fsSL -o "$ADB_ZIP" "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" \
+     && python3 - "$ADB_ZIP" "$ADB_DIR" <<'PYZIP'
+import sys, zipfile, os
+zip_path, out_dir = sys.argv[1], sys.argv[2]
+os.makedirs(out_dir, exist_ok=True)
+wanted = {"adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"}
+with zipfile.ZipFile(zip_path) as z:
+    for name in z.namelist():
+        base = os.path.basename(name)
+        if base in wanted and name.startswith("platform-tools/"):
+            with z.open(name) as src, open(os.path.join(out_dir, base), "wb") as dst:
+                dst.write(src.read())
+            wanted.discard(base)
+sys.exit(0 if not wanted else 1)
+PYZIP
+  then
+    echo "adb: downloaded and staged"
+  else
+    ADB_OK=1
+    echo "warning: could not bundle adb (offline?) — USB users need their own platform-tools" >&2
+  fi
+  rm -rf "$ADB_TMP"
+fi
+
+if [ "$ADB_OK" -eq 0 ] && [ -f "$ADB_DIR/adb.exe" ]; then
+  # Apache-2.0 attribution for the redistributed platform-tools binaries.
+  ADB_LIC="$ADB_DIR/LICENSE-2.0.txt"
+  if [ ! -f "$ADB_LIC" ]; then
+    curl -fsSL -o "$ADB_LIC" "https://www.apache.org/licenses/LICENSE-2.0.txt" \
+      || echo "warning: could not download the Apache-2.0 text for the adb bundle" >&2
+  fi
+  cat > "$ADB_DIR/NOTICE.txt" <<'NOTICE_EOF'
+This distribution bundles "platform-tools" (adb.exe, AdbWinApi.dll,
+AdbWinUsbApi.dll) from the Android SDK, Copyright (C) The Android Open
+Source Project.
+
+Licensed under the Apache License, Version 2.0 (see LICENSE-2.0.txt):
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Source code: https://android.googlesource.com/platform/packages/modules/adb
+Unless required by applicable law or agreed to in writing, the software is
+distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND.
+NOTICE_EOF
+  check "bundle adb + attribution -> dist/openay-windows/adb/" 0
+elif [ "$EXE_OK" -eq 0 ]; then
+  # A missing bundle is a warning, not a build failure (the header comment
+  # promises exactly that) — never route it through check()'s exit gate.
+  echo "warning: adb bundle missing from dist/openay-windows/adb/" >&2
+fi
+
 if [ "$XWIN_OK" -ne 0 ]; then
   echo "== Fallback: compile-only gate for $TARGET =="
   GATE_OK=1
