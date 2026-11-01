@@ -7,6 +7,25 @@ carry features).
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-11-01
+
+### Added
+- **Clients**: the OpenAY Mic logo across platforms — the GUI window and
+  taskbar icon on Linux and Windows, the Windows executable icon (embedded
+  at build time on MSVC hosts; cross builds skip it with a warning), and
+  the Android adaptive launcher icon (the manifest previously declared no
+  icon at all, so the app showed the system default).
+- **Linux dist**: `install-desktop.sh` — a per-user launcher + hicolor icon
+  install (no root) so the dock, app grid, and file-manager launcher views
+  show the logo; GNOME matches running windows to `.desktop` entries and
+  ignores window icons.
+
+### Fixed
+- **Linux**: the GUI announced an empty Wayland application id, so the dock
+  showed a generic gear icon even with the window icon set. It now
+  announces `openay-gui`, matching the shipped `.desktop` entry (verified
+  on the toplevel with `WAYLAND_DEBUG`).
+
 ## [0.3.1] — 2026-10-31
 
 ### Fixed
