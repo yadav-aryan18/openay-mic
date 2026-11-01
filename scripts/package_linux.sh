@@ -28,6 +28,11 @@ rm -rf "$DIST"
 mkdir -p "$DIST"
 cp -f "$GUI" "$DIST/"
 cp -f "$SERVER" "$DIST/"
+# Launcher icon + per-user installer (GNOME/KDE docks ignore window icons;
+# they match running windows to a .desktop entry — see install-desktop.sh).
+cp -f "$ROOT/assets/icons/openay-mic-256.png" "$DIST/openay-mic.png"
+cp -f "$ROOT/scripts/install-desktop.sh" "$DIST/"
+chmod +x "$DIST/install-desktop.sh"
 
 cat > "$DIST/README-LINUX.txt" <<EOF
 OpenAY Mic $VERSION — Linux receiver (x86_64)
@@ -68,6 +73,19 @@ Tuning
   OPENAY_NODE_LATENCY=480/48000 ./openay-server ...
   requests a smaller PipeWire quantum: measured ~10 ms lower latency for
   a few tenths of a percent CPU.
+
+Dock / app-grid icon (GNOME, KDE)
+---------------------------------
+  The window icon alone is not enough there: the dock matches running
+  windows to a .desktop entry and file managers show the generic icon for
+  loose binaries. One-time, per user (no root), from this folder:
+
+      ./install-desktop.sh
+
+  That installs the logo + an 'OpenAY Mic' launcher pointing at this
+  folder's openay-gui (re-run it if you move the folder). Until then the
+  dock may show a generic gear while the app runs — the app itself is
+  unaffected.
 EOF
 
 echo "== Packing tarball =="
