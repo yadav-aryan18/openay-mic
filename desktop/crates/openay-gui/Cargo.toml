@@ -43,6 +43,11 @@ tray-icon = "0.26"
 # is already in the build; this only unlocks the time helper).
 tokio = { version = "1", default-features = false, features = ["time"] }
 
+[build-dependencies]
+# Exe icon embed (Windows): rc.exe on MSVC runners, gracefully skipped
+# elsewhere (see build.rs).
+winresource = "0.1"
+
 [dev-dependencies]
 # Headless layout probing in unit tests (same version as the iced tree).
 iced_core = "0.13"
