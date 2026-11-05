@@ -1,0 +1,3 @@
+[submodule "android/native/third_party/opus"]
+	path = android/native/third_party/opus
+	url = https://github.com/xiph/opus.git

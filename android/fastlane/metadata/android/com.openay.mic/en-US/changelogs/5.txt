@@ -1,0 +1,1 @@
+Packaging: opus is now vendored in-repo (pinned to v1.5.2) so the app builds fully offline — required for F-Droid's network-isolated build servers. No user-facing audio changes; identical codec version to 0.3.2.

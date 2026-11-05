@@ -34,24 +34,21 @@ if(OPENAY_ANDROID)
   # Prefab provides the oboe package to Gradle externalNativeBuild.
   find_package(oboe REQUIRED CONFIG)
 
-  include(FetchContent)
+  # Opus is vendored as a git submodule (xiph/opus, pinned to v1.5.2,
+  # BSD-3-Clause) so the build is fully offline-capable — required for
+  # F-Droid's network-isolated build servers, where a FetchContent download
+  # would fail. The submodule is checked out at the same tag the previous
+  # FetchContent tarball used, so the compiled codec is unchanged.
   set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
   set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
   set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
   set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
   set(OPUS_INSTALL_CMAKE_PACKAGE OFF CACHE BOOL "" FORCE)
   set(OPUS_DISABLE_DOCS ON CACHE BOOL "" FORCE)
-  # NOTE: no DOWNLOAD_EXTRACT_TIMESTAMP here — AGP pins CMake 3.22, where the
-  # option does not exist and FetchContent forwards it into ExternalProject's
-  # URL list, breaking the download.
-  # TODO: pin URL_HASH <sha256> for supply-chain hygiene once a version is
-  # frozen (compute from the tarball at release time).
-  # 2026-08-21: downloads.opuscodec.org no longer resolves (curl: Could not
-  # resolve host); the canonical xiph mirror on GitHub is used instead.
-  FetchContent_Declare(opus
-    URL https://github.com/xiph/opus/archive/refs/tags/v1.5.2.tar.gz
-  )
-  FetchContent_MakeAvailable(opus)
+  add_subdirectory(third_party/opus)
+
+  set(OPENAY_HAVE_OPUS ON)
+  set(OPENAY_OPUS_TARGET opus)
 
   set(OPENAY_HAVE_OPUS ON)
   set(OPENAY_OPUS_TARGET opus)

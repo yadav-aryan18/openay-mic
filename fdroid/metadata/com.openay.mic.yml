@@ -1,0 +1,34 @@
+Categories:
+  - Multimedia
+  - Connectivity
+License: MIT
+AuthorName: Aryan Yadav
+AuthorEmail: yadav-aryan18@users.noreply.github.com
+SourceCode: https://github.com/yadav-aryan18/openay-mic
+IssueTracker: https://github.com/yadav-aryan18/openay-mic/issues
+Changelog: https://github.com/yadav-aryan18/openay-mic/releases
+AutoName: OpenAY Mic
+Summary: Turn an Android phone into a real microphone for Linux and Windows PCs
+Description: |-
+    OpenAY Mic turns an Android phone into a studio-grade microphone for your desktop computer. The phone captures audio and streams it to a receiver that presents it as a native audio device: on Linux a PipeWire virtual microphone that every application can select, on Windows audio rendered through WASAPI (pair it with a virtual-audio-cable driver to expose it as a microphone).
+
+    Transports: Wi-Fi (UDP), USB (TCP over adb), and Bluetooth SPP. Audio: 16-bit PCM at 48 kHz or Opus in 10 ms low-delay frames, carried over a frozen, published wire protocol. The receiver runs an adaptive jitter buffer; end-to-end software-path latency measures p50 around 47 ms with default settings, at under 1 percent CPU when idle.
+
+    Set up in three steps: install this app, run the receiver on your computer (get it from the project's GitHub releases page), connect over the same Wi-Fi network or with a USB cable, then press ON AIR.
+
+    Free and open source under the MIT license. No cloud, no accounts, no tracking: your audio stays on your local network, and the receiver latches onto the first peer it accepts so nothing else can blend into the stream.
+
+    For streamers, podcasters, and tinkerers who want a real microphone without extra hardware.
+RepoType: git
+Repo: https://github.com/yadav-aryan18/openay-mic
+Builds:
+  - versionName: 0.3.3
+    versionCode: 5
+    commit: v0.3.3
+    subdir: android
+    gradle:
+      - yes
+    ndk: 27.2.12479018
+AutoUpdateMode: Version v%v
+UpdateCheckMode: Tags
+CurrentVersionCode: 5
